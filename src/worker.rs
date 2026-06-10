@@ -26,8 +26,6 @@ pub struct PreprocBuffer {
     pub data: Arc<Vec<f32>>,
     pub cfg: PreprocConfig,
     pub display_rows: Arc<Vec<DisplayRow>>,
-    /// Number of actual data rows (excludes Gap entries).
-    pub n_data_rows: usize,
     /// Percentile table of |data| values (0..=100.0).
     pub vmax_pct: PctTable,
 }
@@ -153,9 +151,6 @@ pub fn spawn_worker(
 
             // build display rows for this config
             let display_rows = Arc::new(meta.build_display_rows(req.cfg.avg_depths));
-            let n_data_rows = display_rows.iter()
-                .filter(|r| matches!(r, DisplayRow::Data { .. }))
-                .count();
 
             let first = req.center_sample.saturating_sub(req.half_window);
             let n_samp = (req.half_window * 2)
@@ -205,7 +200,6 @@ pub fn spawn_worker(
                 data: Arc::new(data),
                 cfg: req.cfg,
                 display_rows,
-                n_data_rows,
                 vmax_pct,
             };
 

@@ -21,7 +21,6 @@ pub enum DisplayRow {
 pub struct Meta {
     pub n_saved_chans: usize,
     pub n_ap_chans: usize,
-    pub n_sync_chans: usize,
     pub sample_rate: f64,
     pub n_samples: usize,
     pub uv_per_bit: f32,
@@ -79,11 +78,10 @@ impl Meta {
         let file_size_bytes = file_size_bytes.context("missing fileSizeBytes")?;
 
         let n_ap = n_ap.unwrap_or(n_saved_chans.saturating_sub(1));
-        let n_sy = n_sy.unwrap_or(1);
+        let _n_sy = n_sy.unwrap_or(1);
         let _ = n_lf;
 
         let n_ap_chans = n_ap;
-        let n_sync_chans = n_sy;
         let n_samples = (file_size_bytes / (n_saved_chans as u64 * 2)) as usize;
         let uv_per_bit = (ai_range_max / max_int / ap_gain * 1e6) as f32;
         let channel_geom = parse_geom_map(geom_str.as_deref(), n_ap_chans);
@@ -91,7 +89,6 @@ impl Meta {
         Ok(Meta {
             n_saved_chans,
             n_ap_chans,
-            n_sync_chans,
             sample_rate,
             n_samples,
             uv_per_bit,
@@ -243,10 +240,7 @@ fn parse_geom_map(s: Option<&str>, n_ap: usize) -> Vec<ChannelGeom> {
 // Raw data access
 // ---------------------------------------------------------------------------
 
-pub enum RawData {
-    Loaded(Vec<i16>),
-    Mmap(memmap2::Mmap),
-}
+pub struct RawData(pub memmap2::Mmap);
 
 impl RawData {
     /// Return a flat Vec<f32> in µV, layout: [n_ap][n_samp].
@@ -284,10 +278,7 @@ impl RawData {
     }
 
     fn as_i16_slice(&self) -> &[i16] {
-        match self {
-            RawData::Loaded(v) => v.as_slice(),
-            RawData::Mmap(m) => bytemuck::cast_slice(m.as_ref()),
-        }
+        bytemuck::cast_slice(self.0.as_ref())
     }
 }
 
@@ -299,22 +290,5 @@ pub fn open_data(bin_path: &Path, meta: &Meta) -> Result<(RawData, usize)> {
     if mmap.as_ptr() as usize % 2 != 0 {
         bail!("mmap pointer is not 2-byte aligned");
     }
-    Ok((RawData::Mmap(mmap), meta.n_samples))
-}
-
-/// Query free physical RAM in bytes via /proc/meminfo
-pub fn free_ram_bytes() -> u64 {
-    if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
-        for line in text.lines() {
-            if line.starts_with("MemAvailable:") {
-                let kb: u64 = line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                return kb * 1024;
-            }
-        }
-    }
-    4 * 1024 * 1024 * 1024
+    Ok((RawData(mmap), meta.n_samples))
 }

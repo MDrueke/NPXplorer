@@ -4,7 +4,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::data::{DisplayRow, Meta, RawData, open_data};
+use crate::data::{DisplayRow, Meta, open_data};
 use crate::preprocess::{Filters, PreprocConfig, SpatialFilter};
 use crate::render::build_heatmap_into;
 use crate::worker::{
@@ -20,16 +20,17 @@ pub enum ColorMode {
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum ColorMapChoice {
-    Default,
+    YellowMagenta,
+    RedBlue,
     OrangeBlue,
     IceFire,
     Vanimo,
+    GreyScale,
 }
 
 pub struct RawViewerApp {
     bin_path: PathBuf,
     meta: Arc<Meta>,
-    raw: Arc<RawData>,
 
     // view state
     view_start_s: f64,
@@ -41,8 +42,6 @@ pub struct RawViewerApp {
     // preprocessing
     preproc_cfg: PreprocConfig,
     preproc_filters: Arc<Mutex<Filters>>,
-    hp_locked_by_destripe: bool,
-    hp_before_destripe: bool,
     scroll_speed_fine: bool,
 
     // color scale
@@ -52,8 +51,8 @@ pub struct RawViewerApp {
     color_pct_str: String,
     color_uv_str: String,
     colormap_choice: ColorMapChoice,
-    show_preferences: bool,
 
+    // selected channels
     selected_channel_1: Option<usize>,
     selected_channel_2: Option<usize>,
 
@@ -69,6 +68,7 @@ pub struct RawViewerApp {
     last_rendered_first: usize,
     last_rendered_cfg: Option<PreprocConfig>,
     last_rendered_n: usize,
+    last_rendered_size: Option<[usize; 2]>,
 
     // smooth-scroll state
     waiting_since: Option<Instant>,
@@ -130,7 +130,6 @@ impl RawViewerApp {
         Ok(Self {
             bin_path,
             meta,
-            raw,
             view_start_s: 0.0,
             view_dur_s: 0.5,
             window_dur_str: "0.500".to_string(),
@@ -138,16 +137,13 @@ impl RawViewerApp {
             ch_last: n_ap.saturating_sub(1),
             preproc_cfg: preproc_cfg.clone(),
             preproc_filters: filters,
-            hp_locked_by_destripe: false,
-            hp_before_destripe: false,
             scroll_speed_fine: true,
             color_mode: ColorMode::Percentile,
             color_pct: 99.0,
             color_uv: 120.0,
             color_pct_str: "99.0".to_string(),
             color_uv_str: "120.0".to_string(),
-            colormap_choice: ColorMapChoice::Default,
-            show_preferences: false,
+            colormap_choice: ColorMapChoice::YellowMagenta,
             selected_channel_1: None,
             selected_channel_2: None,
             worker_state: shared,
@@ -159,6 +155,7 @@ impl RawViewerApp {
             last_rendered_first: usize::MAX,
             last_rendered_cfg: None,
             last_rendered_n: 0,
+            last_rendered_size: None,
             waiting_since: None,
             last_requested_center: 0,
             pending_cfg_recompute: false,
@@ -209,8 +206,6 @@ impl RawViewerApp {
 
     fn draw_toolbar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("RawViewer").strong());
-            ui.separator();
             ui.label(format!(
                 "{}",
                 self.bin_path.file_name().unwrap_or_default().to_string_lossy()
@@ -239,9 +234,38 @@ impl RawViewerApp {
             }
 
             ui.separator();
+            ui.label("Scroll:");
+            ui.radio_value(&mut self.scroll_speed_fine, true, "Fine");
+            ui.radio_value(&mut self.scroll_speed_fine, false, "Coarse");
+
+            ui.separator();
 
             // Color scale controls
             ui.label("Color:");
+            
+            let mut cm = self.colormap_choice.clone();
+            egui::ComboBox::from_id_salt("cm_combo")
+                .selected_text(match cm {
+                    ColorMapChoice::YellowMagenta => "Yellow-Magenta",
+                    ColorMapChoice::RedBlue => "Red-Blue",
+                    ColorMapChoice::OrangeBlue => "Orange-Blue",
+                    ColorMapChoice::IceFire => "Ice-Fire",
+                    ColorMapChoice::Vanimo => "Vanimo",
+                    ColorMapChoice::GreyScale => "Greyscale",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut cm, ColorMapChoice::YellowMagenta, "Yellow-Magenta");
+                    ui.selectable_value(&mut cm, ColorMapChoice::RedBlue, "Red-Blue");
+                    ui.selectable_value(&mut cm, ColorMapChoice::OrangeBlue, "Orange-Blue");
+                    ui.selectable_value(&mut cm, ColorMapChoice::IceFire, "Ice-Fire");
+                    ui.selectable_value(&mut cm, ColorMapChoice::Vanimo, "Vanimo");
+                    ui.selectable_value(&mut cm, ColorMapChoice::GreyScale, "Greyscale");
+                });
+            if cm != self.colormap_choice {
+                self.colormap_choice = cm;
+                self.heatmap_texture = None; // Force redraw
+            }
+
             if ui.radio_value(&mut self.color_mode, ColorMode::Percentile, "%ile").changed()
                 || ui.radio_value(&mut self.color_mode, ColorMode::Voltage, "±µV").changed() {
                 self.heatmap_texture = None;
@@ -266,17 +290,6 @@ impl RawViewerApp {
                     self.heatmap_texture = None;
                 }
             }
-
-            ui.separator();
-            ui.label("Scroll:");
-            ui.radio_value(&mut self.scroll_speed_fine, true, "Fine");
-            ui.radio_value(&mut self.scroll_speed_fine, false, "Coarse");
-            
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("⚙ Preferences").clicked() {
-                    self.show_preferences = !self.show_preferences;
-                }
-            });
         });
     }
 
@@ -400,6 +413,20 @@ impl RawViewerApp {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let (Some(ch1), Some(ch2)) = (self.selected_channel_1, self.selected_channel_2) {
+                    if ch1 > 0 && ch1 <= self.meta.channel_geom.len() && ch2 > 0 && ch2 <= self.meta.channel_geom.len() {
+                        let y1 = self.meta.channel_geom[ch1 - 1].y_um;
+                        let y2 = self.meta.channel_geom[ch2 - 1].y_um;
+                        let dist = (y1 - y2).abs();
+                        ui.label(
+                            egui::RichText::new(format!("Δ = {:.1} µm", dist))
+                                .strong()
+                                .color(egui::Color32::WHITE)
+                        );
+                        ui.separator();
+                    }
+                }
+
                 if ch2_visible {
                     if let Some(ch2) = self.selected_channel_2 {
                         if ui.button("✖").clicked() {
@@ -490,29 +517,6 @@ impl eframe::App for RawViewerApp {
             }
         }
 
-        if self.show_preferences {
-            egui::Window::new("Preferences").open(&mut self.show_preferences).show(ctx, |ui| {
-                ui.label("Colormap:");
-                let mut cm = self.colormap_choice.clone();
-                egui::ComboBox::from_id_source("cm_combo")
-                    .selected_text(match cm {
-                        ColorMapChoice::Default => "Default",
-                        ColorMapChoice::OrangeBlue => "orange-blue",
-                        ColorMapChoice::IceFire => "ice-fire",
-                        ColorMapChoice::Vanimo => "vanimo",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut cm, ColorMapChoice::Default, "Default");
-                        ui.selectable_value(&mut cm, ColorMapChoice::OrangeBlue, "orange-blue");
-                        ui.selectable_value(&mut cm, ColorMapChoice::IceFire, "ice-fire");
-                        ui.selectable_value(&mut cm, ColorMapChoice::Vanimo, "vanimo");
-                    });
-                if cm != self.colormap_choice {
-                    self.colormap_choice = cm;
-                    self.heatmap_texture = None; // Force redraw
-                }
-            });
-        }
 
         // mouse-wheel scroll — 5% of window per tick
         let ticks = ctx.input(|i| {
@@ -592,9 +596,11 @@ impl eframe::App for RawViewerApp {
 
                     let pos_changed = self.last_rendered_first != view_first;
                     let cfg_changed = self.last_rendered_cfg.as_ref() != Some(&self.preproc_cfg);
+                    let size_changed = self.last_rendered_size != Some([pw, ph]);
                     
                     let need_rebuild = self.heatmap_texture.is_none()
                         || pos_changed || view_n != self.last_rendered_n
+                        || size_changed
                         || (cfg_changed && matches_cfg);
 
                     if need_rebuild && view_n > 0 {
@@ -623,6 +629,7 @@ impl eframe::App for RawViewerApp {
                             self.last_rendered_first = view_first;
                             self.last_rendered_n = view_n;
                             self.last_rendered_cfg = buf_cfg;
+                            self.last_rendered_size = Some([pw, ph]);
                         }
                     }
                 }
@@ -723,7 +730,7 @@ impl eframe::App for RawViewerApp {
                 if let Some(tex) = &self.heatmap_texture {
                     let img_widget = egui::Image::new(tex)
                         .fit_to_exact_size(avail)
-                        .sense(egui::Sense::hover());
+                        .sense(egui::Sense::click());
                     let resp = ui.add(img_widget);
 
                     // Click detection
@@ -732,11 +739,11 @@ impl eframe::App for RawViewerApp {
                     let mut is_right_click = false;
                     
                     if resp.clicked() {
-                        click_pos = resp.interact_pointer_pos();
+                        click_pos = resp.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.interact_pos()));
                         is_left_click = true;
                     }
                     if resp.secondary_clicked() {
-                        click_pos = resp.interact_pointer_pos();
+                        click_pos = resp.interact_pointer_pos().or_else(|| ctx.input(|i| i.pointer.interact_pos()));
                         is_right_click = true;
                     }
 
@@ -769,7 +776,7 @@ impl eframe::App for RawViewerApp {
                         }
 
                         // Draw lines
-                        let mut draw_line = |ch_to_draw: usize, color: egui::Color32| {
+                        let draw_line = |ch_to_draw: usize, color: egui::Color32| {
                             for r in first_row..=last_row {
                                 if let DisplayRow::Data { first_ch, .. } = &display_rows[r] {
                                     if *first_ch + 1 == ch_to_draw {
@@ -794,7 +801,15 @@ impl eframe::App for RawViewerApp {
                     }
 
                     // hover overlay: ch / time / voltage
-                    if let Some(pos) = resp.hover_pos() {
+                    let hover_pos = resp.hover_pos().or_else(|| {
+                        if resp.dragged() || resp.is_pointer_button_down_on() {
+                            ctx.input(|i| i.pointer.interact_pos())
+                        } else {
+                            None
+                        }
+                    });
+
+                    if let Some(pos) = hover_pos {
                         if let Some(display_rows) = &display_rows_arc {
                             let (first_row, last_row) = self.visible_row_range(&display_rows);
                             let n_rows = last_row.saturating_sub(first_row) + 1;
@@ -828,13 +843,17 @@ impl eframe::App for RawViewerApp {
                             let ch_str = first_ch_hover.map(|c| format!("Ch {}  ", c)).unwrap_or_default();
                             let volt_str = voltage_uv.map(|v| format!("  {:.1} µV", v)).unwrap_or_default();
                             let label = format!("{}t = {:.4} s{}", ch_str, t, volt_str);
-                            ui.painter().text(
-                                resp.rect.left_bottom() + Vec2::new(6.0, -6.0),
-                                egui::Align2::LEFT_BOTTOM,
-                                label,
-                                egui::FontId::proportional(12.0),
-                                egui::Color32::from_rgba_unmultiplied(220, 220, 220, 200),
-                            );
+                            
+                            // Measure text to draw background
+                            let font_id = egui::FontId::proportional(12.0);
+                            let galley = ui.painter().layout_no_wrap(label, font_id.clone(), egui::Color32::from_rgba_unmultiplied(220, 220, 220, 200));
+                            let text_pos = resp.rect.left_bottom() + Vec2::new(6.0, -6.0 - galley.rect.height());
+                            
+                            // Background box
+                            let bg_rect = galley.rect.translate(text_pos.to_vec2()).expand(4.0);
+                            ui.painter().rect_filled(bg_rect, 2.0, egui::Color32::from_rgba_unmultiplied(0x18, 0x18, 0x18, 200));
+                            
+                            ui.painter().galley(text_pos, galley, egui::Color32::from_rgba_unmultiplied(220, 220, 220, 200));
                         }
                     }
 
