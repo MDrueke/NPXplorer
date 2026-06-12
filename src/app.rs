@@ -165,11 +165,6 @@ impl RawViewerApp {
         let shared: SharedWorkerState = Arc::new((Mutex::new(WorkerState::new()), Condvar::new()));
         let cancel: SharedCancel = Arc::new(AtomicBool::new(false));
 
-        // compute display rows to size the buffer
-        let display_rows = meta.build_display_rows(preproc_cfg.avg_depths);
-        let n_data_rows = display_rows.iter()
-            .filter(|r| matches!(r, DisplayRow::Data { .. }))
-            .count();
         let half_window = compute_half_window(view_dur_s, fs);
 
         let handle = spawn_worker(

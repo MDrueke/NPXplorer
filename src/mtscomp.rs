@@ -15,8 +15,6 @@ pub struct MtscompMeta {
     pub do_time_diff: bool,
     pub dtype: String,
     pub n_channels: usize,
-    pub sample_rate: f64,
-    pub version: String,
 }
 
 impl MtscompMeta {

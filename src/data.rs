@@ -299,7 +299,6 @@ impl RawData {
                 while current_idx < chunk_bounds.len() - 1 && out_offset < n_samp {
                     let chunk_start = chunk_bounds[current_idx];
                     let chunk_end = chunk_bounds[current_idx + 1];
-                    let chunk_len = chunk_end - chunk_start;
 
                     // Compute overlap
                     let overlap_start = chunk_start.max(first_sample);
@@ -312,7 +311,6 @@ impl RawData {
                         if let Ok(decompressed) = reader.decompress_chunk(current_idx) {
                             // Decompressed is in C-order: [time * n_channels + ch]
                             use rayon::prelude::*;
-                            let out_ptr = out.as_mut_ptr() as usize; // safe to pass pointer across threads inside par_chunks_mut? No, we will partition instead.
                             // Better: process channel by channel
                             out.par_chunks_mut(n_samp).enumerate().for_each(|(ch, row_dst)| {
                                 for t in 0..overlap_len {

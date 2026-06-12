@@ -4,7 +4,7 @@ RawViewer is a lightweight, high-performance application for the visualization a
 
 ## Features and Limitations
 
-- **File Support**: Currently restricted to data acquired via SpikeGLX (`.ap.bin` format). Support for OpenEphys formats is planned.
+- **File Support**: Currently restricted to data acquired via SpikeGLX (`.ap.bin` format). Support for OpenEphys formats is planned. Natively supports and automatically decompresses `mtscomp` compressed data (`.cbin` + `.ch` metadata).
 - **Metadata Requirement**: The corresponding `.ap.meta` file must be present in the same directory as the binary data file for spatial and hardware layout decoding.
 - **Hardware Support**: Currently supports single-shank Neuropixels probes. Multi-shank support is planned for future releases.
 

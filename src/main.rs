@@ -76,7 +76,15 @@ impl eframe::App for MainApp {
 
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.centered_and_justified(|ui| {
-                        ui.label("open a file to start");
+                        if ui.add(egui::Button::new("open a file to start").frame(false)).clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Recordings", &["bin", "cbin"])
+                                .add_filter("Uncompressed", &["bin"])
+                                .add_filter("Compressed", &["cbin"])
+                                .pick_file() {
+                                file_to_open = Some(path);
+                            }
+                        }
                     });
                 });
             }
