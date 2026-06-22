@@ -1,3 +1,24 @@
+
+macro_rules! file_log {
+    ($($arg:tt)*) => {
+        {
+            let log_path = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("debug.log")))
+                .unwrap_or_else(|| std::path::PathBuf::from("debug.log"));
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                use std::io::Write;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                let _ = write!(f, "[{:.3}] ", now);
+                let _ = writeln!(f, $($arg)*);
+            }
+        }
+    };
+}
+
 use egui::{CentralPanel, TextureHandle, TextureOptions, TopBottomPanel, Ui, Vec2};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
@@ -37,6 +58,8 @@ pub struct Preferences {
     pub color_uv: f32,
     pub colormap_choice: ColorMapChoice,
     pub spike_threshold: f32,
+    #[serde(default)]
+    pub last_dir: Option<String>,
 }
 
 impl Preferences {
@@ -56,12 +79,13 @@ impl Preferences {
         }
     }
 
-    fn path() -> std::path::PathBuf {
-        if let Ok(home) = std::env::var("HOME") {
-            std::path::PathBuf::from(home).join(".rawviewer_prefs.toml")
-        } else {
-            std::path::PathBuf::from("rawviewer_prefs.toml")
+    pub fn path() -> std::path::PathBuf {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                return dir.join("rawviewer_prefs.toml");
+            }
         }
+        std::path::PathBuf::from("rawviewer_prefs.toml")
     }
 }
 
@@ -232,6 +256,7 @@ impl RawViewerApp {
     }
 
     pub fn save_prefs(&self) {
+        let last_dir = self.bin_path.parent().map(|p| p.to_string_lossy().to_string());
         let prefs = Preferences {
             preproc_cfg: self.preproc_cfg.clone(),
             view_dur_s: self.view_dur_s,
@@ -240,13 +265,18 @@ impl RawViewerApp {
             color_uv: self.color_uv,
             colormap_choice: self.colormap_choice.clone(),
             spike_threshold: self.spike_threshold,
+            last_dir,
         };
         prefs.save();
     }
 
     fn request_recompute(&mut self) {
         let fs = self.meta.sample_rate;
-        let center = ((self.view_start_s + self.view_dur_s / 2.0) * fs) as usize;
+        // use same formula as update() to avoid off-by-one from float rounding
+        let view_first = (self.view_start_s * fs) as usize;
+        let view_n = (self.view_dur_s * fs) as usize;
+        let center = view_first + view_n / 2;
+        file_log!("UI: request_recompute center={} view_first={} view_n={} cfg={:?}", center, view_first, view_n, self.preproc_cfg);
         // cancel any in-flight computation
         self.worker_cancel.store(true, Ordering::Relaxed);
         let req = WorkerRequest {
@@ -461,6 +491,10 @@ impl RawViewerApp {
                 }
                 self.jump_str = format!("{:.3}", self.view_start_s);
             }
+            // keep jump field synced when not being edited
+            if !resp.has_focus() {
+                self.jump_str = format!("{:.3}", self.view_start_s);
+            }
 
             let display_rows_arc = {
                 let (lock, _) = &*self.worker_state;
@@ -518,7 +552,10 @@ impl RawViewerApp {
                         } else {
                             format!("Selected Channel: {}", ch1)
                         };
-                        ui.label(text);
+                        ui.label(
+                            egui::RichText::new(text)
+                                .color(egui::Color32::WHITE)
+                        );
                     }
                 }
             });
@@ -553,7 +590,7 @@ impl RawViewerApp {
         let rect = response.rect;
         let w = rect.width();
 
-        painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(0x18, 0x18, 0x18));
+        painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(0x18, 0x1a, 0x1f));
 
         // view marker
         let view_frac = (self.view_start_s / total_s) as f32;
@@ -640,7 +677,8 @@ impl RawViewerApp {
                     ui.horizontal(|ui| {
                         ui.label("Spike Threshold (µV):");
                         if ui.add(egui::DragValue::new(&mut self.spike_threshold).speed(1.0).suffix(" µV")).changed() {
-                            self.heatmap_texture = None; // Redraw to update projection
+                            self.heatmap_texture = None; // redraw to update projection
+                            self.save_prefs();
                         }
                     });
                 });
@@ -679,11 +717,11 @@ impl RawViewerApp {
         TopBottomPanel::top("toolbar").show(ctx, |ui| { self.draw_toolbar(ui); });
         TopBottomPanel::top("preproc").show(ctx, |ui| { self.draw_preproc_panel(ui); });
         TopBottomPanel::top("chan_ctrl").show(ctx, |ui| { self.draw_channel_controls(ui); });
-        TopBottomPanel::bottom("status_bar").show(ctx, |ui| { self.draw_status_bar(ui); });
+        TopBottomPanel::bottom("status_bar").exact_height(20.0).show(ctx, |ui| { self.draw_status_bar(ui); });
         TopBottomPanel::bottom("nav_bar").show(ctx, |ui| { self.draw_nav_bar(ui); });
 
         CentralPanel::default()
-            .frame(egui::Frame::new().fill(egui::Color32::from_rgb(0x18, 0x18, 0x18)))
+            .frame(egui::Frame::new().fill(egui::Color32::from_rgb(crate::render::C_ZERO[0], crate::render::C_ZERO[1], crate::render::C_ZERO[2])))
             .show(ctx, |ui| {
                 let avail = ui.available_size();
                 let pw = avail.x as usize;
@@ -701,7 +739,9 @@ impl RawViewerApp {
                     let st = lock.lock().unwrap();
                     if let Some(buf) = &st.buffer {
                         let buf_end = buf.first_sample + buf.n_samp;
-                        let m_view = buf.first_sample <= view_first && view_first + view_n <= buf_end;
+                        let max_view_n = self.meta.n_samples.saturating_sub(view_first);
+                        let expected_end = view_first + view_n.min(max_view_n);
+                        let m_view = buf.first_sample <= view_first && expected_end <= buf_end;
                         let m_cfg = buf.cfg == self.preproc_cfg;
                         
                         let v = if self.color_mode == ColorMode::Percentile {
@@ -832,6 +872,11 @@ impl RawViewerApp {
                     };
 
                     if !already_requested {
+                        file_log!("UI: Requesting recompute. matches_view={}, matches_cfg={}, pending_cfg={}, center={}", matches_view, matches_cfg, self.pending_cfg_recompute, center);
+                        if let Some(buf) = { let (lock,_) = &*self.worker_state; lock.lock().unwrap().buffer.as_ref().map(|b| (b.first_sample, b.n_samp, b.cfg.clone())) } {
+                            file_log!("UI: Current buf first={}, n={}, cfg={:?}", buf.0, buf.1, buf.2);
+                        }
+                        file_log!("UI: view_first={}, view_n={}, expected_end={}", view_first, view_n, view_first + view_n.min(self.meta.n_samples.saturating_sub(view_first)));
                         self.request_recompute();
                         self.last_requested_center = center;
                         requested_new = true;
@@ -1061,9 +1106,11 @@ impl RawViewerApp {
                                 (frac_y as f64 * n_rows as f64) as usize
                             ).clamp(first_row, last_row);
 
-                            let first_ch_hover = if let DisplayRow::Data { first_ch, .. } = &display_rows[disp_idx] {
-                                Some(*first_ch + 1)
-                            } else { None };
+                            let ch_str = match &display_rows[disp_idx] {
+                                DisplayRow::Data { first_ch, .. } => format!("Ch {}  ", first_ch),
+                                DisplayRow::IntraShankGap => "Channel gap  ".to_string(),
+                                DisplayRow::ShankBoundary => "Shank gap  ".to_string(),
+                            };
 
                             let frac_x = ((pos.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0);
                             let t = self.view_start_s + frac_x as f64 * self.view_dur_s;
@@ -1082,7 +1129,6 @@ impl RawViewerApp {
                                 } else { None }
                             } else { None };
 
-                            let ch_str = first_ch_hover.map(|c| format!("Ch {}  ", c)).unwrap_or_default();
                             let volt_str = voltage_uv.map(|v| format!("  {:.1} µV", v)).unwrap_or_default();
                             let label = format!("{}t = {:.4} s{}", ch_str, t, volt_str);
                             
@@ -1093,7 +1139,7 @@ impl RawViewerApp {
                             
                             // Background box
                             let bg_rect = galley.rect.translate(text_pos.to_vec2()).expand(4.0);
-                            ui.painter().rect_filled(bg_rect, 2.0, egui::Color32::from_rgba_unmultiplied(0x18, 0x18, 0x18, 200));
+                            ui.painter().rect_filled(bg_rect, 2.0, egui::Color32::from_rgba_unmultiplied(crate::render::C_ZERO[0], crate::render::C_ZERO[1], crate::render::C_ZERO[2], 200));
                             
                             ui.painter().galley(text_pos, galley, egui::Color32::from_rgba_unmultiplied(220, 220, 220, 200));
                         }

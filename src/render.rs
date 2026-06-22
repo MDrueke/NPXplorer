@@ -1,9 +1,7 @@
 use crate::data::DisplayRow;
 
 
-pub const C_ZERO: [u8; 3] = [0x18, 0x18, 0x18]; // #181818 grey
-
-const C_GAP: [u8; 3] = [0x50, 0x50, 0x50]; // light grey gap indicator
+pub const C_ZERO: [u8; 3] = [0x26, 0x29, 0x30]; // #262930 grey
 
 #[inline]
 fn lerp_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
@@ -106,9 +104,22 @@ pub fn build_heatmap_into(
         let disp_idx = disp_idx.min(n_rows - 1);
 
         match &visible[disp_idx] {
-            DisplayRow::Gap => {
+            DisplayRow::IntraShankGap => {
+                // Background grey with dotted grey line
+                for (px_idx, px) in row.chunks_exact_mut(4).enumerate() {
+                    if (px_idx / 4) % 2 == 0 {
+                        px[0] = 0x60; px[1] = 0x60; px[2] = 0x60; px[3] = 255; // grey dot
+                    } else {
+                        px[0] = C_ZERO[0]; px[1] = C_ZERO[1]; px[2] = C_ZERO[2]; px[3] = 255;
+                    }
+                }
+            }
+            DisplayRow::ShankBoundary => {
+                // Background grey with solid white dashed line
+                // Wait, user asked for solid white inter-shank separator!
+                // "solid white for the inter-shank separator"
                 for px in row.chunks_exact_mut(4) {
-                    px[0] = C_GAP[0]; px[1] = C_GAP[1]; px[2] = C_GAP[2]; px[3] = 255;
+                    px[0] = 255; px[1] = 255; px[2] = 255; px[3] = 255; // solid white
                 }
             }
             DisplayRow::Data { data_idx, .. } => {

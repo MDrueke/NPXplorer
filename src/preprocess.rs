@@ -125,46 +125,82 @@ use crate::data::DisplayRow;
 // ---------------------------------------------------------------------------
 
 pub fn preprocess(
-    data: &mut Vec<f32>,
+    data: &mut [f32],
     n_samp: usize,
     cfg: &PreprocConfig,
     filt: &Filters,
     cancel: &AtomicBool,
     display_rows: &[DisplayRow],
 ) {
+    if display_rows.is_empty() || n_samp == 0 { return; }
+
+    // Identify contiguous chunks of DisplayRow::Data that share the same shank.
+    let mut shank_blocks = Vec::new();
+    let mut current_shank = None;
+    let mut start_idx = 0;
+    
+    // We only care about Data rows for partitioning the data array
     let data_rows: Vec<&DisplayRow> = display_rows.iter()
         .filter(|r| matches!(r, DisplayRow::Data { .. }))
         .collect();
-    let n_rows = data_rows.len();
-
-    if n_rows == 0 || n_samp == 0 { return; }
-
-    // 1. DC Offset Correction
-    if cfg.dc_removal {
-        apply_dc_removal(data, n_samp);
-    }
-    if cancel.load(Ordering::Relaxed) { return; }
-
-    // 2. Phase Shift Correction
-    if cfg.phase_shift {
-        apply_phase_shift(data, n_samp, &data_rows, cfg.im_dat_prb_type);
-    }
-    if cancel.load(Ordering::Relaxed) { return; }
-
-    // 3. Highpass Filter
-    if cfg.highpass {
-        apply_temporal_hp(data, n_samp, &filt.hp_sos);
-    }
-    if cancel.load(Ordering::Relaxed) { return; }
-
-    // 4. Spatial Filter
-    match cfg.spatial_filter {
-        SpatialFilter::Off => {}
-        SpatialFilter::GlobalCmr => apply_global_cmr(data, n_rows, n_samp),
-        SpatialFilter::LocalCmr => apply_local_cmr(data, n_samp, &data_rows),
-        SpatialFilter::Destripe => {
-            apply_kfilt(data, n_rows, n_samp, filt, cancel);
+        
+    for (i, row) in data_rows.iter().enumerate() {
+        if let DisplayRow::Data { shank, .. } = row {
+            if current_shank.is_none() {
+                current_shank = Some(*shank);
+            } else if Some(*shank) != current_shank {
+                shank_blocks.push((start_idx, i));
+                start_idx = i;
+                current_shank = Some(*shank);
+            }
         }
+    }
+    if start_idx < data_rows.len() {
+        shank_blocks.push((start_idx, data_rows.len()));
+    }
+
+    // Split data into independent, isolated slices per shank
+    // Since `data` is completely ordered exactly as `data_rows`, we can chunk it cleanly.
+    let mut current_data_offset = 0;
+    
+    for (start_row, end_row) in shank_blocks {
+        if cancel.load(Ordering::Relaxed) { return; }
+        
+        let n_shank_rows = end_row - start_row;
+        let n_shank_samples = n_shank_rows * n_samp;
+        
+        let shank_data = &mut data[current_data_offset .. current_data_offset + n_shank_samples];
+        let shank_data_rows = &data_rows[start_row .. end_row];
+        
+        // 1. DC Offset Correction
+        if cfg.dc_removal {
+            apply_dc_removal(shank_data, n_samp);
+        }
+        if cancel.load(Ordering::Relaxed) { return; }
+
+        // 2. Phase Shift Correction
+        if cfg.phase_shift {
+            apply_phase_shift(shank_data, n_samp, shank_data_rows, cfg.im_dat_prb_type);
+        }
+        if cancel.load(Ordering::Relaxed) { return; }
+
+        // 3. Highpass Filter
+        if cfg.highpass {
+            apply_temporal_hp(shank_data, n_samp, &filt.hp_sos);
+        }
+        if cancel.load(Ordering::Relaxed) { return; }
+
+        // 4. Spatial Filter
+        match cfg.spatial_filter {
+            SpatialFilter::Off => {}
+            SpatialFilter::GlobalCmr => apply_global_cmr(shank_data, n_shank_rows, n_samp),
+            SpatialFilter::LocalCmr => apply_local_cmr(shank_data, n_samp, shank_data_rows),
+            SpatialFilter::Destripe => {
+                apply_kfilt(shank_data, n_shank_rows, n_samp, filt, cancel);
+            }
+        }
+        
+        current_data_offset += n_shank_samples;
     }
 }
 
@@ -172,7 +208,7 @@ pub fn preprocess(
 // DC offset removal
 // ---------------------------------------------------------------------------
 
-fn apply_dc_removal(data: &mut Vec<f32>, n_samp: usize) {
+fn apply_dc_removal(data: &mut [f32], n_samp: usize) {
     data.par_chunks_mut(n_samp).for_each(|row| {
         let mean = row.iter().sum::<f32>() / n_samp as f32;
         row.iter_mut().for_each(|v| *v -= mean);
@@ -183,7 +219,7 @@ fn apply_dc_removal(data: &mut Vec<f32>, n_samp: usize) {
 // Phase Shift Correction (Fractional delay via FFT)
 // ---------------------------------------------------------------------------
 
-fn apply_phase_shift(data: &mut Vec<f32>, n_samp: usize, data_rows: &[&DisplayRow], im_dat_prb_type: u32) {
+fn apply_phase_shift(data: &mut [f32], n_samp: usize, data_rows: &[&DisplayRow], im_dat_prb_type: u32) {
     data.par_chunks_mut(n_samp).enumerate().for_each(|(row_idx, row)| {
         if let DisplayRow::Data { first_ch, .. } = data_rows[row_idx] {
             let shift_samples = match im_dat_prb_type {
@@ -214,7 +250,7 @@ thread_local! {
 // Local CMR
 // ---------------------------------------------------------------------------
 
-fn apply_local_cmr(data: &mut Vec<f32>, n_samp: usize, data_rows: &[&DisplayRow]) {
+fn apply_local_cmr(data: &mut [f32], n_samp: usize, data_rows: &[&DisplayRow]) {
     let n_rows = data_rows.len();
     let mut neighborhoods = vec![Vec::new(); n_rows];
     
@@ -270,7 +306,7 @@ fn apply_local_cmr(data: &mut Vec<f32>, n_samp: usize, data_rows: &[&DisplayRow]
 // Temporal HP
 // ---------------------------------------------------------------------------
 
-fn apply_temporal_hp(data: &mut Vec<f32>, n_samp: usize, sos: &[Sos]) {
+fn apply_temporal_hp(data: &mut [f32], n_samp: usize, sos: &[Sos]) {
     data.par_chunks_mut(n_samp).for_each(|ch| {
         sosfiltfilt_inplace(sos, ch);
     });
@@ -284,7 +320,7 @@ thread_local! {
     static CMR_COL: RefCell<Vec<f32>> = RefCell::new(Vec::new());
 }
 
-fn apply_global_cmr(data: &mut Vec<f32>, n_rows: usize, n_samp: usize) {
+fn apply_global_cmr(data: &mut [f32], n_rows: usize, n_samp: usize) {
     let data_ptr = SendPtr(data.as_mut_ptr());
     let half = n_rows / 2;
 
@@ -360,7 +396,7 @@ struct SendPtr(*mut f32);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
-fn apply_kfilt(data: &mut Vec<f32>, n_rows: usize, n_samp: usize, filt: &Filters, cancel: &AtomicBool) {
+fn apply_kfilt(data: &mut [f32], n_rows: usize, n_samp: usize, filt: &Filters, cancel: &AtomicBool) {
     let pad = 60usize.min(n_rows);
     let n_padded = n_rows + 2 * pad;
     let gain = compute_agc_gain(data, n_rows, n_samp, filt.kfilt_lagc);
@@ -379,29 +415,66 @@ fn apply_kfilt(data: &mut Vec<f32>, n_rows: usize, n_samp: usize, filt: &Filters
     let gain_ptr = SendPtr(gain.as_ptr() as *mut f32);
     let sos = filt.kfilt_sos.clone();
 
-    (0..n_samp).into_par_iter().for_each(|t| {
+    let chunk_size = 512;
+    (0..n_samp).into_par_iter().step_by(chunk_size).for_each(|t_start| {
+        let t_end = (t_start + chunk_size).min(n_samp);
+        let n_t = t_end - t_start;
         let dp = data_ptr.0;
         let gp = gain_ptr.0;
         let _ = (&data_ptr, &gain_ptr);
 
         KFILT_COL.with(|cell| {
-            let mut col = cell.borrow_mut();
-            col.resize(n_padded, 0.0);
+            let mut buf = cell.borrow_mut();
+            // We use buf to store a 2D block: [n_padded][n_t] in row-major
+            buf.resize(n_padded * n_t, 0.0);
+
+            // Read row by row for contiguous memory access
+            for ch in 0..n_rows {
+                let src_row = unsafe { std::slice::from_raw_parts(dp.add(ch * n_samp + t_start), n_t) };
+                let dst_row = &mut buf[(pad + ch) * n_t .. (pad + ch + 1) * n_t];
+                dst_row.copy_from_slice(src_row);
+            }
+
             // mirror-pad at top
             for p in 0..pad {
-                col[p] = unsafe { *dp.add((pad - 1 - p).min(n_rows - 1) * n_samp + t) };
+                let src_ch = (pad - 1 - p).min(n_rows.saturating_sub(1));
+                let src_idx = (pad + src_ch) * n_t;
+                let dst_idx = p * n_t;
+                for i in 0..n_t {
+                    buf[dst_idx + i] = buf[src_idx + i];
+                }
             }
-            for ch in 0..n_rows {
-                col[pad + ch] = unsafe { *dp.add(ch * n_samp + t) };
-            }
+
             // mirror-pad at bottom
             for p in 0..pad {
-                col[pad + n_rows + p] = unsafe { *dp.add(n_rows.saturating_sub(1 + p) * n_samp + t) };
+                let src_ch = n_rows.saturating_sub(1 + p);
+                let src_idx = (pad + src_ch) * n_t;
+                let dst_idx = (pad + n_rows + p) * n_t;
+                for i in 0..n_t {
+                    buf[dst_idx + i] = buf[src_idx + i];
+                }
             }
-            sosfiltfilt_inplace(&sos, &mut col);
+
+            // Filter each column
+            let mut col = vec![0.0f32; n_padded];
+            for i in 0..n_t {
+                for r in 0..n_padded {
+                    col[r] = buf[r * n_t + i];
+                }
+                sosfiltfilt_inplace(&sos, &mut col);
+                for r in 0..n_padded {
+                    buf[r * n_t + i] = col[r];
+                }
+            }
+
+            // Write back row by row
             for ch in 0..n_rows {
-                let gv = unsafe { *gp.add(ch * n_samp + t) };
-                unsafe { *dp.add(ch * n_samp + t) = col[pad + ch] * gv; }
+                let dst_row = unsafe { std::slice::from_raw_parts_mut(dp.add(ch * n_samp + t_start), n_t) };
+                let src_row = &buf[(pad + ch) * n_t .. (pad + ch + 1) * n_t];
+                let g_row = unsafe { std::slice::from_raw_parts(gp.add(ch * n_samp + t_start), n_t) };
+                for i in 0..n_t {
+                    dst_row[i] = src_row[i] * g_row[i];
+                }
             }
         });
     });

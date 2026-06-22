@@ -1,3 +1,24 @@
+
+macro_rules! file_log {
+    ($($arg:tt)*) => {
+        {
+            let log_path = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("debug.log")))
+                .unwrap_or_else(|| std::path::PathBuf::from("debug.log"));
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                use std::io::Write;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                let _ = write!(f, "[{:.3}] ", now);
+                let _ = writeln!(f, $($arg)*);
+            }
+        }
+    };
+}
+
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -145,10 +166,12 @@ pub fn spawn_worker(
                 }
             };
 
+            // reset cancel flag for this newly grabbed request
+            cancel.store(false, Ordering::Relaxed);
+            file_log!("WORKER: Picked up request center={} half_window={} cfg={:?}", req.center_sample, req.half_window, req.cfg);
+
             // perform heavy computation within the dedicated thread pool
             pool.install(|| {
-                // reset cancel flag
-                cancel.store(false, Ordering::Relaxed);
 
             // build display rows for this config
             let display_rows = Arc::new(meta.build_display_rows(req.cfg.avg_depths));
@@ -160,19 +183,16 @@ pub fn spawn_worker(
             // read raw chunk [n_ap][n_samp]
             let raw_chunk = raw.read_chunk_uv(first, n_samp, &meta);
             if cancel.load(Ordering::Relaxed) {
+                file_log!("WORKER: Cancelled after read_chunk_uv");
                 let mut st = lock.lock().unwrap();
                 st.status = WorkerStatus::Idle;
                 st.active_request = None;
                 return;
             }
 
-            // depth-average → [n_data_rows][n_samp]
-            let mut data = if req.cfg.avg_depths {
-                average_depth_rows(&raw_chunk, n_samp, &display_rows)
-            } else {
-                // no averaging: pass through all AP channels as data rows
-                raw_chunk
-            };
+            // average_depth_rows correctly reorders raw_chunk into display_rows order
+            // If avg_depths is false, it still reorders the single-channel groups correctly.
+            let mut data = average_depth_rows(&raw_chunk, n_samp, &display_rows);
 
             if cancel.load(Ordering::Relaxed) {
                 let mut st = lock.lock().unwrap();
@@ -183,6 +203,7 @@ pub fn spawn_worker(
 
             // preprocess in-place
             let filt_g = filt.lock().unwrap().clone();
+            file_log!("WORKER: Starting preprocess, data.len()={}, n_samp={}, display_rows={}", data.len(), n_samp, display_rows.len());
             preprocess(&mut data, n_samp, &req.cfg, &filt_g, &cancel, &display_rows);
 
             if cancel.load(Ordering::Relaxed) {
@@ -207,9 +228,11 @@ pub fn spawn_worker(
             let mut st = lock.lock().unwrap();
             st.active_request = None;
             if st.request.is_some() {
+                file_log!("WORKER: Finished but discarded — new request waiting");
                 // newer request arrived — discard this result
                 st.status = WorkerStatus::Idle;
             } else {
+                file_log!("WORKER: Done. buf first={}, n_samp={}, data.len()={}, display_rows={}", buf.first_sample, buf.n_samp, buf.data.len(), buf.display_rows.len());
                 st.buffer = Some(buf);
                 st.status = WorkerStatus::Done;
                 ctx.request_repaint(); // Wake UI immediately

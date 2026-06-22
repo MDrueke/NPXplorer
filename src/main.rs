@@ -24,18 +24,25 @@ enum AppState {
 
 struct MainApp {
     state: AppState,
+    last_dir: Option<PathBuf>,
 }
 
 impl MainApp {
     fn new(ctx: &egui::Context, bin_path: Option<PathBuf>) -> Self {
         let mut visuals = egui::Visuals::dark();
-        let bg_color = egui::Color32::from_rgb(0x18, 0x18, 0x18);
+        let bg_color = egui::Color32::from_rgb(crate::render::C_ZERO[0], crate::render::C_ZERO[1], crate::render::C_ZERO[2]);
         visuals.panel_fill = bg_color;
         visuals.window_fill = bg_color;
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x28, 0x28, 0x28); // slightly lighter for hover
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0x38, 0x38, 0x38);  // slightly lighter for active
-        visuals.extreme_bg_color = visuals.widgets.inactive.bg_fill; // make text edits match sliders
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x28, 0x28, 0x28);
+        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0x38, 0x38, 0x38);
+        visuals.extreme_bg_color = visuals.widgets.inactive.bg_fill;
         ctx.set_visuals(visuals);
+
+        let last_dir = app::Preferences::load()
+            .and_then(|p| p.last_dir)
+            .map(PathBuf::from)
+            .or_else(|| bin_path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf())));
+
         let state = if let Some(path) = bin_path {
             match app::RawViewerApp::new(ctx, path) {
                 Ok(a) => AppState::Loaded(a),
@@ -47,12 +54,12 @@ impl MainApp {
         } else {
             AppState::Empty
         };
-        Self { state }
+        Self { state, last_dir }
     }
 
     fn custom_title_bar(&self, ctx: &egui::Context) {
         let title_bar_height = 24.0;
-        let title_bar_color = egui::Color32::from_rgb(0x18, 0x18, 0x18);
+        let title_bar_color = egui::Color32::from_rgb(crate::render::C_ZERO[0], crate::render::C_ZERO[1], crate::render::C_ZERO[2]);
         
         egui::TopBottomPanel::top("custom_title_bar")
             .frame(egui::Frame::NONE.fill(title_bar_color))
@@ -109,11 +116,14 @@ impl eframe::App for MainApp {
                     ui.horizontal(|ui| {
                         ui.menu_button("File", |ui| {
                             if ui.button("Open").clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
+                                let mut dlg = rfd::FileDialog::new()
                                     .add_filter("Recordings", &["bin", "cbin"])
                                     .add_filter("Uncompressed", &["bin"])
-                                    .add_filter("Compressed", &["cbin"])
-                                    .pick_file() {
+                                    .add_filter("Compressed", &["cbin"]);
+                                if let Some(dir) = &self.last_dir {
+                                    dlg = dlg.set_directory(dir);
+                                }
+                                if let Some(path) = dlg.pick_file() {
                                     file_to_open = Some(path);
                                 }
                                 ui.close_menu();
@@ -125,11 +135,14 @@ impl eframe::App for MainApp {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.centered_and_justified(|ui| {
                         if ui.add(egui::Button::new("open a file to start").frame(false)).clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
+                            let mut dlg = rfd::FileDialog::new()
                                 .add_filter("Recordings", &["bin", "cbin"])
                                 .add_filter("Uncompressed", &["bin"])
-                                .add_filter("Compressed", &["cbin"])
-                                .pick_file() {
+                                .add_filter("Compressed", &["cbin"]);
+                            if let Some(dir) = &self.last_dir {
+                                dlg = dlg.set_directory(dir);
+                            }
+                            if let Some(path) = dlg.pick_file() {
                                 file_to_open = Some(path);
                             }
                         }
@@ -140,11 +153,14 @@ impl eframe::App for MainApp {
                 app.update(ctx);
                 if app.file_dialog_request {
                     app.file_dialog_request = false;
-                    if let Some(path) = rfd::FileDialog::new()
+                    let mut dlg = rfd::FileDialog::new()
                         .add_filter("Recordings", &["bin", "cbin"])
                         .add_filter("Uncompressed", &["bin"])
-                        .add_filter("Compressed", &["cbin"])
-                        .pick_file() {
+                        .add_filter("Compressed", &["cbin"]);
+                    if let Some(dir) = &self.last_dir {
+                        dlg = dlg.set_directory(dir);
+                    }
+                    if let Some(path) = dlg.pick_file() {
                         file_to_open = Some(path);
                     }
                 }
@@ -152,6 +168,7 @@ impl eframe::App for MainApp {
         }
 
         if let Some(path) = file_to_open {
+            self.last_dir = path.parent().map(|p| p.to_path_buf());
             match app::RawViewerApp::new(ctx, path) {
                 Ok(a) => self.state = AppState::Loaded(a),
                 Err(e) => eprintln!("Error opening file: {e}"),

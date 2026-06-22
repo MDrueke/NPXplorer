@@ -13,8 +13,9 @@ pub struct ChannelGeom {
 /// `data_idx` is the row index into the PreprocBuffer data array (None for gaps).
 #[derive(Clone, Debug)]
 pub enum DisplayRow {
-    Data { data_idx: usize, channels: Vec<usize>, first_ch: usize, x_um: f32, y_um: f32 },
-    Gap,
+    Data { data_idx: usize, channels: Vec<usize>, first_ch: usize, x_um: f32, y_um: f32, shank: u32 },
+    IntraShankGap,
+    ShankBoundary,
 }
 
 #[derive(Clone, Debug)]
@@ -164,15 +165,14 @@ impl Meta {
             let pitch = *pitch_map.get(shank).unwrap_or(&20.0);
 
             if let Some((prev_shank, prev_y)) = prev {
-                let gap = if *shank != prev_shank {
-                    // different shank: always insert a gap
-                    true
+                if *shank != prev_shank {
+                    // different shank: always insert a ShankBoundary
+                    rows.push(DisplayRow::ShankBoundary);
                 } else {
                     // same shank: gap if spacing > 1.5× pitch
-                    (y - prev_y) > pitch * 1.5
-                };
-                if gap {
-                    rows.push(DisplayRow::Gap);
+                    if (y - prev_y) > pitch * 1.5 {
+                        rows.push(DisplayRow::IntraShankGap);
+                    }
                 }
             }
 
@@ -184,6 +184,7 @@ impl Meta {
                 first_ch,
                 x_um,
                 y_um: *y,
+                shank: *shank,
             });
             data_idx += 1;
             prev = Some((*shank, *y));
