@@ -1,24 +1,3 @@
-
-macro_rules! file_log {
-    ($($arg:tt)*) => {
-        {
-            let log_path = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("debug.log")))
-                .unwrap_or_else(|| std::path::PathBuf::from("debug.log"));
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                use std::io::Write;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0);
-                let _ = write!(f, "[{:.3}] ", now);
-                let _ = writeln!(f, $($arg)*);
-            }
-        }
-    };
-}
-
 use egui::{CentralPanel, TextureHandle, TextureOptions, TopBottomPanel, Ui, Vec2};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
@@ -82,14 +61,14 @@ impl Preferences {
     pub fn path() -> std::path::PathBuf {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
-                return dir.join("rawviewer_prefs.toml");
+                return dir.join("npxplorer_prefs.toml");
             }
         }
-        std::path::PathBuf::from("rawviewer_prefs.toml")
+        std::path::PathBuf::from("npxplorer_prefs.toml")
     }
 }
 
-pub struct RawViewerApp {
+pub struct NPXplorerApp {
     bin_path: PathBuf,
     meta: Arc<Meta>,
     is_compressed: bool,
@@ -97,10 +76,10 @@ pub struct RawViewerApp {
     // view state
     view_start_s: f64,
     view_dur_s: f64,
-    window_dur_str: String,   // owned string for the text field
-    jump_str: String,         // owned string for the jump text field
-    ch_first: usize,          // first_ch of first visible data row
-    ch_last: usize,           // first_ch of last visible data row
+    window_dur_str: String,
+    jump_str: String,
+    ch_first: usize,
+    ch_last: usize,
 
     // preprocessing
     preproc_cfg: PreprocConfig,
@@ -109,8 +88,8 @@ pub struct RawViewerApp {
 
     // color scale
     color_mode: ColorMode,
-    color_pct: f32,           // percentile (80.0–100.0), default 99.0
-    color_uv: f32,            // voltage default 120.0
+    color_pct: f32,
+    color_uv: f32,
     color_pct_str: String,
     color_uv_str: String,
     colormap_choice: ColorMapChoice,
@@ -145,9 +124,14 @@ pub struct RawViewerApp {
     pending_cfg_recompute: bool,
     pub file_dialog_request: bool,
     projection_sums: Vec<f32>,
+    // spike projection cache keys
+    proj_view_first: usize,
+    proj_view_n: usize,
+    proj_threshold: f32,
+    proj_cfg: Option<PreprocConfig>,
 }
 
-impl RawViewerApp {
+impl NPXplorerApp {
     pub fn new(ctx: &egui::Context, bin_path: PathBuf) -> anyhow::Result<Self> {
         let meta_path = bin_path.with_extension("meta");
         let meta = Arc::new(Meta::from_file(&meta_path)?);
@@ -252,6 +236,10 @@ impl RawViewerApp {
             pending_cfg_recompute: false,
             file_dialog_request: false,
             projection_sums: Vec::new(),
+            proj_view_first: usize::MAX,
+            proj_view_n: 0,
+            proj_threshold: 0.0,
+            proj_cfg: None,
         })
     }
 
@@ -630,17 +618,8 @@ impl RawViewerApp {
     }
 }
 
-impl RawViewerApp {
+impl NPXplorerApp {
     pub fn update(&mut self, ctx: &egui::Context) {
-        // request repaint while worker is busy
-        {
-            let (lock, _) = &*self.worker_state;
-            let st = lock.lock().unwrap();
-            if st.status == WorkerStatus::Computing || st.request.is_some() {
-                ctx.request_repaint_after(std::time::Duration::from_millis(50));
-            }
-        }
-
         let mut show_prefs = self.show_preferences;
         if show_prefs {
             egui::Window::new("Preferences")
@@ -733,31 +712,56 @@ impl RawViewerApp {
                 let view_n = (self.view_dur_s * fs) as usize;
                 let center = view_first + view_n / 2;
 
-                // check buffer coverage
-                let (matches_view, matches_cfg, display_rows_opt, vmax, buf_cfg) = {
+                // === single snapshot of worker state for all reads this frame ===
+                let (
+                    w_status, w_has_request,
+                    buf_first, buf_n_samp, buf_data, buf_cfg, buf_display_rows,
+                    matches_view, matches_cfg,
+                    req_center_cfg, act_center_cfg,
+                ) = {
                     let (lock, _) = &*self.worker_state;
                     let st = lock.lock().unwrap();
+                    let status = st.status.clone();
+                    let has_req = st.request.is_some();
+                    let req_cc = st.request.as_ref().map(|r| (r.center_sample, r.cfg.clone()));
+                    let act_cc = st.active_request.as_ref().map(|r| (r.center_sample, r.cfg.clone()));
+
                     if let Some(buf) = &st.buffer {
                         let buf_end = buf.first_sample + buf.n_samp;
                         let max_view_n = self.meta.n_samples.saturating_sub(view_first);
                         let expected_end = view_first + view_n.min(max_view_n);
                         let m_view = buf.first_sample <= view_first && expected_end <= buf_end;
                         let m_cfg = buf.cfg == self.preproc_cfg;
-                        
-                        let v = if self.color_mode == ColorMode::Percentile {
-                            let pct_idx = (self.color_pct * 100.0).round() as usize;
-                            buf.vmax_pct[pct_idx.min(10000)]
-                        } else {
-                            self.color_uv
-                        };
-                        
-                        (m_view, m_cfg, Some(Arc::clone(&buf.display_rows)), v, Some(buf.cfg.clone()))
+
+                        (status, has_req,
+                         buf.first_sample, buf.n_samp,
+                         Some(Arc::clone(&buf.data)), Some(buf.cfg.clone()),
+                         Some(Arc::clone(&buf.display_rows)),
+                         m_view, m_cfg, req_cc, act_cc)
                     } else {
-                        (false, false, None, 250.0f32, None)
+                        (status, has_req, 0, 0, None, None, None, false, false, req_cc, act_cc)
                     }
                 };
 
-                let vmax = vmax.max(1.0);
+                // request repaint while worker is busy (moved here from top to use snapshot)
+                if w_status == WorkerStatus::Computing || w_has_request {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                }
+
+                // compute vmax from current UI settings
+                let vmax = if matches_view {
+                    if self.color_mode == ColorMode::Percentile {
+                        // need percentile table — quick lock just for the lookup
+                        let (lock, _) = &*self.worker_state;
+                        let st = lock.lock().unwrap();
+                        if let Some(buf) = &st.buffer {
+                            let pct_idx = (self.color_pct * 100.0).round() as usize;
+                            buf.vmax_pct[pct_idx.min(10000)].max(1.0)
+                        } else { 250.0 }
+                    } else {
+                        self.color_uv.max(1.0)
+                    }
+                } else { 250.0 };
 
                 // Rebuild heatmap if we have data for the view
                 if matches_view {
@@ -773,75 +777,81 @@ impl RawViewerApp {
                         || (cfg_changed && matches_cfg);
 
                     if need_rebuild && view_n > 0 {
-                        if let Some(display_rows) = &display_rows_opt {
-                            let (data_arc, stride, offset, n) = {
-                                let (lock, _) = &*self.worker_state;
-                                let st = lock.lock().unwrap();
-                                let buf = st.buffer.as_ref().unwrap();
-                                let off = view_first - buf.first_sample;
-                                let n = view_n.min(buf.n_samp - off);
-                                (Arc::clone(&buf.data), buf.n_samp, off, n)
-                            };
+                        if let (Some(data_arc), Some(display_rows)) = (&buf_data, &buf_display_rows) {
+                            let offset = view_first - buf_first;
+                            let n = view_n.min(buf_n_samp - offset);
+                            let stride = buf_n_samp;
 
                             let (first_row, last_row) = self.visible_row_range(display_rows);
-                            
-                            // Compute projection sums (spike counts)
-                            let visible = &display_rows[first_row..=last_row];
-                            let mut sums = vec![0.0f32; visible.len()];
-                            
-                            let sample_rate = self.meta.sample_rate;
-                            let refractory_samples = (1.5 * sample_rate as f32 / 1000.0) as usize;
-                            let threshold = self.spike_threshold;
 
-                            use rayon::prelude::*;
-                            sums.par_iter_mut().enumerate().for_each(|(i, count)| {
-                                if let DisplayRow::Data { data_idx, .. } = &visible[i] {
-                                    let base = data_idx * stride + offset;
-                                    if base + n <= data_arc.len() {
-                                        let ch_data = &data_arc[base..base + n];
-                                        let mut spikes = 0.0f32;
-                                        let mut last_spike = None;
-                                        for (t, &v) in ch_data.iter().enumerate() {
-                                            if v < threshold {
-                                                if let Some(last_t) = last_spike {
-                                                    if t - last_t > refractory_samples {
+                            // spike projection: only recompute if view/threshold/cfg changed
+                            let proj_stale = self.proj_view_first != view_first
+                                || self.proj_view_n != view_n
+                                || self.proj_threshold != self.spike_threshold
+                                || self.proj_cfg.as_ref() != Some(&self.preproc_cfg);
+
+                            if proj_stale {
+                                let visible = &display_rows[first_row..=last_row];
+                                let mut sums = vec![0.0f32; visible.len()];
+                                
+                                let sample_rate = self.meta.sample_rate;
+                                let refractory_samples = (1.5 * sample_rate as f32 / 1000.0) as usize;
+                                let threshold = self.spike_threshold;
+
+                                use rayon::prelude::*;
+                                sums.par_iter_mut().enumerate().for_each(|(i, count)| {
+                                    if let DisplayRow::Data { data_idx, .. } = &visible[i] {
+                                        let base = data_idx * stride + offset;
+                                        if base + n <= data_arc.len() {
+                                            let ch_data = &data_arc[base..base + n];
+                                            let mut spikes = 0.0f32;
+                                            let mut last_spike = None;
+                                            for (t, &v) in ch_data.iter().enumerate() {
+                                                if v < threshold {
+                                                    if let Some(last_t) = last_spike {
+                                                        if t - last_t > refractory_samples {
+                                                            spikes += 1.0;
+                                                            last_spike = Some(t);
+                                                        }
+                                                    } else {
                                                         spikes += 1.0;
                                                         last_spike = Some(t);
                                                     }
-                                                } else {
-                                                    spikes += 1.0;
-                                                    last_spike = Some(t);
                                                 }
                                             }
+                                            *count = spikes;
                                         }
-                                        *count = spikes;
                                     }
-                                }
-                            });
+                                });
 
-                            // Apply Gaussian convolution (sigma = 1.5, kernel size 7)
-                            let kernel = [0.0366, 0.111, 0.217, 0.271, 0.217, 0.111, 0.0366];
-                            let k_rad = 3;
-                            let mut smoothed = vec![0.0f32; sums.len()];
-                            for i in 0..sums.len() {
-                                let mut v = 0.0;
-                                let mut weight_sum = 0.0;
-                                for j in 0..=6 {
-                                    let idx = i as isize + (j as isize - k_rad);
-                                    if idx >= 0 && idx < sums.len() as isize {
-                                        v += sums[idx as usize] * kernel[j];
-                                        weight_sum += kernel[j];
+                                // Gaussian convolution (sigma=1.5, kernel size 7)
+                                let kernel = [0.0366, 0.111, 0.217, 0.271, 0.217, 0.111, 0.0366];
+                                let k_rad = 3;
+                                let mut smoothed = vec![0.0f32; sums.len()];
+                                for i in 0..sums.len() {
+                                    let mut v = 0.0;
+                                    let mut weight_sum = 0.0;
+                                    for j in 0..=6 {
+                                        let idx = i as isize + (j as isize - k_rad);
+                                        if idx >= 0 && idx < sums.len() as isize {
+                                            v += sums[idx as usize] * kernel[j];
+                                            weight_sum += kernel[j];
+                                        }
+                                    }
+                                    if weight_sum > 0.0 {
+                                        smoothed[i] = v / weight_sum;
                                     }
                                 }
-                                if weight_sum > 0.0 {
-                                    smoothed[i] = v / weight_sum;
-                                }
+                                self.projection_sums = smoothed;
+                                self.proj_view_first = view_first;
+                                self.proj_view_n = view_n;
+                                self.proj_threshold = self.spike_threshold;
+                                self.proj_cfg = Some(self.preproc_cfg.clone());
                             }
-                            self.projection_sums = smoothed;
 
                             build_heatmap_into(
                                 &mut self.pixel_buf,
-                                &data_arc,
+                                data_arc,
                                 display_rows,
                                 first_row, last_row,
                                 stride, offset, n,
@@ -858,25 +868,18 @@ impl RawViewerApp {
                     }
                 }
 
-                // Request new background computation if needed
+                // request new background computation if needed (uses snapshot for checks, locks only for writes)
                 let mut requested_new = false;
                 if !matches_view || !matches_cfg || self.pending_cfg_recompute {
-                    // We need a new buffer either because we are out of bounds, or settings changed.
-                    // But we ONLY send a new request if we haven't already requested it.
                     let already_requested = {
-                        let (lock, _) = &*self.worker_state;
-                        let st = lock.lock().unwrap();
-                        let req_match = st.request.as_ref().map_or(false, |r| r.center_sample == center && r.cfg == self.preproc_cfg);
-                        let act_match = st.active_request.as_ref().map_or(false, |r| r.center_sample == center && r.cfg == self.preproc_cfg);
+                        let req_match = req_center_cfg.as_ref().map_or(false, |(c, cfg)| *c == center && *cfg == self.preproc_cfg);
+                        let act_match = act_center_cfg.as_ref().map_or(false, |(c, cfg)| *c == center && *cfg == self.preproc_cfg);
                         req_match || act_match
                     };
 
                     if !already_requested {
                         file_log!("UI: Requesting recompute. matches_view={}, matches_cfg={}, pending_cfg={}, center={}", matches_view, matches_cfg, self.pending_cfg_recompute, center);
-                        if let Some(buf) = { let (lock,_) = &*self.worker_state; lock.lock().unwrap().buffer.as_ref().map(|b| (b.first_sample, b.n_samp, b.cfg.clone())) } {
-                            file_log!("UI: Current buf first={}, n={}, cfg={:?}", buf.0, buf.1, buf.2);
-                        }
-                        file_log!("UI: view_first={}, view_n={}, expected_end={}", view_first, view_n, view_first + view_n.min(self.meta.n_samples.saturating_sub(view_first)));
+                        file_log!("UI: buf first={}, n={}, view_first={}, view_n={}", buf_first, buf_n_samp, view_first, view_n);
                         self.request_recompute();
                         self.last_requested_center = center;
                         requested_new = true;
@@ -887,21 +890,13 @@ impl RawViewerApp {
                 }
 
                 if matches_view && matches_cfg && !requested_new {
-                    // Prefetch logic: request next chunk if approaching edge,
-                    // but ONLY if we haven't requested it already.
+                    // prefetch logic (uses snapshot values)
                     let prefetch_margin = self.worker_half_window / 4;
-                    let (buf_first, buf_end) = {
-                        let (lock, _) = &*self.worker_state;
-                        let st = lock.lock().unwrap();
-                        if let Some(buf) = &st.buffer {
-                            (buf.first_sample, buf.first_sample + buf.n_samp)
-                        } else { (0, 0) }
-                    };
+                    let buf_end = buf_first + buf_n_samp;
                     
                     let mut near_left = view_first < buf_first + prefetch_margin;
                     let mut near_right = view_first + view_n + prefetch_margin > buf_end;
 
-                    // Prevent prefetching past the file bounds!
                     if near_left && buf_first == 0 {
                         near_left = false;
                     }
@@ -910,7 +905,6 @@ impl RawViewerApp {
                     }
                         
                     if near_left || near_right {
-                        // The next center should be shifted towards the direction we are heading.
                         let next_center = if near_left {
                             view_first.saturating_sub(self.worker_half_window / 2)
                         } else {
@@ -918,15 +912,12 @@ impl RawViewerApp {
                         };
                         
                         let already_requested = {
-                            let (lock, _) = &*self.worker_state;
-                            let st = lock.lock().unwrap();
-                            let req_match = st.request.as_ref().map_or(false, |r| r.center_sample == next_center && r.cfg == self.preproc_cfg);
-                            let act_match = st.active_request.as_ref().map_or(false, |r| r.center_sample == next_center && r.cfg == self.preproc_cfg);
+                            let req_match = req_center_cfg.as_ref().map_or(false, |(c, cfg)| *c == next_center && *cfg == self.preproc_cfg);
+                            let act_match = act_center_cfg.as_ref().map_or(false, |(c, cfg)| *c == next_center && *cfg == self.preproc_cfg);
                             req_match || act_match
                         };
 
                         if !already_requested {
-                            // cancel any in-flight computation
                             self.worker_cancel.store(true, Ordering::Relaxed);
                             let req = WorkerRequest {
                                 center_sample: next_center,
@@ -942,7 +933,7 @@ impl RawViewerApp {
                     }
                 }
 
-                // Show loading warning only if we have no texture to display
+                // loading indicator
                 if self.heatmap_texture.is_none() {
                     ui.painter().text(
                         ui.clip_rect().center(),
@@ -962,7 +953,7 @@ impl RawViewerApp {
                         .sense(egui::Sense::click());
                     let resp = ui.add(img_widget);
 
-                    // Click detection
+                    // click detection
                     let mut click_pos = None;
                     let mut is_left_click = false;
                     let mut is_right_click = false;
@@ -976,17 +967,11 @@ impl RawViewerApp {
                         is_right_click = true;
                     }
 
-                    let display_rows_arc = {
-                        let (lock, _) = &*self.worker_state;
-                        let st = lock.lock().unwrap();
-                        st.buffer.as_ref().map(|b| Arc::clone(&b.display_rows))
-                    };
-
-                    if let Some(display_rows) = &display_rows_arc {
-                        let (first_row, last_row) = self.visible_row_range(&display_rows);
+                    if let Some(display_rows) = &buf_display_rows {
+                        let (first_row, last_row) = self.visible_row_range(display_rows);
                         let n_rows = last_row.saturating_sub(first_row) + 1;
 
-                        // Handle clicks
+                        // handle clicks
                         if let Some(pos) = click_pos {
                             let frac_y = ((pos.y - resp.rect.top()) / resp.rect.height()).clamp(0.0, 1.0);
                             let disp_idx = last_row.saturating_sub(
@@ -1004,7 +989,7 @@ impl RawViewerApp {
                             }
                         }
 
-                        // Draw lines
+                        // draw channel marker lines
                         let draw_line = |ch_to_draw: usize, color: egui::Color32| {
                             for r in first_row..=last_row {
                                 if let DisplayRow::Data { first_ch, .. } = &display_rows[r] {
@@ -1028,13 +1013,12 @@ impl RawViewerApp {
                             draw_line(ch2, egui::Color32::from_rgba_unmultiplied(255, 182, 23, 128));
                         }
 
-                        // Draw Projection Overlay
+                        // draw projection overlay
                         if !self.projection_sums.is_empty() {
                             // scale with window duration and threshold (baseline: -20 µV → 1x)
                             let threshold_scale = self.spike_threshold.abs() / 20.0;
                             let spike_scale_factor = threshold_scale * (0.5 / self.view_dur_s) as f32;
                             
-                            // 10% opacity colors for each colormap
                             let color = match self.colormap_choice {
                                 ColorMapChoice::YellowMagenta => egui::Color32::from_rgba_unmultiplied(250, 234, 130, 5),
                                 ColorMapChoice::RedBlue => egui::Color32::from_rgba_unmultiplied(204, 103, 230, 8),
@@ -1045,17 +1029,16 @@ impl RawViewerApp {
                             };
 
                             let min_x = resp.rect.left();
-                            let max_x = resp.rect.right(); // Can project across the entire image if scaled high enough
+                            let max_x = resp.rect.right();
                             let top_y = resp.rect.top();
                             let h = resp.rect.height();
-
                             let row_h = h / n_rows as f32;
 
                             let mut mesh = egui::epaint::Mesh::default();
 
                             for (i, &count) in self.projection_sums.iter().enumerate() {
                                 let x = min_x + count * spike_scale_factor;
-                                let x = x.min(max_x); // clamp to the right edge of the image
+                                let x = x.min(max_x);
                                 
                                 let y = top_y + h - (i as f32 + 0.5) * row_h;
 
@@ -1098,8 +1081,8 @@ impl RawViewerApp {
                     });
 
                     if let Some(pos) = hover_pos {
-                        if let Some(display_rows) = &display_rows_arc {
-                            let (first_row, last_row) = self.visible_row_range(&display_rows);
+                        if let Some(display_rows) = &buf_display_rows {
+                            let (first_row, last_row) = self.visible_row_range(display_rows);
                             let n_rows = last_row.saturating_sub(first_row) + 1;
 
                             let frac_y = ((pos.y - resp.rect.top()) / resp.rect.height()).clamp(0.0, 1.0);
@@ -1116,15 +1099,15 @@ impl RawViewerApp {
                             let frac_x = ((pos.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0);
                             let t = self.view_start_s + frac_x as f64 * self.view_dur_s;
 
+                            // voltage readout from snapshot data
                             let voltage_uv: Option<f32> = if let Some(DisplayRow::Data { data_idx, .. }) = display_rows.get(disp_idx) {
-                                let (lock, _) = &*self.worker_state;
-                                let st = lock.lock().unwrap();
-                                if let Some(buf) = &st.buffer {
+                                if let Some(data) = &buf_data {
                                     let t_sample = (t * self.meta.sample_rate) as usize;
-                                    if t_sample >= buf.first_sample {
-                                        let off = t_sample - buf.first_sample;
-                                        if off < buf.n_samp {
-                                            Some(buf.data[data_idx * buf.n_samp + off])
+                                    if t_sample >= buf_first {
+                                        let off = t_sample - buf_first;
+                                        let idx = data_idx * buf_n_samp + off;
+                                        if off < buf_n_samp && idx < data.len() {
+                                            Some(data[idx])
                                         } else { None }
                                     } else { None }
                                 } else { None }
@@ -1133,12 +1116,10 @@ impl RawViewerApp {
                             let volt_str = voltage_uv.map(|v| format!("  {:.1} µV", v)).unwrap_or_default();
                             let label = format!("{}t = {:.4} s{}", ch_str, t, volt_str);
                             
-                            // Measure text to draw background
                             let font_id = egui::FontId::proportional(12.0);
                             let galley = ui.painter().layout_no_wrap(label, font_id.clone(), egui::Color32::from_rgba_unmultiplied(220, 220, 220, 200));
                             let text_pos = resp.rect.left_bottom() + Vec2::new(6.0, -6.0 - galley.rect.height());
                             
-                            // Background box
                             let bg_rect = galley.rect.translate(text_pos.to_vec2()).expand(4.0);
                             ui.painter().rect_filled(bg_rect, 2.0, egui::Color32::from_rgba_unmultiplied(crate::render::C_ZERO[0], crate::render::C_ZERO[1], crate::render::C_ZERO[2], 200));
                             
@@ -1146,7 +1127,7 @@ impl RawViewerApp {
                         }
                     }
 
-                    // Scale bar overlay (10% of view_dur_s) bottom right
+                    // scale bar overlay (10% of view_dur_s) bottom right
                     let scale_bar_frac = 0.1;
                     let scale_bar_w = avail.x * scale_bar_frac;
                     let scale_bar_h = 4.0;

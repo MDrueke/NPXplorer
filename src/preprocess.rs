@@ -392,6 +392,10 @@ thread_local! {
     static KFILT_COL: RefCell<Vec<f32>> = RefCell::new(Vec::new());
 }
 
+/// Raw mutable pointer wrapper for cross-thread access in rayon.
+/// SAFETY: this is only safe when each parallel iteration accesses
+/// disjoint memory. All uses iterate over time samples `t`, where
+/// each `t` touches `ch * n_samp + t` — guaranteed disjoint for distinct `t`.
 struct SendPtr(*mut f32);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}

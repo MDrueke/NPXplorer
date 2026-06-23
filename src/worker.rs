@@ -1,23 +1,5 @@
 
-macro_rules! file_log {
-    ($($arg:tt)*) => {
-        {
-            let log_path = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("debug.log")))
-                .unwrap_or_else(|| std::path::PathBuf::from("debug.log"));
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                use std::io::Write;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0);
-                let _ = write!(f, "[{:.3}] ", now);
-                let _ = writeln!(f, $($arg)*);
-            }
-        }
-    };
-}
+
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -215,6 +197,11 @@ pub fn spawn_worker(
 
             // compute percentile table
             let vmax_pct = compute_pct_table(&data);
+
+            let n_data_rows = display_rows.iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
+            debug_assert_eq!(data.len(), n_data_rows * n_samp,
+                "data/display_rows dimension mismatch: data.len()={} != {}*{}",
+                data.len(), n_data_rows, n_samp);
 
             let buf = PreprocBuffer {
                 first_sample: first,

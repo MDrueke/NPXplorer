@@ -1,3 +1,29 @@
+pub static DEBUG_LOGGING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Logging macro that only writes when --debug is active.
+/// Writes to debug.log next to the executable with timestamps.
+#[macro_export]
+macro_rules! file_log {
+    ($($arg:tt)*) => {
+        if $crate::DEBUG_LOGGING.load(std::sync::atomic::Ordering::Relaxed) {
+            let log_path = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("debug.log")))
+                .unwrap_or_else(|| std::path::PathBuf::from("debug.log"));
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                use std::io::Write;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                let _ = write!(f, "[{:.3}] ", now);
+                let _ = writeln!(f, $($arg)*);
+            }
+        }
+    };
+}
+
 mod app;
 mod data;
 mod geometry;
@@ -10,21 +36,26 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "rawviewer", about = "Neuropixels raw data viewer")]
+#[command(name = "npxplorer", about = "Neuropixels raw data viewer")]
 struct Args {
     /// Path to the .ap.bin SpikeGLX file
     #[arg(short, long)]
     file: Option<PathBuf>,
+
+    /// Enable debug logging to debug.log next to the executable
+    #[arg(long)]
+    debug: bool,
 }
 
 enum AppState {
     Empty,
-    Loaded(app::RawViewerApp),
+    Loaded(app::NPXplorerApp),
 }
 
 struct MainApp {
     state: AppState,
     last_dir: Option<PathBuf>,
+    error_msg: Option<String>,
 }
 
 impl MainApp {
@@ -43,18 +74,19 @@ impl MainApp {
             .map(PathBuf::from)
             .or_else(|| bin_path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf())));
 
+        let mut error_msg = None;
         let state = if let Some(path) = bin_path {
-            match app::RawViewerApp::new(ctx, path) {
+            match app::NPXplorerApp::new(ctx, path) {
                 Ok(a) => AppState::Loaded(a),
                 Err(e) => {
-                    eprintln!("Error opening file: {e}");
+                    error_msg = Some(format!("{e}"));
                     AppState::Empty
                 }
             }
         } else {
             AppState::Empty
         };
-        Self { state, last_dir }
+        Self { state, last_dir, error_msg }
     }
 
     fn custom_title_bar(&self, ctx: &egui::Context) {
@@ -80,7 +112,7 @@ impl MainApp {
                     // Title text
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new("RawViewer v0.1 beta").color(egui::Color32::WHITE).size(14.0));
+                        ui.label(egui::RichText::new("NPXplorer v0.1 beta").color(egui::Color32::WHITE).size(14.0));
                     });
                     
                     // Window controls
@@ -134,18 +166,25 @@ impl eframe::App for MainApp {
 
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.centered_and_justified(|ui| {
-                        if ui.add(egui::Button::new("open a file to start").frame(false)).clicked() {
-                            let mut dlg = rfd::FileDialog::new()
-                                .add_filter("Recordings", &["bin", "cbin"])
-                                .add_filter("Uncompressed", &["bin"])
-                                .add_filter("Compressed", &["cbin"]);
-                            if let Some(dir) = &self.last_dir {
-                                dlg = dlg.set_directory(dir);
+                        ui.vertical_centered(|ui| {
+                            if ui.add(egui::Button::new("open a file to start").frame(false)).clicked() {
+                                let mut dlg = rfd::FileDialog::new()
+                                    .add_filter("Recordings", &["bin", "cbin"])
+                                    .add_filter("Uncompressed", &["bin"])
+                                    .add_filter("Compressed", &["cbin"]);
+                                if let Some(dir) = &self.last_dir {
+                                    dlg = dlg.set_directory(dir);
+                                }
+                                if let Some(path) = dlg.pick_file() {
+                                    file_to_open = Some(path);
+                                }
                             }
-                            if let Some(path) = dlg.pick_file() {
-                                file_to_open = Some(path);
+                            // show error if any
+                            if let Some(err) = &self.error_msg {
+                                ui.add_space(20.0);
+                                ui.colored_label(egui::Color32::from_rgb(0xff, 0x66, 0x66), format!("Error: {err}"));
                             }
-                        }
+                        });
                     });
                 });
             }
@@ -169,9 +208,15 @@ impl eframe::App for MainApp {
 
         if let Some(path) = file_to_open {
             self.last_dir = path.parent().map(|p| p.to_path_buf());
-            match app::RawViewerApp::new(ctx, path) {
-                Ok(a) => self.state = AppState::Loaded(a),
-                Err(e) => eprintln!("Error opening file: {e}"),
+            match app::NPXplorerApp::new(ctx, path) {
+                Ok(a) => {
+                    self.state = AppState::Loaded(a);
+                    self.error_msg = None;
+                }
+                Err(e) => {
+                    self.error_msg = Some(format!("{e}"));
+                    self.state = AppState::Empty;
+                }
             }
         }
     }
@@ -186,9 +231,14 @@ impl eframe::App for MainApp {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    if args.debug {
+        DEBUG_LOGGING.store(true, std::sync::atomic::Ordering::Relaxed);
+        file_log!("=== NPXplorer debug logging started ===");
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("RawViewer v0.1 beta")
+            .with_title("NPXplorer v0.1 beta")
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([800.0, 500.0])
             .with_decorations(false),
@@ -196,7 +246,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     eframe::run_native(
-        "RawViewer v0.1 beta",
+        "NPXplorer v0.1 beta",
         options,
         Box::new(move |cc| {
             Ok(Box::new(MainApp::new(&cc.egui_ctx, args.file)))

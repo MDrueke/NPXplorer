@@ -1,10 +1,10 @@
 [package]
-name = "rawviewer"
-version = "0.12.0"
+name = "npxplorer"
+version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "rawviewer"
+name = "npxplorer"
 path = "src/main.rs"
 
 [dependencies]

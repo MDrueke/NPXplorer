@@ -1,8 +1,10 @@
-# RawViewer v0.1 beta
+# NPXplorer v0.1 beta
 
 A lightweight viewer for raw Neuropixels electrophysiology data. Renders voltage traces as a heatmap mapped to the physical probe geometry in real time.
 
 **This is beta software.** It has not been extensively tested across all recording configurations and probe types. Expect rough edges.
+
+![App Screenshot](ex_screenshot.png)
 
 ## Requirements
 
@@ -14,12 +16,12 @@ A lightweight viewer for raw Neuropixels electrophysiology data. Renders voltage
 
 Launch with a file:
 ```bash
-rawviewer --file /path/to/data.ap.bin
+npxplorer --file /path/to/data.ap.bin
 ```
 
 Or launch empty and use the file picker:
 ```bash
-rawviewer
+npxplorer
 ```
 
 ### Navigation
@@ -66,7 +68,7 @@ A semi-transparent bar overlay on the left side of the heatmap shows threshold c
 
 ## Configuration
 
-Preferences are saved to `rawviewer_prefs.toml` in the same directory as the executable. This includes preprocessing settings, colormap, color scale mode, spike threshold, window duration, and the last opened directory.
+Preferences are saved to `npxplorer_prefs.toml` in the same directory as the executable. This includes preprocessing settings, colormap, color scale mode, spike threshold, window duration, and the last opened directory.
 
 ## Building from source
 
@@ -75,7 +77,7 @@ Requires Rust (stable). Build with:
 cargo build --release
 ```
 
-The binary will be at `target/release/rawviewer`. Debug builds are too slow for real-time rendering of full Neuropixels data.
+The binary will be at `target/release/npxplorer`. Debug builds are too slow for real-time rendering of full Neuropixels data.
 
 ## Known limitations
 

@@ -1,5 +1,2 @@
-
-1. Optimize FireIce colormap to darken out the mid colors a bit
-
-2. Double clicking a channel opens a window to view the single channel waveform
+1. Double clicking a channel opens a window to view the single channel waveform
 
