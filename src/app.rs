@@ -8,7 +8,7 @@ use crate::data::{DisplayRow, Meta, open_data};
 use crate::preprocess::{Filters, PreprocConfig, SpatialFilter};
 use crate::render::build_heatmap_into;
 use crate::worker::{
-    SharedCancel, SharedWorkerState, WorkerRequest, WorkerState, WorkerStatus,
+    RequestKind, SharedCancel, SharedWorkerState, WorkerRequest, WorkerState, WorkerStatus,
     compute_half_window, spawn_worker,
 };
 
@@ -28,6 +28,9 @@ pub enum ColorMapChoice {
     GreyScale,
 }
 
+fn default_padding_s() -> f64 { 2.5 }
+fn default_extension_s() -> f64 { 1.0 }
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Preferences {
     pub preproc_cfg: PreprocConfig,
@@ -37,6 +40,10 @@ pub struct Preferences {
     pub color_uv: f32,
     pub colormap_choice: ColorMapChoice,
     pub spike_threshold: f32,
+    #[serde(default = "default_padding_s")]
+    pub padding_s: f64,
+    #[serde(default = "default_extension_s")]
+    pub extension_s: f64,
     #[serde(default)]
     pub last_dir: Option<String>,
 }
@@ -106,6 +113,8 @@ pub struct NPXplorerApp {
     worker_state: SharedWorkerState,
     worker_cancel: SharedCancel,
     worker_half_window: usize,
+    padding_s: f64,
+    extension_s: f64,
     _worker_handle: std::thread::JoinHandle<()>,
 
     // rendering
@@ -157,6 +166,8 @@ impl NPXplorerApp {
         let mut color_uv = 120.0;
         let mut colormap_choice = ColorMapChoice::IceFire;
         let mut spike_threshold = -40.0;
+        let mut padding_s = 2.5f64;
+        let mut extension_s = 1.0f64;
 
         if let Some(p) = prefs {
             preproc_cfg = p.preproc_cfg;
@@ -168,12 +179,14 @@ impl NPXplorerApp {
             color_uv = p.color_uv;
             colormap_choice = p.colormap_choice;
             spike_threshold = p.spike_threshold;
+            padding_s = p.padding_s;
+            extension_s = p.extension_s;
         }
         let filters = Arc::new(Mutex::new(Filters::new(&preproc_cfg)));
         let shared: SharedWorkerState = Arc::new((Mutex::new(WorkerState::new()), Condvar::new()));
         let cancel: SharedCancel = Arc::new(AtomicBool::new(false));
 
-        let half_window = compute_half_window(view_dur_s, fs);
+        let half_window = compute_half_window(view_dur_s, padding_s, fs);
 
         let handle = spawn_worker(
             Arc::clone(&raw),
@@ -188,8 +201,10 @@ impl NPXplorerApp {
         {
             let (lock, cvar) = &*shared;
             lock.lock().unwrap().request = Some(WorkerRequest {
-                center_sample: (half_window as f64 * 0.5 * fs / fs) as usize,
-                half_window,
+                kind: RequestKind::Full {
+                    center_sample: half_window,
+                    half_window,
+                },
                 cfg: preproc_cfg.clone(),
             });
             cvar.notify_one();
@@ -224,6 +239,8 @@ impl NPXplorerApp {
             worker_state: shared,
             worker_cancel: cancel,
             worker_half_window: half_window,
+            padding_s,
+            extension_s,
             _worker_handle: handle,
             heatmap_texture: None,
             pixel_buf: Vec::new(),
@@ -253,6 +270,8 @@ impl NPXplorerApp {
             color_uv: self.color_uv,
             colormap_choice: self.colormap_choice.clone(),
             spike_threshold: self.spike_threshold,
+            padding_s: self.padding_s,
+            extension_s: self.extension_s,
             last_dir,
         };
         prefs.save();
@@ -268,8 +287,10 @@ impl NPXplorerApp {
         // cancel any in-flight computation
         self.worker_cancel.store(true, Ordering::Relaxed);
         let req = WorkerRequest {
-            center_sample: center,
-            half_window: self.worker_half_window,
+            kind: RequestKind::Full {
+                center_sample: center,
+                half_window: self.worker_half_window,
+            },
             cfg: self.preproc_cfg.clone(),
         };
         let (lock, cvar) = &*self.worker_state;
@@ -318,8 +339,6 @@ impl NPXplorerApp {
                 self.bin_path.file_name().unwrap_or_default().to_string_lossy()
             ));
             ui.separator();
-            ui.label(format!("t = {:.3} s", self.view_start_s));
-
             // window duration text field — stored separately to avoid overwrite each frame
             ui.label("Window:");
             let resp = ui.add(
@@ -332,7 +351,7 @@ impl NPXplorerApp {
                     let new_dur = v.clamp(0.01, 10.0);
                     if (new_dur - self.view_dur_s).abs() > 1e-6 {
                         self.view_dur_s = new_dur;
-                        self.worker_half_window = compute_half_window(self.view_dur_s, self.meta.sample_rate);
+                        self.worker_half_window = compute_half_window(self.view_dur_s, self.padding_s, self.meta.sample_rate);
                         self.heatmap_texture = None;
                         self.pending_cfg_recompute = true;
                     }
@@ -349,7 +368,7 @@ impl NPXplorerApp {
             ui.separator();
 
             // Color scale controls
-            ui.label("Color:");
+            ui.label("Color scale:");
 
             if ui.radio_value(&mut self.color_mode, ColorMode::Percentile, "%ile").changed()
                 || ui.radio_value(&mut self.color_mode, ColorMode::Voltage, "±µV").changed() {
@@ -656,13 +675,39 @@ impl NPXplorerApp {
                     ui.horizontal(|ui| {
                         ui.label("Spike Threshold (µV):");
                         if ui.add(egui::DragValue::new(&mut self.spike_threshold).speed(1.0).suffix(" µV")).changed() {
-                            self.heatmap_texture = None; // redraw to update projection
+                            self.heatmap_texture = None;
+                            self.save_prefs();
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Initial buffer padding (s):");
+                        if ui.add(
+                            egui::DragValue::new(&mut self.padding_s)
+                                .speed(0.1).range(0.5..=10.0).suffix(" s")
+                        ).changed() {
+                            let fs = self.meta.sample_rate;
+                            self.worker_half_window = compute_half_window(self.view_dur_s, self.padding_s, fs);
+                            self.pending_cfg_recompute = true;
+                            self.save_prefs();
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Extension chunk (s):");
+                        if ui.add(
+                            egui::DragValue::new(&mut self.extension_s)
+                                .speed(0.1).range(0.1..=5.0).suffix(" s")
+                        ).changed() {
                             self.save_prefs();
                         }
                     });
                 });
         }
         self.show_preferences = show_prefs;
+        // scroll_dir: +1 = forward in time, -1 = backward, 0 = no scroll this frame
+        let mut scroll_dir: i32 = 0;
+
         // mouse-wheel scroll — 5% of window per tick
         let ticks = ctx.input(|i| {
             i.events.iter().filter_map(|e| match e {
@@ -677,6 +722,7 @@ impl NPXplorerApp {
             let pct = if self.scroll_speed_fine { 0.05 } else { 0.30 };
             let step = ticks as f64 * self.view_dur_s * pct;
             self.view_start_s = (self.view_start_s + step).clamp(0.0, max_start);
+            scroll_dir = if ticks > 0.0 { 1 } else { -1 };
         }
 
         // keyboard scroll
@@ -687,9 +733,11 @@ impl NPXplorerApp {
             let max_start = (total_s - self.view_dur_s).max(0.0);
             if i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::D) {
                 self.view_start_s = (self.view_start_s + step).min(max_start);
+                scroll_dir = 1;
             }
             if i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::A) {
                 self.view_start_s = (self.view_start_s - step).max(0.0);
+                scroll_dir = -1;
             }
         });
 
@@ -723,8 +771,16 @@ impl NPXplorerApp {
                     let st = lock.lock().unwrap();
                     let status = st.status.clone();
                     let has_req = st.request.is_some();
-                    let req_cc = st.request.as_ref().map(|r| (r.center_sample, r.cfg.clone()));
-                    let act_cc = st.active_request.as_ref().map(|r| (r.center_sample, r.cfg.clone()));
+                    let req_cc = st.request.as_ref().and_then(|r| {
+                        if let RequestKind::Full { center_sample, .. } = &r.kind {
+                            Some((*center_sample, r.cfg.clone()))
+                        } else { None }
+                    });
+                    let act_cc = st.active_request.as_ref().and_then(|r| {
+                        if let RequestKind::Full { center_sample, .. } = &r.kind {
+                            Some((*center_sample, r.cfg.clone()))
+                        } else { None }
+                    });
 
                     if let Some(buf) = &st.buffer {
                         let buf_end = buf.first_sample + buf.n_samp;
@@ -890,45 +946,38 @@ impl NPXplorerApp {
                 }
 
                 if matches_view && matches_cfg && !requested_new {
-                    // prefetch logic (uses snapshot values)
-                    let prefetch_margin = self.worker_half_window / 4;
+                    let fs = self.meta.sample_rate;
                     let buf_end = buf_first + buf_n_samp;
-                    
-                    let mut near_left = view_first < buf_first + prefetch_margin;
-                    let mut near_right = view_first + view_n + prefetch_margin > buf_end;
+                    let prefetch_margin = (self.view_dur_s / 2.0 * fs) as usize;
 
-                    if near_left && buf_first == 0 {
-                        near_left = false;
-                    }
-                    if near_right && buf_end >= self.meta.n_samples {
-                        near_right = false;
-                    }
-                        
-                    if near_left || near_right {
-                        let next_center = if near_left {
-                            view_first.saturating_sub(self.worker_half_window / 2)
-                        } else {
-                            view_first + view_n + self.worker_half_window / 2
-                        };
-                        
-                        let already_requested = {
-                            let req_match = req_center_cfg.as_ref().map_or(false, |(c, cfg)| *c == next_center && *cfg == self.preproc_cfg);
-                            let act_match = act_center_cfg.as_ref().map_or(false, |(c, cfg)| *c == next_center && *cfg == self.preproc_cfg);
-                            req_match || act_match
-                        };
+                    // A: scroll direction triggers immediately; proximity is the no-scroll fallback
+                    let extend_dir: i32 = if scroll_dir > 0 && buf_end < self.meta.n_samples {
+                        1
+                    } else if scroll_dir < 0 && buf_first > 0 {
+                        -1
+                    } else if view_first + view_n + prefetch_margin > buf_end && buf_end < self.meta.n_samples {
+                        1
+                    } else if view_first < buf_first + prefetch_margin && buf_first > 0 {
+                        -1
+                    } else {
+                        0
+                    };
 
-                        if !already_requested {
-                            self.worker_cancel.store(true, Ordering::Relaxed);
-                            let req = WorkerRequest {
-                                center_sample: next_center,
-                                half_window: self.worker_half_window,
+                    if extend_dir != 0 {
+                        // B: only submit if worker is idle — never cancel in-progress work
+                        let (lock, cvar) = &*self.worker_state;
+                        let mut st = lock.lock().unwrap();
+                        if st.status == WorkerStatus::Idle && st.request.is_none() {
+                            st.request = Some(WorkerRequest {
+                                kind: RequestKind::Extend {
+                                    direction: extend_dir,
+                                    extension_samp: (self.extension_s * fs) as usize,
+                                    view_first,
+                                    view_n,
+                                },
                                 cfg: self.preproc_cfg.clone(),
-                            };
-                            let (lock, cvar) = &*self.worker_state;
-                            lock.lock().unwrap().request = Some(req);
+                            });
                             cvar.notify_one();
-                            
-                            self.last_requested_center = next_center;
                         }
                     }
                 }

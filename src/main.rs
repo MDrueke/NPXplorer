@@ -112,7 +112,7 @@ impl MainApp {
                     // Title text
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new("NPXplorer v0.1 beta").color(egui::Color32::WHITE).size(14.0));
+                        ui.label(egui::RichText::new("NPXplorer v0.2").color(egui::Color32::WHITE).size(14.0));
                     });
                     
                     // Window controls
@@ -238,7 +238,7 @@ fn main() -> anyhow::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("NPXplorer v0.1 beta")
+            .with_title("NPXplorer v0.2")
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([800.0, 500.0])
             .with_decorations(false),
@@ -246,7 +246,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     eframe::run_native(
-        "NPXplorer v0.1 beta",
+        "NPXplorer v0.2",
         options,
         Box::new(move |cc| {
             Ok(Box::new(MainApp::new(&cc.egui_ctx, args.file)))

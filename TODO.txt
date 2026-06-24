@@ -1,2 +1,2 @@
 1. Double clicking a channel opens a window to view the single channel waveform
-
+2. Move the "open a file to start" back to center
