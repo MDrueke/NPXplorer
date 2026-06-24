@@ -1,4 +1,4 @@
-# NPXplorer v0.1 beta
+# NPXplorer v0.2
 
 A lightweight viewer for raw Neuropixels electrophysiology data. Renders voltage traces as a heatmap mapped to the physical probe geometry in real time.
 
