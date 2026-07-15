@@ -28,8 +28,39 @@ pub enum ColorMapChoice {
     GreyScale,
 }
 
-fn default_padding_s() -> f64 { 2.5 }
-fn default_extension_s() -> f64 { 1.0 }
+fn default_initial_buffer_s() -> f64 { 30.0 }
+fn default_extension_margin_s() -> f64 { 5.0 }
+fn default_mem_pressure_pct() -> f32 { 15.0 }
+fn default_mem_reserve_mb() -> f64 { 1500.0 }
+fn default_spike_overlay_scale() -> f32 { 1.0 }
+fn default_spike_smoothing_sigma() -> f32 { 1.5 }
+
+/// Largest buffer duration (s) that fits in currently-available system memory, minus
+/// `mem_reserve_mb`. Used both to clamp saved preferences at load time and to bound
+/// the "Initial buffer size" slider live in the Preferences window.
+fn max_feasible_buffer_s(n_data_rows: usize, sample_rate: f64, mem_reserve_mb: f64) -> f64 {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let available = sys.available_memory() as f64;
+    let usable = (available - mem_reserve_mb * 1e6).max(0.0);
+    let bytes_per_sample_all_rows = (n_data_rows.max(1) as f64) * 4.0; // f32
+    (usable / bytes_per_sample_all_rows / sample_rate).max(1.0)
+}
+
+/// Largest extension margin (s) that can't oscillate against itself.
+///
+/// Once the buffer is at its `initial_buffer_s` (B) cap, extending by margin M on one
+/// side trims the same M from the opposite side (net-zero growth). Right before that
+/// fires, the far margin is at worst `B - view_n - M`; after the trim it drops by
+/// another M, to `B - view_n - 2M`. For that not to already be below M (and
+/// immediately trigger an extension back the other way), we need:
+///   B - view_n - 2M >= M   =>   M <= (B - view_n) / 3
+/// A 0.9 safety factor keeps clear of the exact boundary (float rounding, view_n
+/// changes, etc.).
+fn max_extension_margin_s(initial_buffer_s: f64, view_dur_s: f64) -> f64 {
+    (((initial_buffer_s - view_dur_s).max(0.0) / 3.0) * 0.9).max(0.5)
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Preferences {
@@ -40,10 +71,25 @@ pub struct Preferences {
     pub color_uv: f32,
     pub colormap_choice: ColorMapChoice,
     pub spike_threshold: f32,
-    #[serde(default = "default_padding_s")]
-    pub padding_s: f64,
-    #[serde(default = "default_extension_s")]
-    pub extension_s: f64,
+    /// user-configurable multiplier on the firing-rate overlay's width scaling
+    #[serde(default = "default_spike_overlay_scale")]
+    pub spike_overlay_scale: f32,
+    /// std. dev. (in channels/display rows) of the Gaussian used to smooth the
+    /// firing-rate overlay across depth
+    #[serde(default = "default_spike_smoothing_sigma")]
+    pub spike_smoothing_sigma: f32,
+    /// total size (s) of the buffer loaded on initial load / full recompute; also the
+    /// steady-state cap that incremental extension growth settles back to
+    #[serde(default = "default_initial_buffer_s")]
+    pub initial_buffer_s: f64,
+    /// how close (s) the view can get to the edge of the preprocessed buffer before
+    /// an extension is triggered; also the size of each extension step
+    #[serde(default = "default_extension_margin_s")]
+    pub extension_margin_s: f64,
+    #[serde(default = "default_mem_pressure_pct")]
+    pub mem_pressure_pct: f32,
+    #[serde(default = "default_mem_reserve_mb")]
+    pub mem_reserve_mb: f64,
     #[serde(default)]
     pub last_dir: Option<String>,
 }
@@ -104,6 +150,8 @@ pub struct NPXplorerApp {
     // preferences
     show_preferences: bool,
     spike_threshold: f32,
+    spike_overlay_scale: f32,
+    spike_smoothing_sigma: f32,
 
     // selected channels
     selected_channel_1: Option<usize>,
@@ -113,8 +161,10 @@ pub struct NPXplorerApp {
     worker_state: SharedWorkerState,
     worker_cancel: SharedCancel,
     worker_half_window: usize,
-    padding_s: f64,
-    extension_s: f64,
+    initial_buffer_s: f64,
+    extension_margin_s: f64,
+    mem_pressure_pct: f32,
+    mem_reserve_mb: f64,
     _worker_handle: std::thread::JoinHandle<()>,
 
     // rendering
@@ -124,6 +174,7 @@ pub struct NPXplorerApp {
     last_rendered_cfg: Option<PreprocConfig>,
     last_rendered_n: usize,
     last_rendered_size: Option<[usize; 2]>,
+    last_rendered_buf: Option<(usize, usize)>,
 
     // smooth-scroll state
     waiting_since: Option<Instant>,
@@ -137,13 +188,13 @@ pub struct NPXplorerApp {
     proj_view_first: usize,
     proj_view_n: usize,
     proj_threshold: f32,
+    proj_sigma: f32,
     proj_cfg: Option<PreprocConfig>,
 }
 
 impl NPXplorerApp {
     pub fn new(ctx: &egui::Context, bin_path: PathBuf) -> anyhow::Result<Self> {
-        let meta_path = bin_path.with_extension("meta");
-        let meta = Arc::new(Meta::from_file(&meta_path)?);
+        let meta = Arc::new(Meta::from_data_path(&bin_path)?);
         let (raw, _) = open_data(&bin_path, &meta)?;
         let raw = Arc::new(raw);
         let fs = meta.sample_rate;
@@ -166,8 +217,12 @@ impl NPXplorerApp {
         let mut color_uv = 120.0;
         let mut colormap_choice = ColorMapChoice::IceFire;
         let mut spike_threshold = -40.0;
-        let mut padding_s = 2.5f64;
-        let mut extension_s = 1.0f64;
+        let mut spike_overlay_scale = default_spike_overlay_scale();
+        let mut spike_smoothing_sigma = default_spike_smoothing_sigma();
+        let mut initial_buffer_s = default_initial_buffer_s();
+        let mut extension_margin_s = default_extension_margin_s();
+        let mut mem_pressure_pct = default_mem_pressure_pct();
+        let mut mem_reserve_mb = default_mem_reserve_mb();
 
         if let Some(p) = prefs {
             preproc_cfg = p.preproc_cfg;
@@ -179,14 +234,27 @@ impl NPXplorerApp {
             color_uv = p.color_uv;
             colormap_choice = p.colormap_choice;
             spike_threshold = p.spike_threshold;
-            padding_s = p.padding_s;
-            extension_s = p.extension_s;
+            spike_overlay_scale = p.spike_overlay_scale;
+            spike_smoothing_sigma = p.spike_smoothing_sigma;
+            initial_buffer_s = p.initial_buffer_s;
+            extension_margin_s = p.extension_margin_s;
+            mem_pressure_pct = p.mem_pressure_pct;
+            mem_reserve_mb = p.mem_reserve_mb;
         }
+
+        // defensively re-clamp in case prefs were saved on a machine with more RAM,
+        // or with an initial_buffer_s/view_dur_s combination that no longer satisfies
+        // the no-oscillation bound
+        let n_data_rows = meta.build_display_rows(preproc_cfg.avg_depths)
+            .iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
+        initial_buffer_s = initial_buffer_s.min(max_feasible_buffer_s(n_data_rows, fs, mem_reserve_mb));
+        extension_margin_s = extension_margin_s.min(max_extension_margin_s(initial_buffer_s, view_dur_s));
+
         let filters = Arc::new(Mutex::new(Filters::new(&preproc_cfg)));
         let shared: SharedWorkerState = Arc::new((Mutex::new(WorkerState::new()), Condvar::new()));
         let cancel: SharedCancel = Arc::new(AtomicBool::new(false));
 
-        let half_window = compute_half_window(view_dur_s, padding_s, fs);
+        let half_window = compute_half_window(initial_buffer_s, fs);
 
         let handle = spawn_worker(
             Arc::clone(&raw),
@@ -234,13 +302,17 @@ impl NPXplorerApp {
             colormap_choice,
             show_preferences: false,
             spike_threshold,
+            spike_overlay_scale,
+            spike_smoothing_sigma,
             selected_channel_1: None,
             selected_channel_2: None,
             worker_state: shared,
             worker_cancel: cancel,
             worker_half_window: half_window,
-            padding_s,
-            extension_s,
+            initial_buffer_s,
+            extension_margin_s,
+            mem_pressure_pct,
+            mem_reserve_mb,
             _worker_handle: handle,
             heatmap_texture: None,
             pixel_buf: Vec::new(),
@@ -248,6 +320,7 @@ impl NPXplorerApp {
             last_rendered_cfg: None,
             last_rendered_n: 0,
             last_rendered_size: None,
+            last_rendered_buf: None,
             waiting_since: None,
             last_requested_center: 0,
             pending_cfg_recompute: false,
@@ -256,6 +329,7 @@ impl NPXplorerApp {
             proj_view_first: usize::MAX,
             proj_view_n: 0,
             proj_threshold: 0.0,
+            proj_sigma: 0.0,
             proj_cfg: None,
         })
     }
@@ -270,8 +344,12 @@ impl NPXplorerApp {
             color_uv: self.color_uv,
             colormap_choice: self.colormap_choice.clone(),
             spike_threshold: self.spike_threshold,
-            padding_s: self.padding_s,
-            extension_s: self.extension_s,
+            spike_overlay_scale: self.spike_overlay_scale,
+            spike_smoothing_sigma: self.spike_smoothing_sigma,
+            initial_buffer_s: self.initial_buffer_s,
+            extension_margin_s: self.extension_margin_s,
+            mem_pressure_pct: self.mem_pressure_pct,
+            mem_reserve_mb: self.mem_reserve_mb,
             last_dir,
         };
         prefs.save();
@@ -351,9 +429,7 @@ impl NPXplorerApp {
                     let new_dur = v.clamp(0.01, 10.0);
                     if (new_dur - self.view_dur_s).abs() > 1e-6 {
                         self.view_dur_s = new_dur;
-                        self.worker_half_window = compute_half_window(self.view_dur_s, self.padding_s, self.meta.sample_rate);
                         self.heatmap_texture = None;
-                        self.pending_cfg_recompute = true;
                     }
                 }
                 // re-sync display string to actual value
@@ -599,6 +675,23 @@ impl NPXplorerApp {
 
         painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(0x18, 0x1a, 0x1f));
 
+        let [ar, ag, ab] = crate::render::colormap_accent(&self.colormap_choice);
+
+        // preprocessed-buffer extent, drawn first so it sits beneath the view marker
+        let buf_extent = {
+            let (lock, _) = &*self.worker_state;
+            lock.lock().unwrap().buffer.as_ref().map(|b| (b.first_sample, b.n_samp))
+        };
+        if let Some((first, n_samp)) = buf_extent {
+            let buf_frac = (first as f64 / self.meta.sample_rate / total_s) as f32;
+            let buf_w_frac = (n_samp as f64 / self.meta.sample_rate / total_s) as f32;
+            let buf_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.min.x + w * buf_frac, rect.min.y),
+                Vec2::new((w * buf_w_frac).max(2.0), rect.height()),
+            );
+            painter.rect_filled(buf_rect, 1.0, egui::Color32::from_rgba_unmultiplied(ar, ag, ab, crate::render::BUFFER_EXTENT_ALPHA));
+        }
+
         // view marker
         let view_frac = (self.view_start_s / total_s) as f32;
         let view_w_frac = (self.view_dur_s / total_s) as f32;
@@ -606,7 +699,7 @@ impl NPXplorerApp {
             egui::pos2(rect.min.x + w * view_frac, rect.min.y),
             Vec2::new((w * view_w_frac).max(2.0), rect.height()),
         );
-        painter.rect_filled(view_rect, 1.0, egui::Color32::from_rgba_premultiplied(200, 200, 255, 180));
+        painter.rect_filled(view_rect, 1.0, egui::Color32::from_rgba_unmultiplied(ar, ag, ab, crate::render::VIEW_MARKER_ALPHA));
 
         // time labels
         let n_labels = 8;
@@ -646,6 +739,8 @@ impl NPXplorerApp {
                 .collapsible(false)
                 .open(&mut show_prefs)
                 .show(ctx, |ui| {
+                    ui.label(egui::RichText::new("Appearance").strong());
+
                     ui.horizontal(|ui| {
                         ui.label("Colormap:");
                         let mut cm = self.colormap_choice.clone();
@@ -672,6 +767,9 @@ impl NPXplorerApp {
                         }
                     });
 
+                    ui.separator();
+                    ui.label(egui::RichText::new("Firing rate overlay").strong());
+
                     ui.horizontal(|ui| {
                         ui.label("Spike Threshold (µV):");
                         if ui.add(egui::DragValue::new(&mut self.spike_threshold).speed(1.0).suffix(" µV")).changed() {
@@ -681,32 +779,95 @@ impl NPXplorerApp {
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label("Initial buffer padding (s):");
+                        ui.label("Overlay scale:");
                         if ui.add(
-                            egui::DragValue::new(&mut self.padding_s)
-                                .speed(0.1).range(0.5..=10.0).suffix(" s")
+                            egui::DragValue::new(&mut self.spike_overlay_scale)
+                                .speed(0.05).range(0.1..=10.0)
                         ).changed() {
-                            let fs = self.meta.sample_rate;
-                            self.worker_half_window = compute_half_window(self.view_dur_s, self.padding_s, fs);
-                            self.pending_cfg_recompute = true;
+                            self.heatmap_texture = None;
                             self.save_prefs();
                         }
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label("Extension chunk (s):");
+                        ui.label("Depth smoothing sigma (channels):");
                         if ui.add(
-                            egui::DragValue::new(&mut self.extension_s)
-                                .speed(0.1).range(0.1..=5.0).suffix(" s")
+                            egui::DragValue::new(&mut self.spike_smoothing_sigma)
+                                .speed(0.1).range(0.1..=10.0)
+                        ).changed() {
+                            self.heatmap_texture = None;
+                            self.save_prefs();
+                        }
+                    });
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("Buffer").strong());
+
+                    let n_data_rows = self.meta.build_display_rows(self.preproc_cfg.avg_depths)
+                        .iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
+                    let max_feasible = max_feasible_buffer_s(n_data_rows, self.meta.sample_rate, self.mem_reserve_mb);
+
+                    ui.horizontal(|ui| {
+                        ui.label("Initial buffer size (s):");
+                        if ui.add(
+                            egui::DragValue::new(&mut self.initial_buffer_s)
+                                .speed(0.5).range(1.0..=max_feasible).suffix(" s")
+                        ).changed() {
+                            let fs = self.meta.sample_rate;
+                            self.worker_half_window = compute_half_window(self.initial_buffer_s, fs);
+                            let max_margin = max_extension_margin_s(self.initial_buffer_s, self.view_dur_s);
+                            self.extension_margin_s = self.extension_margin_s.min(max_margin);
+                            self.pending_cfg_recompute = true;
+                            self.save_prefs();
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(format!("(max given available memory: {:.1} s)", max_feasible))
+                            .small().color(egui::Color32::GRAY)
+                    );
+
+                    let max_margin = max_extension_margin_s(self.initial_buffer_s, self.view_dur_s);
+                    ui.horizontal(|ui| {
+                        ui.label("Extension margin (s):");
+                        if ui.add(
+                            egui::DragValue::new(&mut self.extension_margin_s)
+                                .speed(0.1).range(0.5..=max_margin).suffix(" s")
                         ).changed() {
                             self.save_prefs();
                         }
                     });
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "distance from the buffer edge that triggers (and size of) each extension — capped at {:.1} s to prevent the buffer from ping-ponging between edges",
+                            max_margin
+                        )).small().color(egui::Color32::GRAY)
+                    );
+
+                    ui.horizontal(|ui| {
+                        ui.label("Memory pressure threshold (%):");
+                        if ui.add(
+                            egui::DragValue::new(&mut self.mem_pressure_pct)
+                                .speed(1.0).range(1.0..=90.0).suffix(" %")
+                        ).changed() {
+                            self.save_prefs();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Memory reserve (MB):");
+                        if ui.add(
+                            egui::DragValue::new(&mut self.mem_reserve_mb)
+                                .speed(50.0).range(100.0..=20000.0).suffix(" MB")
+                        ).changed() {
+                            self.save_prefs();
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new("buffer growth stops once free memory drops below either threshold")
+                            .small().color(egui::Color32::GRAY)
+                    );
                 });
         }
         self.show_preferences = show_prefs;
-        // scroll_dir: +1 = forward in time, -1 = backward, 0 = no scroll this frame
-        let mut scroll_dir: i32 = 0;
 
         // mouse-wheel scroll — 5% of window per tick
         let ticks = ctx.input(|i| {
@@ -722,7 +883,6 @@ impl NPXplorerApp {
             let pct = if self.scroll_speed_fine { 0.05 } else { 0.30 };
             let step = ticks as f64 * self.view_dur_s * pct;
             self.view_start_s = (self.view_start_s + step).clamp(0.0, max_start);
-            scroll_dir = if ticks > 0.0 { 1 } else { -1 };
         }
 
         // keyboard scroll
@@ -733,11 +893,9 @@ impl NPXplorerApp {
             let max_start = (total_s - self.view_dur_s).max(0.0);
             if i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::D) {
                 self.view_start_s = (self.view_start_s + step).min(max_start);
-                scroll_dir = 1;
             }
             if i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::A) {
                 self.view_start_s = (self.view_start_s - step).max(0.0);
-                scroll_dir = -1;
             }
         });
 
@@ -804,8 +962,10 @@ impl NPXplorerApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(50));
                 }
 
-                // compute vmax from current UI settings
-                let vmax = if matches_view {
+                // compute vmax from current UI settings — valid whenever cfg matches,
+                // regardless of exact time coverage (percentile table covers whatever's
+                // currently in the buffer)
+                let vmax = if matches_cfg {
                     if self.color_mode == ColorMode::Percentile {
                         // need percentile table — quick lock just for the lookup
                         let (lock, _) = &*self.worker_state;
@@ -819,37 +979,55 @@ impl NPXplorerApp {
                     }
                 } else { 250.0 };
 
-                // Rebuild heatmap if we have data for the view
                 if matches_view {
                     self.waiting_since = None;
+                }
 
+                // Rebuild whenever we have a cfg-matching buffer, rendering whatever time
+                // overlap exists and letting build_heatmap_into background-fill the rest —
+                // keeps the view live instead of freezing on a stale frame while extension
+                // or a full recompute catches up.
+                if matches_cfg {
                     let pos_changed = self.last_rendered_first != view_first;
                     let cfg_changed = self.last_rendered_cfg.as_ref() != Some(&self.preproc_cfg);
                     let size_changed = self.last_rendered_size != Some([pw, ph]);
-                    
+                    let buf_changed = self.last_rendered_buf != Some((buf_first, buf_n_samp));
+
                     let need_rebuild = self.heatmap_texture.is_none()
                         || pos_changed || view_n != self.last_rendered_n
-                        || size_changed
-                        || (cfg_changed && matches_cfg);
+                        || size_changed || buf_changed
+                        || cfg_changed;
 
                     if need_rebuild && view_n > 0 {
                         if let (Some(data_arc), Some(display_rows)) = (&buf_data, &buf_display_rows) {
-                            let offset = view_first - buf_first;
-                            let n = view_n.min(buf_n_samp - offset);
                             let stride = buf_n_samp;
 
                             let (first_row, last_row) = self.visible_row_range(display_rows);
 
-                            // spike projection: only recompute if view/threshold/cfg changed
+                            // spike projection over whatever time overlap currently exists
+                            // between the view and the buffer (may be partial or none)
+                            let ov_start = view_first.max(buf_first);
+                            let ov_end = (view_first + view_n).min(buf_first + buf_n_samp);
+                            let (offset, n) = if ov_start < ov_end {
+                                (ov_start - buf_first, ov_end - ov_start)
+                            } else {
+                                (0, 0)
+                            };
+
+                            // spike projection: only recompute if view/threshold/cfg changed,
+                            // or the buffer itself changed (e.g. extension filled in previously
+                            // out-of-range samples while the view stayed put)
                             let proj_stale = self.proj_view_first != view_first
                                 || self.proj_view_n != view_n
                                 || self.proj_threshold != self.spike_threshold
-                                || self.proj_cfg.as_ref() != Some(&self.preproc_cfg);
+                                || self.proj_sigma != self.spike_smoothing_sigma
+                                || self.proj_cfg.as_ref() != Some(&self.preproc_cfg)
+                                || buf_changed;
 
                             if proj_stale {
                                 let visible = &display_rows[first_row..=last_row];
                                 let mut sums = vec![0.0f32; visible.len()];
-                                
+
                                 let sample_rate = self.meta.sample_rate;
                                 let refractory_samples = (1.5 * sample_rate as f32 / 1000.0) as usize;
                                 let threshold = self.spike_threshold;
@@ -858,7 +1036,7 @@ impl NPXplorerApp {
                                 sums.par_iter_mut().enumerate().for_each(|(i, count)| {
                                     if let DisplayRow::Data { data_idx, .. } = &visible[i] {
                                         let base = data_idx * stride + offset;
-                                        if base + n <= data_arc.len() {
+                                        if n > 0 && base + n <= data_arc.len() {
                                             let ch_data = &data_arc[base..base + n];
                                             let mut spikes = 0.0f32;
                                             let mut last_spike = None;
@@ -880,9 +1058,15 @@ impl NPXplorerApp {
                                     }
                                 });
 
-                                // Gaussian convolution (sigma=1.5, kernel size 7)
-                                let kernel = [0.0366, 0.111, 0.217, 0.271, 0.217, 0.111, 0.0366];
-                                let k_rad = 3;
+                                // Gaussian convolution across depth, radius 3 (7-tap);
+                                // sigma is user-configurable (default 1.5, matching the
+                                // previous fixed kernel exactly)
+                                let sigma = self.spike_smoothing_sigma.max(0.01);
+                                let k_rad: isize = 3;
+                                let kernel: [f32; 7] = std::array::from_fn(|j| {
+                                    let x = j as f32 - k_rad as f32;
+                                    (-x * x / (2.0 * sigma * sigma)).exp()
+                                });
                                 let mut smoothed = vec![0.0f32; sums.len()];
                                 for i in 0..sums.len() {
                                     let mut v = 0.0;
@@ -902,6 +1086,7 @@ impl NPXplorerApp {
                                 self.proj_view_first = view_first;
                                 self.proj_view_n = view_n;
                                 self.proj_threshold = self.spike_threshold;
+                                self.proj_sigma = self.spike_smoothing_sigma;
                                 self.proj_cfg = Some(self.preproc_cfg.clone());
                             }
 
@@ -910,7 +1095,7 @@ impl NPXplorerApp {
                                 data_arc,
                                 display_rows,
                                 first_row, last_row,
-                                stride, offset, n,
+                                stride, buf_first, buf_n_samp, view_first, view_n,
                                 pw, ph, vmax,
                                 &self.colormap_choice,
                             );
@@ -920,6 +1105,7 @@ impl NPXplorerApp {
                             self.last_rendered_n = view_n;
                             self.last_rendered_cfg = buf_cfg;
                             self.last_rendered_size = Some([pw, ph]);
+                            self.last_rendered_buf = Some((buf_first, buf_n_samp));
                         }
                     }
                 }
@@ -948,32 +1134,42 @@ impl NPXplorerApp {
                 if matches_view && matches_cfg && !requested_new {
                     let fs = self.meta.sample_rate;
                     let buf_end = buf_first + buf_n_samp;
-                    let prefetch_margin = (self.view_dur_s / 2.0 * fs) as usize;
+                    let target_margin = (self.extension_margin_s * fs) as usize;
 
-                    // A: scroll direction triggers immediately; proximity is the no-scroll fallback
-                    let extend_dir: i32 = if scroll_dir > 0 && buf_end < self.meta.n_samples {
-                        1
-                    } else if scroll_dir < 0 && buf_first > 0 {
+                    // spatial, direction-agnostic: whichever side the view is closest to
+                    // the buffer edge on is (by construction) the side being scrolled toward,
+                    // so this re-fires every frame the worker is idle until margin is restored —
+                    // no need to track scroll direction explicitly, and it doesn't depend on a
+                    // scroll event having fired this exact frame (unlike the old proximity check)
+                    let left_margin = view_first.saturating_sub(buf_first);
+                    let right_margin = buf_end.saturating_sub(view_first + view_n);
+                    let left_needs = left_margin < target_margin && buf_first > 0;
+                    let right_needs = right_margin < target_margin && buf_end < self.meta.n_samples;
+
+                    let extend_dir: i32 = if left_needs && (!right_needs || left_margin <= right_margin) {
                         -1
-                    } else if view_first + view_n + prefetch_margin > buf_end && buf_end < self.meta.n_samples {
+                    } else if right_needs {
                         1
-                    } else if view_first < buf_first + prefetch_margin && buf_first > 0 {
-                        -1
                     } else {
                         0
                     };
 
                     if extend_dir != 0 {
-                        // B: only submit if worker is idle — never cancel in-progress work
+                        // only submit if the worker is free (Idle or Done — Done is the
+                        // steady-state after any successful compute, so it must count as
+                        // free too) and never cancel in-progress work
                         let (lock, cvar) = &*self.worker_state;
                         let mut st = lock.lock().unwrap();
-                        if st.status == WorkerStatus::Idle && st.request.is_none() {
+                        if st.status != WorkerStatus::Computing && st.request.is_none() {
                             st.request = Some(WorkerRequest {
                                 kind: RequestKind::Extend {
                                     direction: extend_dir,
-                                    extension_samp: (self.extension_s * fs) as usize,
+                                    extension_samp: target_margin,
                                     view_first,
                                     view_n,
+                                    max_buffer_samp: (self.initial_buffer_s * fs) as usize,
+                                    mem_pressure_pct: self.mem_pressure_pct,
+                                    mem_reserve_bytes: (self.mem_reserve_mb * 1e6) as u64,
                                 },
                                 cfg: self.preproc_cfg.clone(),
                             });
@@ -1064,18 +1260,23 @@ impl NPXplorerApp {
 
                         // draw projection overlay
                         if !self.projection_sums.is_empty() {
-                            // scale with window duration and threshold (baseline: -20 µV → 1x)
+                            // scale with window duration and threshold (baseline: -20 µV → 1x),
+                            // plus a user-configurable multiplier (spike_overlay_scale, default 1)
                             let threshold_scale = self.spike_threshold.abs() / 20.0;
-                            let spike_scale_factor = threshold_scale * (0.5 / self.view_dur_s) as f32;
+                            let spike_scale_factor = threshold_scale * (0.5 / self.view_dur_s) as f32 * self.spike_overlay_scale;
                             
-                            let color = match self.colormap_choice {
-                                ColorMapChoice::YellowMagenta => egui::Color32::from_rgba_unmultiplied(250, 234, 130, 5),
-                                ColorMapChoice::RedBlue => egui::Color32::from_rgba_unmultiplied(204, 103, 230, 8),
-                                ColorMapChoice::OrangeBlue => egui::Color32::from_rgba_unmultiplied(242, 171, 126, 5),
-                                ColorMapChoice::IceFire => egui::Color32::from_rgba_unmultiplied(166, 217, 237, 8),
-                                ColorMapChoice::Vanimo => egui::Color32::from_rgba_unmultiplied(202, 237, 166, 5),
-                                ColorMapChoice::GreyScale => egui::Color32::from_rgba_unmultiplied(255, 255, 255, 2),
+                            // per-map alpha is tuned for this overlay's many-triangle accumulation,
+                            // so it stays separate from the shared RGB in render::colormap_accent
+                            let overlay_alpha = match self.colormap_choice {
+                                ColorMapChoice::YellowMagenta => 5,
+                                ColorMapChoice::RedBlue => 8,
+                                ColorMapChoice::OrangeBlue => 5,
+                                ColorMapChoice::IceFire => 8,
+                                ColorMapChoice::Vanimo => 5,
+                                ColorMapChoice::GreyScale => 2,
                             };
+                            let [pr, pg, pb] = crate::render::colormap_accent(&self.colormap_choice);
+                            let color = egui::Color32::from_rgba_unmultiplied(pr, pg, pb, overlay_alpha);
 
                             let min_x = resp.rect.left();
                             let max_x = resp.rect.right();

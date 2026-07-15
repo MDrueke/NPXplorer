@@ -50,7 +50,19 @@ impl WorkerState {
 #[derive(Clone, Debug)]
 pub enum RequestKind {
     Full { center_sample: usize, half_window: usize },
-    Extend { direction: i32, extension_samp: usize, view_first: usize, view_n: usize },
+    Extend {
+        direction: i32,
+        extension_samp: usize,
+        view_first: usize,
+        view_n: usize,
+        /// cap on total buffer size (samples) — growth stops (net-zero) once reached
+        max_buffer_samp: usize,
+        /// trigger net-zero growth early if system-available memory drops below this
+        /// percentage of total (0-100)
+        mem_pressure_pct: f32,
+        /// ...or below this absolute number of free bytes, whichever hits first
+        mem_reserve_bytes: u64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -108,8 +120,30 @@ fn compute_pct_table(data: &[f32]) -> PctTable {
 // Half-window size
 // ---------------------------------------------------------------------------
 
-pub fn compute_half_window(view_dur_s: f64, padding_s: f64, sample_rate: f64) -> usize {
-    ((view_dur_s / 2.0 + padding_s) * sample_rate) as usize
+/// Half of the initial/full-recompute buffer size, in samples. `initial_buffer_s` is
+/// the total width of that buffer (view sits at its center); this also doubles as the
+/// steady-state cap that incremental extension growth is trimmed back to.
+pub fn compute_half_window(initial_buffer_s: f64, sample_rate: f64) -> usize {
+    (initial_buffer_s / 2.0 * sample_rate) as usize
+}
+
+// ---------------------------------------------------------------------------
+// Memory pressure check
+// ---------------------------------------------------------------------------
+
+/// True if system-available memory is low by either the percentage or absolute
+/// threshold. Used to decide whether buffer growth should stop (net-zero) early.
+fn memory_pressure(mem_pressure_pct: f32, mem_reserve_bytes: u64) -> bool {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let total = sys.total_memory();
+    if total == 0 {
+        return false; // can't determine — assume no pressure rather than stall growth
+    }
+    let available = sys.available_memory();
+    let pct_free = available as f64 / total as f64 * 100.0;
+    pct_free < mem_pressure_pct as f64 || available < mem_reserve_bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -151,8 +185,8 @@ pub fn spawn_worker(
                     RequestKind::Full { center_sample, half_window } => {
                         run_full(&req.cfg, center_sample, half_window, &raw, &meta, &filt, &lock, &cancel, &ctx);
                     }
-                    RequestKind::Extend { direction, extension_samp, view_first, view_n } => {
-                        run_extend(&req.cfg, direction, extension_samp, view_first, view_n, &raw, &meta, &filt, &lock, &cancel, &ctx);
+                    RequestKind::Extend { direction, extension_samp, view_first, view_n, max_buffer_samp, mem_pressure_pct, mem_reserve_bytes } => {
+                        run_extend(&req.cfg, direction, extension_samp, view_first, view_n, max_buffer_samp, mem_pressure_pct, mem_reserve_bytes, &raw, &meta, &filt, &lock, &cancel, &ctx);
                     }
                 }
             });
@@ -224,6 +258,9 @@ fn run_extend(
     extension_samp: usize,
     view_first: usize,
     view_n: usize,
+    max_buffer_samp: usize,
+    mem_pressure_pct: f32,
+    mem_reserve_bytes: u64,
     raw: &RawData,
     meta: &Meta,
     filt: &Mutex<Filters>,
@@ -256,8 +293,10 @@ fn run_extend(
         .filter(|r| matches!(r, DisplayRow::Data { .. }))
         .count();
 
-    // 1 second minimum retain in the reverse direction
-    let min_retain = meta.sample_rate as usize;
+    // small fixed safety margin — trimming never eats into this much space behind/ahead
+    // of the visible view, regardless of cap or memory pressure (correctness floor)
+    let safety_retain = EXTENSION_OVERLAP_SAMP;
+    let pressure = memory_pressure(mem_pressure_pct, mem_reserve_bytes);
 
     let (read_start, read_n, clean_offset, actual_ext, drop_samp, new_first) = if direction > 0 {
         // extend right: read [buf_end - overlap, buf_end + ext]
@@ -270,9 +309,12 @@ fn run_extend(
         let act_overlap = buf_end - rs;
         let rn = act_overlap + ext;
 
-        // drop from left, preserving min_retain behind view_first
-        let headroom = (view_first as isize - old_first as isize - min_retain as isize).max(0) as usize;
-        let drop = headroom.min(ext);
+        // no trim below the cap and without memory pressure (pure growth); once over
+        // the cap or under pressure, drop enough for net-zero growth from here on
+        let over_cap = (old_n_samp + ext).saturating_sub(max_buffer_samp);
+        let target_drop = if pressure { over_cap.max(ext) } else { over_cap };
+        let headroom = (view_first as isize - old_first as isize - safety_retain as isize).max(0) as usize;
+        let drop = target_drop.min(headroom).min(old_n_samp);
 
         (rs, rn, act_overlap, ext, drop, old_first + drop)
     } else {
@@ -284,11 +326,12 @@ fn run_extend(
         let act_overlap = EXTENSION_OVERLAP_SAMP.min(old_n_samp);
         let rn = ext + act_overlap;
 
-        // drop from right, preserving min_retain ahead of view_end
+        let over_cap = (old_n_samp + ext).saturating_sub(max_buffer_samp);
+        let target_drop = if pressure { over_cap.max(ext) } else { over_cap };
         let view_end = view_first + view_n;
         let buf_end = old_first + old_n_samp;
-        let headroom = (buf_end as isize - view_end as isize - min_retain as isize).max(0) as usize;
-        let drop = headroom.min(ext);
+        let headroom = (buf_end as isize - view_end as isize - safety_retain as isize).max(0) as usize;
+        let drop = target_drop.min(headroom).min(old_n_samp);
 
         (rs, rn, 0usize, ext, drop, rs)
     };

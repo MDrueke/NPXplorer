@@ -1,4 +1,4 @@
-# NPXplorer v0.2
+# NPXplorer v0.5
 
 A lightweight viewer for raw Neuropixels electrophysiology data. Renders voltage traces as a heatmap mapped to the physical probe geometry in real time.
 
@@ -8,9 +8,10 @@ A lightweight viewer for raw Neuropixels electrophysiology data. Renders voltage
 
 ## Requirements
 
-- **SpikeGLX format only.** Supports `.ap.bin` (uncompressed) and `.ap.cbin` (mtscomp-compressed, requires `.ch` metadata alongside).
-- The corresponding `.ap.meta` file must be in the same directory as the data file — this is where probe geometry, gain, and sample rate are read from.
-- Tested with NP 1.0, NP 2.0 single-shank, and NP 2.0 multi-shank probes. Other probe types may work but are untested.
+- Both data acquired with SpikeGLX or OpenEphys is supported. The format is detected automatically, and the app attempts to find the meta file.
+- Data compressed with mtscomp is decompressed on-the-fly
+- Tested with NP 1.0, NP 2.0 single-shank, and NP 2.0 multi-shank probes via SpikeGLX.
+  OpenEphys support has only been tested against a single-shank NP 1.0 recording. Reading multi-shank data acquired with OpenEphys works in theory, but is untested.
 
 ## Usage
 
@@ -22,12 +23,15 @@ Just launch, and pick a file from the file dialog.
 - **Arrow keys** or **A/D** jump half a window at a time.
 - **Click on the navigation bar** at the bottom to jump to any point in the recording.
 - **"Jump to (s)"** field lets you type an exact time in seconds.
+- The navigation bar shows two markers in the colormap's accent color: a solid bar for the currently displayed window, and a fainter, wider shaded region behind it showing how much surrounding time has been preprocessed and is ready for smooth scrolling. The preprocessed chunk is automatically extended in the direction of scrolling once a certain margin (configurable in preferences) is met
 
 ### Selecting channels
 
 - **Left-click** on the heatmap to select a channel (white marker line).
 - **Right-click** to select a second channel (orange marker line).
 - When both are selected, the vertical distance (Δ µm) between them is displayed.
+
+This is useful for determining i.e. layer boundaries from ephys data.
 
 ### Preprocessing options
 
@@ -38,7 +42,7 @@ All filters run in real time on the displayed chunk. The pipeline order is fixed
 3. **300 Hz highpass** — 3rd-order Butterworth, applied forward-backward (zero phase). Automatically enabled and locked on when Destripe is selected.
 4. **Spatial filter** — choose one:
    - **Off** — no spatial filtering.
-   - **Global CMR** — subtracts the median across all channels at each time point.
+   - **Global CMR** — subtracts the median across all channels at sample.
    - **Local CMR** — subtracts the median of channels within a 100–400 µm annulus around each channel. Uses Euclidean distance from probe geometry.
    - **Destripe** — IBL-style kfilt: AGC normalization → spatial highpass (0.01 Wn Butterworth, forward-backward) → rescale. Includes mirror padding at probe edges.
 5. **Avg depths** — when enabled, channels at the same depth on the same shank are averaged into a single display row.
@@ -49,8 +53,11 @@ For multi-shank probes, all spatial filters operate independently per shank.
 
 A semi-transparent bar overlay on the left side of the heatmap shows threshold crossings per channel, computed over the visible time window. This gives a quick approximation of firing rate by depth.
 
-- **Threshold** — configurable in Preferences (default: −40 µV). A 1.5 ms refractory period is enforced between counted crossings.
-- **Scaling** — the overlay width scales with both the time window duration and the threshold. At −20 µV the overlay has a baseline size; at −40 µV it's 2× as wide, at −80 µV it's 4×, etc.
+All related settings are grouped under "Firing rate overlay" in Preferences:
+
+- **Threshold** — default −40 µV. A 1.5 ms refractory period is enforced between counted crossings.
+- **Overlay scale** — the overlay width scales with both the time window duration and the threshold (at −20 µV it has a baseline size; at −40 µV it's 2× as wide, at −80 µV it's 4×, etc.), multiplied by this manual factor. Default 1, i.e. no change.
+- **Depth smoothing sigma** — standard deviation, in channels, of the Gaussian used to smooth the overlay across depth. Default 1.5.
 
 ### Color scale
 
@@ -62,6 +69,12 @@ A semi-transparent bar overlay on the left side of the heatmap shows threshold c
 
 Preferences are saved to `npxplorer_prefs.toml` in the same directory as the executable. This includes preprocessing settings, colormap, color scale mode, spike threshold, window duration, and the last opened directory.
 
+The Preferences window also exposes background prefetch tuning:
+
+- **Initial buffer size (s)** — total width of the preprocessed buffer loaded on initial load, on a config change, or on a jump to an unloaded region. Also the steady-state size that continuous scrolling settles back to. Default 30 s, clamped to what currently-available system memory allows.
+- **Extension margin (s)** — how close the view is allowed to get to the edge of the preprocessed buffer before more is fetched in that direction; also the size of each fetch. Default 5 s, capped well below a third of the initial buffer size so growing on one side and trimming the other can't oscillate back and forth.
+- **Memory pressure threshold (%)** / **Memory reserve (MB)** — while scrolling continuously in one direction, the buffer keeps growing without trimming the trailing side, up to the initial buffer size. If free system memory drops below either threshold first, growth stops (net-zero: trimming keeps pace with further extension) rather than waiting to hit the size cap.
+
 ## Building from source
 
 Requires Rust (stable). Build with:
@@ -69,9 +82,9 @@ Requires Rust (stable). Build with:
 cargo build --release
 ```
 
-The binary will be at `target/release/npxplorer`. Debug builds are too slow for real-time rendering of full Neuropixels data.
-
 ## Known limitations
 
-- SpikeGLX `.ap.bin`/`.ap.cbin` only. No OpenEphys support.
+- Only tested on SpikeGLX (`.ap.bin`/`.ap.cbin`) and OpenEphys binary format (`continuous.dat`/`.cbin`).
 - Compressed `.cbin` files are a bit slower to navigate since each chunk must be decompressed on the fly.
+- OpenEphys: only a single probe/stream per file is handled — if a `PROCESSOR` block in `settings.xml` contains multiple `NP_PROBE` entries (multiple probes on one PXI card), only the first is used.
+- OpenEphys: multi-shank NP 2.0 geometry and multi-experiment/multi-recording sessions are untested (see Requirements).

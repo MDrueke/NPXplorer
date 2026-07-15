@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -30,6 +30,25 @@ pub struct Meta {
 }
 
 impl Meta {
+    /// Detect the acquisition format from the data file's location and load metadata
+    /// accordingly. SpikeGLX is identified by a sibling `.meta` file; Open Ephys is
+    /// identified by a `structure.oebin` found in an ancestor directory (with a
+    /// `settings.xml` further up, at the Record Node level).
+    pub fn from_data_path(bin_path: &Path) -> Result<Self> {
+        let meta_path = bin_path.with_extension("meta");
+        if meta_path.is_file() {
+            return Self::from_file(&meta_path);
+        }
+        if let Some((oebin_path, settings_path)) = find_open_ephys_meta(bin_path) {
+            return Self::from_open_ephys(bin_path, &oebin_path, &settings_path);
+        }
+        bail!(
+            "no metadata found for {}: expected a sibling .meta file (SpikeGLX) \
+             or a structure.oebin in a parent directory (Open Ephys)",
+            bin_path.display()
+        );
+    }
+
     pub fn from_file(meta_path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(meta_path)
             .with_context(|| format!("reading meta file: {}", meta_path.display()))?;
@@ -94,6 +113,94 @@ impl Meta {
             n_samples,
             uv_per_bit,
             im_dat_prb_type: im_dat_prb_type.unwrap_or(0),
+            channel_geom,
+        })
+    }
+
+    /// Load metadata for an Open Ephys binary-format recording. `bin_path` is the
+    /// chosen `continuous.dat` (or a compressed `.cbin` in its place); `oebin_path` and
+    /// `settings_path` are the associated `structure.oebin` / `settings.xml`.
+    pub fn from_open_ephys(bin_path: &Path, oebin_path: &Path, settings_path: &Path) -> Result<Self> {
+        let oebin_text = std::fs::read_to_string(oebin_path)
+            .with_context(|| format!("reading {}", oebin_path.display()))?;
+        let oebin: serde_json::Value = serde_json::from_str(&oebin_text)
+            .with_context(|| format!("parsing {}", oebin_path.display()))?;
+
+        // the stream is identified by the name of the directory the data file lives in,
+        // e.g. ".../continuous/Neuropix-PXI-100.1/continuous.dat" -> "Neuropix-PXI-100.0"
+        let stream_dir_name = bin_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .context("could not determine stream folder name from data path")?;
+
+        let continuous = oebin
+            .get("continuous")
+            .and_then(|v| v.as_array())
+            .context("structure.oebin missing 'continuous' array")?;
+
+        let stream = continuous
+            .iter()
+            .find(|c| {
+                c.get("folder_name")
+                    .and_then(|v| v.as_str())
+                    .map(|f| f.trim_end_matches('/') == stream_dir_name)
+                    .unwrap_or(false)
+            })
+            .with_context(|| format!("no stream '{}' found in structure.oebin", stream_dir_name))?;
+
+        let sample_rate = stream
+            .get("sample_rate")
+            .and_then(|v| v.as_f64())
+            .context("missing sample_rate in structure.oebin stream")?;
+        let num_channels = stream
+            .get("num_channels")
+            .and_then(|v| v.as_u64())
+            .context("missing num_channels in structure.oebin stream")? as usize;
+        // identifies which PROCESSOR block in settings.xml this stream came from
+        let source_processor_id = stream
+            .get("source_processor_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        let channels = stream
+            .get("channels")
+            .and_then(|v| v.as_array())
+            .context("missing channels array in structure.oebin stream")?;
+
+        // bit_volts is already a direct µV-per-bit scale (unlike SpikeGLX's gain formula);
+        // key name varies across GUI versions (bit_volts vs bitVolts)
+        let mut bit_volts_vals = Vec::with_capacity(channels.len());
+        for ch in channels {
+            let bv = ch
+                .get("bit_volts")
+                .or_else(|| ch.get("bitVolts"))
+                .and_then(|v| v.as_f64())
+                .context("channel missing bit_volts/bitVolts in structure.oebin")?;
+            bit_volts_vals.push(bv);
+        }
+        let uv_per_bit = *bit_volts_vals.first().context("empty channels array in structure.oebin")?;
+        if bit_volts_vals.iter().any(|&v| (v - uv_per_bit).abs() > 1e-6) {
+            bail!("non-uniform bit_volts across channels — not currently supported");
+        }
+
+        let file_size_bytes = std::fs::metadata(bin_path)
+            .with_context(|| format!("stat {}", bin_path.display()))?
+            .len();
+        let n_samples = (file_size_bytes / (num_channels as u64 * 2)) as usize;
+
+        let settings_text = std::fs::read_to_string(settings_path)
+            .with_context(|| format!("reading {}", settings_path.display()))?;
+        let (channel_geom, im_dat_prb_type) =
+            parse_open_ephys_geometry(&settings_text, source_processor_id, num_channels)?;
+
+        Ok(Meta {
+            n_saved_chans: num_channels,
+            n_ap_chans: num_channels,
+            sample_rate,
+            n_samples,
+            uv_per_bit: uv_per_bit as f32,
+            im_dat_prb_type,
             channel_geom,
         })
     }
@@ -235,6 +342,122 @@ fn parse_geom_map(s: Option<&str>, n_ap: usize) -> Vec<ChannelGeom> {
         out[i] = g;
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Open Ephys support
+// ---------------------------------------------------------------------------
+
+/// Search ancestor directories of `bin_path` for `structure.oebin`, then continue
+/// searching upward from there for `settings.xml` (which lives at the Record Node
+/// level, above `structure.oebin`'s experiment/recording level).
+fn find_open_ephys_meta(bin_path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let ancestors: Vec<&Path> = bin_path.ancestors().collect();
+
+    let oebin_idx = ancestors.iter().position(|dir| dir.join("structure.oebin").is_file())?;
+    let oebin_path = ancestors[oebin_idx].join("structure.oebin");
+
+    for dir in &ancestors[oebin_idx..] {
+        let candidate = dir.join("settings.xml");
+        if candidate.is_file() {
+            return Some((oebin_path, candidate));
+        }
+    }
+    None
+}
+
+/// Parse channel geometry and probe type from an Open Ephys `settings.xml`.
+///
+/// Positions come from `<ELECTRODE_XPOS>`/`<ELECTRODE_YPOS>` attributes (named `CH{n}`)
+/// inside the `<NP_PROBE>` element nested under the `<PROCESSOR NodeId="{node_id}">`
+/// block. Some channels (e.g. NP 1.0's internal reference site) have no listed
+/// position — these fall back to the nearest channel index that does.
+///
+/// Shank is inferred from clustering x-positions: NP 1.0 / single-shank NP 2.0 columns
+/// are tens of µm apart, while distinct shanks on multi-shank NP 2.0 probes are ~250 µm
+/// apart, so a gap threshold separates them. This has not been tested against a real
+/// multi-shank Open Ephys recording — see README.
+fn parse_open_ephys_geometry(xml: &str, node_id: u32, n_ap: usize) -> Result<(Vec<ChannelGeom>, u32)> {
+    let doc = roxmltree::Document::parse(xml).context("parsing settings.xml")?;
+
+    let processor = doc
+        .descendants()
+        .find(|n| {
+            n.has_tag_name("PROCESSOR")
+                && n.attribute("NodeId").and_then(|s| s.parse::<u32>().ok()) == Some(node_id)
+        })
+        .with_context(|| format!("no PROCESSOR with NodeId={} in settings.xml", node_id))?;
+
+    let np_probe = processor
+        .descendants()
+        .find(|n| n.has_tag_name("NP_PROBE"))
+        .context("no NP_PROBE found for this processor — only Neuropixels streams are supported")?;
+
+    // heuristic: only the phase-shift channel grouping (32/13 vs 24/16) depends on this
+    let probe_part_number = np_probe.attribute("probe_part_number").unwrap_or("");
+    let im_dat_prb_type = if probe_part_number.starts_with("PRB2") || probe_part_number.contains("NP2") {
+        21
+    } else {
+        0
+    };
+
+    let xpos_node = np_probe
+        .descendants()
+        .find(|n| n.has_tag_name("ELECTRODE_XPOS"))
+        .context("missing ELECTRODE_XPOS in settings.xml")?;
+    let ypos_node = np_probe
+        .descendants()
+        .find(|n| n.has_tag_name("ELECTRODE_YPOS"))
+        .context("missing ELECTRODE_YPOS in settings.xml")?;
+
+    let read_ch_attrs = |node: roxmltree::Node| -> HashMap<usize, f32> {
+        node.attributes()
+            .filter_map(|attr| {
+                let idx = attr.name().strip_prefix("CH")?.parse::<usize>().ok()?;
+                let val = attr.value().parse::<f32>().ok()?;
+                Some((idx, val))
+            })
+            .collect()
+    };
+    let xs = read_ch_attrs(xpos_node);
+    let ys = read_ch_attrs(ypos_node);
+
+    // cluster x-positions into shanks: sort unique values, start a new shank whenever
+    // consecutive values are further apart than a single-shank column spacing
+    const SHANK_GAP_THRESHOLD_UM: f32 = 100.0;
+    let mut unique_x: Vec<f32> = xs.values().copied().collect();
+    unique_x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    unique_x.dedup_by(|a, b| (*a - *b).abs() < 1.0);
+    let mut cluster_starts: Vec<f32> = Vec::new();
+    for &x in &unique_x {
+        if cluster_starts.last().map_or(true, |&last| x - last > SHANK_GAP_THRESHOLD_UM) {
+            cluster_starts.push(x);
+        }
+    }
+    let shank_for_x = |x: f32| -> u32 {
+        cluster_starts.iter().rposition(|&start| x + 0.5 >= start).unwrap_or(0) as u32
+    };
+
+    let mut channel_geom = vec![ChannelGeom { x_um: 0.0, y_um: 0.0, shank: 0 }; n_ap];
+    for i in 0..n_ap {
+        let (x, y) = match (xs.get(&i), ys.get(&i)) {
+            (Some(&x), Some(&y)) => (x, y),
+            _ => {
+                // fallback for channels with no listed position (e.g. NP 1.0's
+                // internal reference site): use the nearest channel that has one
+                (1..n_ap)
+                    .find_map(|d| {
+                        i.checked_sub(d).and_then(|lo| xs.get(&lo).zip(ys.get(&lo)))
+                            .or_else(|| (i + d < n_ap).then(|| ()).and_then(|_| xs.get(&(i + d)).zip(ys.get(&(i + d)))))
+                    })
+                    .map(|(&x, &y)| (x, y))
+                    .unwrap_or((0.0, 0.0))
+            }
+        };
+        channel_geom[i] = ChannelGeom { x_um: x, y_um: y, shank: shank_for_x(x) };
+    }
+
+    Ok((channel_geom, im_dat_prb_type))
 }
 
 // ---------------------------------------------------------------------------
