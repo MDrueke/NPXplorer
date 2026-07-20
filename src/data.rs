@@ -58,6 +58,7 @@ impl Meta {
         let mut file_size_bytes: Option<u64> = None;
         let mut ai_range_max: f64 = 0.6;
         let mut ap_gain: f64 = 500.0;
+        let mut lf_gain: f64 = 250.0;
         let mut max_int: f64 = 512.0;
         let mut n_ap: Option<usize> = None;
         let mut n_lf: Option<usize> = None;
@@ -74,6 +75,7 @@ impl Meta {
                     "fileSizeBytes" => file_size_bytes = val.parse().ok(),
                     "imAiRangeMax" => ai_range_max = val.parse().unwrap_or(0.6),
                     "imChan0apGain" => ap_gain = val.parse().unwrap_or(500.0),
+                    "imChan0lfGain" => lf_gain = val.parse().unwrap_or(250.0),
                     "imMaxInt" => max_int = val.parse().unwrap_or(512.0),
                     "snsApLfSy" => {
                         let parts: Vec<&str> = val.split(',').collect();
@@ -97,13 +99,21 @@ impl Meta {
         let sample_rate = sample_rate.context("missing imSampRate")?;
         let file_size_bytes = file_size_bytes.context("missing fileSizeBytes")?;
 
-        let n_ap = n_ap.unwrap_or(n_saved_chans.saturating_sub(1));
-        let _n_sy = n_sy.unwrap_or(1);
-        let _ = n_lf;
+        // snsApLfSy reports counts for both bands, e.g. (384,0,1) in an .ap.meta and
+        // (0,384,1) in the sibling .lf.meta — only the band saved in *this* file is
+        // nonzero. Sum them to get the number of signal (non-sync) channels present here,
+        // falling back to nSavedChans - nSy if the field is missing entirely.
+        let n_sy = n_sy.unwrap_or(1);
+        let is_lf_band = n_lf.unwrap_or(0) > 0 && n_ap.unwrap_or(0) == 0;
+        let n_signal_chans = match (n_ap, n_lf) {
+            (Some(a), Some(l)) if a + l > 0 => a + l,
+            _ => n_saved_chans.saturating_sub(n_sy),
+        };
 
-        let n_ap_chans = n_ap;
+        let n_ap_chans = n_signal_chans;
         let n_samples = (file_size_bytes / (n_saved_chans as u64 * 2)) as usize;
-        let uv_per_bit = (ai_range_max / max_int / ap_gain * 1e6) as f32;
+        let gain = if is_lf_band { lf_gain } else { ap_gain };
+        let uv_per_bit = (ai_range_max / max_int / gain * 1e6) as f32;
         let channel_geom = parse_geom_map(geom_str.as_deref(), n_ap_chans);
 
         Ok(Meta {
