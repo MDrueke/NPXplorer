@@ -9,6 +9,7 @@ A lightweight viewer for raw Neuropixels electrophysiology data. Renders voltage
 ## Requirements
 
 - Both data acquired with SpikeGLX or OpenEphys is supported. The format is detected automatically, and the app attempts to find the meta file.
+- For SpikeGLX, both the AP and LFP bands are supported (`.ap.bin`/`.lf.bin`). The matching `.ap.meta`/`.lf.meta` next to the data file is used for each band.
 - Data compressed with mtscomp is decompressed on-the-fly
 - Tested with NP 1.0, NP 2.0 single-shank, and NP 2.0 multi-shank probes via SpikeGLX.
   OpenEphys support has only been tested against a single-shank NP 1.0 recording. Reading multi-shank data acquired with OpenEphys works in theory, but is untested.
@@ -65,9 +66,31 @@ All related settings are grouped under "Firing rate overlay" in Preferences:
 - **±µV mode** — manually set the symmetric color range (10–300 µV).
 - **Colormaps** — six options available in Preferences: Ice-Fire (default), Yellow-Magenta, Red-Blue, Orange-Blue, Vanimo, and Greyscale.
 
+### PSTH (peri-stimulus average)
+
+Click **PSTH** in the top bar and pick a file of stimulus onset times (`.csv`, `.txt`, `.tsv`, `.dat`; UTF-8/UTF-16/Latin-1 are handled). For each stimulus, the preprocessed signal in a window around the onset is averaged across stimuli (mean, using the main window's current preprocessing settings). The window shows three plots sharing a time axis: the selected-channel traces, the mean across the channel range, and a heatmap over all channels in the range.
+
+Set the controls, then press **Apply settings** to compute or recompute:
+
+- **Channels** — first/last channel to include.
+- **Stim time (s)** — only stimuli whose onset falls in this range are averaged. Defaults to the whole recording.
+- **Window (ms)** — start and end of the peri-stimulus window relative to onset (e.g. −50 to 200).
+- **Color scale** — percentile or ±µV, as for the main heatmap. Changing it re-colors without recomputing.
+
+**Left-click / right-click** the heatmap to plot a channel's trace (white / orange, up to two). **Deselect** clears them. **Export PNG…** writes the three plots to an image; the default filename is `<recording>_<stim file>_psth.png`.
+
+Stimulus onset times are read according to a layout file. Each line of the layout mirrors the structure of the stim file: leading lines without an `o` are header rows to skip, and the first line containing `o` marks which comma-separated column(s) hold the onset times (in seconds); `x` marks columns to ignore, and trailing `x` beyond the file's columns are ignored. For example:
+
+```
+header
+o,x,x
+```
+
+skips one header row and reads onsets from the first column. A `stims_file_layout.csv` placed next to the stim file is used if present; otherwise the default at `config/stims_file_layout.csv` (next to the executable) applies. If the layout does not match the file, an error describing the mismatch is shown.
+
 ## Configuration
 
-Preferences are saved to `npxplorer_prefs.toml` in the same directory as the executable. This includes preprocessing settings, colormap, color scale mode, spike threshold, window duration, and the last opened directory.
+Preferences are saved to `config/npxplorer_prefs.toml` in a `config/` folder next to the executable (a `npxplorer_prefs.toml` left next to the executable by an older version is still read if the new one is absent). This includes preprocessing settings, colormap, color scale mode, spike threshold, window duration, and the last opened directory. The `config/` folder also holds the default `stims_file_layout.csv` used by the PSTH tool; it is created on first launch.
 
 The Preferences window also exposes background prefetch tuning:
 
@@ -84,7 +107,7 @@ cargo build --release
 
 ## Known limitations
 
-- Only tested on SpikeGLX (`.ap.bin`/`.ap.cbin`) and OpenEphys binary format (`continuous.dat`/`.cbin`).
+- Only tested on SpikeGLX (`.ap.bin`/`.lf.bin`/`.ap.cbin`) and OpenEphys binary format (`continuous.dat`/`.cbin`).
 - Compressed `.cbin` files are a bit slower to navigate since each chunk must be decompressed on the fly.
 - OpenEphys: only a single probe/stream per file is handled — if a `PROCESSOR` block in `settings.xml` contains multiple `NP_PROBE` entries (multiple probes on one PXI card), only the first is used.
 - OpenEphys: multi-shank NP 2.0 geometry and multi-experiment/multi-recording sessions are untested (see Requirements).
