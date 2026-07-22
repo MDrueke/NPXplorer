@@ -1,1 +1,1 @@
-1. Double clicking a channel opens a window to view the single channel waveform
+1. A mechanism to open a window to view the single channel waveform

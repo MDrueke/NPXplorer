@@ -1,12 +1,14 @@
 use egui::{CentralPanel, TextureHandle, TextureOptions, TopBottomPanel, Ui, Vec2};
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::data::{DisplayRow, Meta, open_data};
+use crate::data::{DisplayRow, Meta, RawData, open_data};
 use crate::preprocess::{Filters, PreprocConfig, SpatialFilter};
-use crate::render::build_heatmap_into;
+use crate::psth::{PsthParams, PsthResult, compute_psth, resolve_layout, load_stim_times, default_layout_path};
+use crate::render::{build_heatmap_into, build_psth_heatmap_into};
 use crate::worker::{
     RequestKind, SharedCancel, SharedWorkerState, WorkerRequest, WorkerState, WorkerStatus,
     compute_half_window, spawn_worker,
@@ -96,22 +98,29 @@ pub struct Preferences {
 
 impl Preferences {
     pub fn load() -> Option<Self> {
-        let path = Self::path();
-        if let Ok(s) = std::fs::read_to_string(path) {
-            toml::from_str(&s).ok()
-        } else {
-            None
-        }
+        // prefer the new config/ location; fall back to the legacy path next to the exe
+        // so settings saved by older versions are not lost
+        let text = std::fs::read_to_string(Self::path())
+            .or_else(|_| std::fs::read_to_string(Self::legacy_path()))
+            .ok()?;
+        toml::from_str(&text).ok()
     }
 
     pub fn save(&self) {
         let path = Self::path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         if let Ok(s) = toml::to_string_pretty(self) {
             let _ = std::fs::write(path, s);
         }
     }
 
     pub fn path() -> std::path::PathBuf {
+        crate::psth::config_dir().join("npxplorer_prefs.toml")
+    }
+
+    fn legacy_path() -> std::path::PathBuf {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 return dir.join("npxplorer_prefs.toml");
@@ -121,9 +130,155 @@ impl Preferences {
     }
 }
 
+/// State for the PSTH window: the peri-stimulus average of the preprocessed signal.
+struct PsthState {
+    open: bool,
+    stim_path: Option<PathBuf>,
+    // staged settings (only committed to a recompute when "Apply settings" is pressed)
+    ch_first: usize,
+    ch_last: usize,
+    start_ms: f64,
+    end_ms: f64,
+    start_ms_str: String,
+    end_ms_str: String,
+    stim_t_start: f64,
+    stim_t_end: f64,
+    stim_t_start_str: String,
+    stim_t_end_str: String,
+    total_s: f64,
+    color_mode: ColorMode,
+    color_pct: f32,
+    color_uv: f32,
+
+    // per-channel line selection (mirrors the main window; independent of it)
+    sel_ch1: Option<usize>,
+    sel_ch2: Option<usize>,
+
+    // async plumbing
+    pick_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
+    compute_rx: Option<mpsc::Receiver<Result<PsthResult, String>>>,
+    cancel: Arc<AtomicBool>,
+    computing: bool,
+    apply_requested: bool,
+
+    result: Option<Arc<PsthResult>>,
+    error: Option<String>,
+    n_used: usize,
+    n_skipped: usize,
+
+    texture: Option<TextureHandle>,
+    pixel_buf: Vec<u8>,
+    tex_dirty: bool,
+    last_tex_size: Option<[usize; 2]>,
+
+    // rect of the plotted figure (logical coords), for PNG export cropping
+    figure_rect: Option<egui::Rect>,
+    export_pick_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
+    export_path: Option<PathBuf>,
+    export_pending: bool,
+}
+
+impl PsthState {
+    fn new(ch_first: usize, ch_last: usize, total_s: f64) -> Self {
+        Self {
+            open: false,
+            stim_path: None,
+            ch_first,
+            ch_last,
+            start_ms: -50.0,
+            end_ms: 200.0,
+            start_ms_str: "-50".to_string(),
+            end_ms_str: "200".to_string(),
+            stim_t_start: 0.0,
+            stim_t_end: total_s,
+            stim_t_start_str: "0.000".to_string(),
+            stim_t_end_str: format!("{:.3}", total_s),
+            total_s,
+            color_mode: ColorMode::Percentile,
+            color_pct: 99.0,
+            color_uv: 50.0,
+            sel_ch1: None,
+            sel_ch2: None,
+            pick_rx: None,
+            compute_rx: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            computing: false,
+            apply_requested: false,
+            result: None,
+            error: None,
+            n_used: 0,
+            n_skipped: 0,
+            texture: None,
+            pixel_buf: Vec::new(),
+            tex_dirty: false,
+            last_tex_size: None,
+            figure_rect: None,
+            export_pick_rx: None,
+            export_path: None,
+            export_pending: false,
+        }
+    }
+}
+
+/// Spawn the native picker for a stimulus-times file on a background thread (same
+/// rationale as the main file picker: never block the egui event loop).
+fn spawn_stim_picker(dir: Option<PathBuf>) -> mpsc::Receiver<Option<PathBuf>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut dlg = rfd::FileDialog::new()
+            .add_filter("Stimulus times", &["csv", "txt", "tsv", "dat"])
+            .add_filter("All files", &["*"]);
+        if let Some(d) = dir {
+            dlg = dlg.set_directory(d);
+        }
+        let _ = tx.send(dlg.pick_file());
+    });
+    rx
+}
+
+/// Spawn the native save dialog for the PSTH PNG on a background thread.
+fn spawn_png_saver(dir: Option<PathBuf>, default_name: String) -> mpsc::Receiver<Option<PathBuf>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut dlg = rfd::FileDialog::new()
+            .add_filter("PNG image", &["png"])
+            .set_file_name(default_name);
+        if let Some(d) = dir {
+            dlg = dlg.set_directory(d);
+        }
+        let _ = tx.send(dlg.save_file());
+    });
+    rx
+}
+
+/// data-row index (into `result.data`) for a 1-based channel number, or None if the
+/// channel is not among the computed display rows.
+fn channel_row(result: &PsthResult, ch: usize) -> Option<usize> {
+    result.display_rows.iter().find_map(|r| match r {
+        DisplayRow::Data { data_idx, first_ch, .. } if *first_ch + 1 == ch => Some(*data_idx),
+        _ => None,
+    })
+}
+
+/// 1-based channel number under a heatmap y coordinate (ch_last at top, ch_first at
+/// bottom — matching `build_psth_heatmap_into`).
+fn channel_at_heatmap_y(result: &PsthResult, heat_rect: egui::Rect, y: f32) -> Option<usize> {
+    let n_rows = result.display_rows.len();
+    if n_rows == 0 {
+        return None;
+    }
+    let frac = ((y - heat_rect.top()) / heat_rect.height()).clamp(0.0, 0.999_9);
+    let disp_idx = (n_rows - 1).saturating_sub((frac * n_rows as f32) as usize);
+    match result.display_rows.get(disp_idx) {
+        Some(DisplayRow::Data { first_ch, .. }) => Some(*first_ch + 1),
+        _ => None,
+    }
+}
+
 pub struct NPXplorerApp {
     bin_path: PathBuf,
     meta: Arc<Meta>,
+    raw: Arc<RawData>,
     is_compressed: bool,
 
     // view state
@@ -190,6 +345,8 @@ pub struct NPXplorerApp {
     proj_threshold: f32,
     proj_sigma: f32,
     proj_cfg: Option<PreprocConfig>,
+
+    psth: PsthState,
 }
 
 impl NPXplorerApp {
@@ -281,9 +438,11 @@ impl NPXplorerApp {
         let is_compressed = bin_path.extension().and_then(|s| s.to_str()) == Some("cbin");
 
         let n_ap = meta.n_ap_chans;
+        let psth_total_s = meta.n_samples as f64 / meta.sample_rate;
         Ok(Self {
             bin_path,
             meta,
+            raw: Arc::clone(&raw),
             is_compressed,
             view_start_s: 0.0,
             view_dur_s,
@@ -331,6 +490,7 @@ impl NPXplorerApp {
             proj_threshold: 0.0,
             proj_sigma: 0.0,
             proj_cfg: None,
+            psth: PsthState::new(0, n_ap.saturating_sub(1), psth_total_s),
         })
     }
 
@@ -374,6 +534,167 @@ impl NPXplorerApp {
         let (lock, cvar) = &*self.worker_state;
         lock.lock().unwrap().request = Some(req);
         cvar.notify_one();
+    }
+
+    // -----------------------------------------------------------------------
+    // PSTH
+    // -----------------------------------------------------------------------
+
+    /// Poll the PSTH picker/compute/export channels and dispatch a computation only
+    /// when the user has pressed "Apply settings" (or just picked a file).
+    fn poll_and_maybe_dispatch_psth(&mut self, ctx: &egui::Context) {
+        // stimulus-file picker
+        if let Some(rx) = &self.psth.pick_rx {
+            match rx.try_recv() {
+                Ok(picked) => {
+                    self.psth.pick_rx = None;
+                    if let Some(path) = picked {
+                        self.psth.stim_path = Some(path);
+                        self.psth.open = true;
+                        self.psth.apply_requested = true; // auto-compute on first load
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.psth.pick_rx = None,
+            }
+        }
+
+        // compute result
+        if let Some(rx) = &self.psth.compute_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.psth.compute_rx = None;
+                    self.psth.computing = false;
+                    match res {
+                        Ok(r) => {
+                            self.psth.n_used = r.n_used;
+                            self.psth.n_skipped = r.n_skipped;
+                            self.psth.result = Some(Arc::new(r));
+                            self.psth.error = None;
+                            self.psth.tex_dirty = true;
+                        }
+                        Err(e) if e == "cancelled" => {}
+                        Err(e) => {
+                            self.psth.error = Some(e);
+                            self.psth.result = None;
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.psth.compute_rx = None;
+                    self.psth.computing = false;
+                }
+            }
+        }
+
+        // dispatch only when Apply was pressed
+        if self.psth.apply_requested && self.psth.stim_path.is_some() {
+            self.psth.apply_requested = false;
+            self.dispatch_psth_compute(ctx);
+        }
+
+        self.poll_psth_export(ctx);
+    }
+
+    fn dispatch_psth_compute(&mut self, ctx: &egui::Context) {
+        let stim_path = match &self.psth.stim_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        // cancel any in-flight compute and install a fresh cancel flag
+        self.psth.cancel.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.psth.cancel = Arc::clone(&cancel);
+
+        let (tx, rx) = mpsc::channel();
+        self.psth.compute_rx = Some(rx);
+        self.psth.computing = true;
+        self.psth.error = None;
+
+        let raw = Arc::clone(&self.raw);
+        let meta = Arc::clone(&self.meta);
+        let cfg = self.preproc_cfg.clone();
+        let params = PsthParams {
+            ch_first: self.psth.ch_first,
+            ch_last: self.psth.ch_last,
+            start_ms: self.psth.start_ms,
+            end_ms: self.psth.end_ms,
+        };
+        let (t_start, t_end) = (self.psth.stim_t_start, self.psth.stim_t_end);
+        let default_layout = default_layout_path();
+        let ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            let res = (|| -> Result<PsthResult, String> {
+                let layout = resolve_layout(&stim_path, &default_layout).map_err(|e| e.to_string())?;
+                let all = load_stim_times(&stim_path, &layout).map_err(|e| e.to_string())?;
+                let times: Vec<f64> = all.into_iter().filter(|&t| t >= t_start && t <= t_end).collect();
+                if times.is_empty() {
+                    return Err(format!(
+                        "no stimuli fall within the selected time range {:.3}–{:.3} s.",
+                        t_start, t_end
+                    ));
+                }
+                compute_psth(&raw, &meta, &cfg, &times, &params, &cancel).map_err(|e| e.to_string())
+            })();
+            let _ = tx.send(res);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Poll the PNG-export save dialog and, once the requested screenshot arrives,
+    /// crop it to the figure area and write the file.
+    fn poll_psth_export(&mut self, ctx: &egui::Context) {
+        // save-file dialog result
+        if let Some(rx) = &self.psth.export_pick_rx {
+            match rx.try_recv() {
+                Ok(picked) => {
+                    self.psth.export_pick_rx = None;
+                    if let Some(mut path) = picked {
+                        if path.extension().is_none() {
+                            path.set_extension("png");
+                        }
+                        self.psth.export_path = Some(path);
+                        self.psth.export_pending = true;
+                        // request a full-viewport screenshot; we crop it when it arrives
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.psth.export_pick_rx = None,
+            }
+        }
+
+        // screenshot reply
+        if self.psth.export_pending {
+            let shot = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                    _ => None,
+                })
+            });
+            if let (Some(image), Some(rect), Some(path)) =
+                (shot, self.psth.figure_rect, self.psth.export_path.clone())
+            {
+                self.psth.export_pending = false;
+                self.psth.export_path = None;
+                let ppp = ctx.pixels_per_point();
+                let cropped = image.region(&rect, Some(ppp));
+                let [w, h] = cropped.size;
+                match crate::psth::save_png(&path, w, h, cropped.as_raw()) {
+                    Ok(()) => {}
+                    Err(e) => self.psth.error = Some(format!("PNG export failed: {e}")),
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -474,6 +795,14 @@ impl NPXplorerApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Preferences").clicked() {
                     self.show_preferences = !self.show_preferences;
+                }
+                if ui.button("PSTH").clicked() {
+                    self.psth.open = true;
+                    if self.psth.pick_rx.is_none() {
+                        self.psth.pick_rx = Some(spawn_stim_picker(
+                            self.bin_path.parent().map(|p| p.to_path_buf()),
+                        ));
+                    }
                 }
             });
         });
@@ -731,7 +1060,390 @@ impl NPXplorerApp {
 }
 
 impl NPXplorerApp {
+    fn draw_psth_window(&mut self, ctx: &egui::Context) {
+        if !self.psth.open {
+            return;
+        }
+        let c_zero = egui::Color32::from_rgb(
+            crate::render::C_ZERO[0], crate::render::C_ZERO[1], crate::render::C_ZERO[2],
+        );
+        let [ar, ag, ab] = crate::render::colormap_accent(&self.colormap_choice);
+        let accent = egui::Color32::from_rgb(ar, ag, ab);
+        let accent_50 = egui::Color32::from_rgba_unmultiplied(ar, ag, ab, 128);
+        let cmap = self.colormap_choice.clone();
+        let n_ap = self.meta.n_ap_chans;
+        let total_s = self.psth.total_s;
+
+        // size the window to 2/3 of the main window and center it on first open
+        let screen = ctx.screen_rect();
+        let win_size = screen.size() * (2.0 / 3.0);
+        let win_pos = screen.center() - (win_size * 0.5);
+
+        let mut open = self.psth.open;
+        let result = self.psth.result.clone();
+
+        egui::Window::new(
+            egui::RichText::new("Peri-Stimulus Time Histogram").color(egui::Color32::WHITE),
+        )
+            .open(&mut open)
+            .default_size(win_size)
+            .default_pos(win_pos)
+            .frame(egui::Frame::new().fill(c_zero).inner_margin(8.0)
+                .stroke(egui::Stroke::new(2.0, accent_50)))
+            .show(ctx, |ui| {
+                // force every widget in this window onto the app background
+                ui.visuals_mut().panel_fill = c_zero;
+                ui.visuals_mut().window_fill = c_zero;
+
+                ui.horizontal(|ui| {
+                    if ui.button("Change file…").clicked() && self.psth.pick_rx.is_none() {
+                        self.psth.pick_rx = Some(spawn_stim_picker(
+                            self.bin_path.parent().map(|p| p.to_path_buf()),
+                        ));
+                    }
+                    let name = self.psth.stim_path.as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "(no file)".into());
+                    ui.label(name);
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can_export = self.psth.result.is_some()
+                            && self.psth.export_pick_rx.is_none()
+                            && !self.psth.export_pending;
+                        if ui.add_enabled(can_export, egui::Button::new("Export PNG…")).clicked() {
+                            self.psth.export_pick_rx = Some(spawn_png_saver(
+                                self.bin_path.parent().map(|p| p.to_path_buf()),
+                                self.default_psth_png_name(),
+                            ));
+                        }
+                    });
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Channels:");
+                    let mut cf = self.psth.ch_first + 1;
+                    let mut cl = self.psth.ch_last + 1;
+                    let mut changed = false;
+                    changed |= ui.add(egui::Slider::new(&mut cf, 1..=n_ap).text("First")).changed();
+                    changed |= ui.add(egui::Slider::new(&mut cl, 1..=n_ap).text("Last")).changed();
+                    if changed {
+                        self.psth.ch_first = (cf - 1).min(cl - 1);
+                        self.psth.ch_last = (cl - 1).max(cf - 1);
+                    }
+
+                    ui.separator();
+
+                    // stimulus time-range selector (seconds)
+                    ui.label("Stim time (s):");
+                    let r1 = ui.add(egui::TextEdit::singleline(&mut self.psth.stim_t_start_str)
+                        .desired_width(70.0).hint_text("start"));
+                    if r1.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if let Ok(v) = self.psth.stim_t_start_str.trim().parse::<f64>() {
+                            self.psth.stim_t_start = v.clamp(0.0, total_s);
+                        }
+                        self.psth.stim_t_start_str = format!("{:.3}", self.psth.stim_t_start);
+                    }
+                    ui.label("to");
+                    let r2 = ui.add(egui::TextEdit::singleline(&mut self.psth.stim_t_end_str)
+                        .desired_width(70.0).hint_text("end"));
+                    if r2.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if let Ok(v) = self.psth.stim_t_end_str.trim().parse::<f64>() {
+                            self.psth.stim_t_end = v.clamp(0.0, total_s);
+                        }
+                        self.psth.stim_t_end_str = format!("{:.3}", self.psth.stim_t_end);
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Window (ms):");
+                    let r1 = ui.add(egui::TextEdit::singleline(&mut self.psth.start_ms_str)
+                        .desired_width(55.0).hint_text("start"));
+                    if r1.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if let Ok(v) = self.psth.start_ms_str.trim().parse::<f64>() {
+                            self.psth.start_ms = v;
+                        }
+                        self.psth.start_ms_str = format!("{}", self.psth.start_ms);
+                    }
+                    ui.label("to");
+                    let r2 = ui.add(egui::TextEdit::singleline(&mut self.psth.end_ms_str)
+                        .desired_width(55.0).hint_text("end"));
+                    if r2.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if let Ok(v) = self.psth.end_ms_str.trim().parse::<f64>() {
+                            self.psth.end_ms = v;
+                        }
+                        self.psth.end_ms_str = format!("{}", self.psth.end_ms);
+                    }
+
+                    ui.separator();
+
+                    // Apply: commit the staged settings and recompute
+                    let apply = ui.add_enabled(
+                        self.psth.stim_path.is_some() && !self.psth.computing,
+                        egui::Button::new(egui::RichText::new("Apply settings").color(c_zero))
+                            .fill(accent_50),
+                    );
+                    if apply.clicked() {
+                        self.psth.apply_requested = true;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Color scale:");
+                    let mut changed = false;
+                    changed |= ui.radio_value(&mut self.psth.color_mode, ColorMode::Percentile, "%ile").changed();
+                    changed |= ui.radio_value(&mut self.psth.color_mode, ColorMode::Voltage, "±µV").changed();
+                    if self.psth.color_mode == ColorMode::Percentile {
+                        changed |= ui.add(egui::Slider::new(&mut self.psth.color_pct, 95.0..=100.0)
+                            .step_by(0.1).suffix("%")).changed();
+                    } else {
+                        changed |= ui.add(egui::Slider::new(&mut self.psth.color_uv, 1.0..=200.0)
+                            .suffix("µV")).changed();
+                    }
+                    if changed {
+                        self.psth.tex_dirty = true;
+                    }
+                });
+
+                if self.psth.computing {
+                    ui.horizontal(|ui| { ui.spinner(); ui.label("Computing…"); });
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                } else if let Some(err) = &self.psth.error {
+                    ui.colored_label(egui::Color32::from_rgb(0xff, 0x66, 0x66), err);
+                } else if self.psth.result.is_some() {
+                    ui.horizontal(|ui| {
+                        let base = if self.psth.n_skipped > 0 {
+                            format!("{} stimuli averaged ({} skipped near edges)",
+                                self.psth.n_used, self.psth.n_skipped)
+                        } else {
+                            format!("{} stimuli averaged", self.psth.n_used)
+                        };
+                        ui.label(base);
+                        ui.label("·  left-click / right-click the heatmap to plot a channel:");
+                        if let Some(c) = self.psth.sel_ch1 {
+                            ui.colored_label(egui::Color32::from_rgb(255, 255, 255), format!("ch {c}"));
+                        }
+                        if let Some(c) = self.psth.sel_ch2 {
+                            ui.colored_label(egui::Color32::from_rgb(255, 182, 23), format!("ch {c}"));
+                        }
+                        if (self.psth.sel_ch1.is_some() || self.psth.sel_ch2.is_some())
+                            && ui.button("Deselect").clicked()
+                        {
+                            self.psth.sel_ch1 = None;
+                            self.psth.sel_ch2 = None;
+                        }
+                    });
+                }
+
+                ui.separator();
+
+                if let Some(result) = &result {
+                    self.draw_psth_plots(ui, result, &cmap, accent, c_zero);
+                } else if !self.psth.computing && self.psth.error.is_none() {
+                    ui.label("Pick a stimulus-times file to compute the PSTH.");
+                }
+            });
+
+        self.psth.open = open;
+    }
+
+    /// Default filename for a PSTH PNG: `<recording>_<stim file>_psth.png`.
+    fn default_psth_png_name(&self) -> String {
+        let rec = self.bin_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let stim = self.psth.stim_path.as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        format!("{rec}_{stim}_psth.png")
+    }
+
+    fn draw_psth_plots(
+        &mut self,
+        ui: &mut Ui,
+        result: &Arc<PsthResult>,
+        cmap: &ColorMapChoice,
+        accent: egui::Color32,
+        c_zero: egui::Color32,
+    ) {
+        // colors for the two selectable channel traces (match the main window)
+        let ch1_color = egui::Color32::from_rgb(255, 255, 255);
+        let ch2_color = egui::Color32::from_rgb(255, 182, 23);
+
+        let avail = ui.available_size();
+        if avail.x < 40.0 || avail.y < 90.0 {
+            return;
+        }
+        let (rect, _resp) = ui.allocate_exact_size(avail, egui::Sense::hover());
+        self.psth.figure_rect = Some(rect);
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, c_zero);
+
+        let gutter = 46.0;
+        let x_axis_h = 22.0;
+        let gap = 6.0;
+        let plot_left = rect.left() + gutter;
+        let plot_right = rect.right() - 6.0;
+
+        // two stacked line plots (selected-channel, then mean) above the heatmap
+        let line_h = ((rect.height() - x_axis_h) * 0.20).clamp(40.0, 130.0);
+        let sel_rect = egui::Rect::from_min_max(
+            egui::pos2(plot_left, rect.top()),
+            egui::pos2(plot_right, rect.top() + line_h),
+        );
+        let avg_rect = egui::Rect::from_min_max(
+            egui::pos2(plot_left, sel_rect.bottom() + gap),
+            egui::pos2(plot_right, sel_rect.bottom() + gap + line_h),
+        );
+        let heat_rect = egui::Rect::from_min_max(
+            egui::pos2(plot_left, avg_rect.bottom() + gap),
+            egui::pos2(plot_right, rect.bottom() - x_axis_h),
+        );
+        if heat_rect.width() < 2.0 || heat_rect.height() < 2.0 {
+            return;
+        }
+
+        let start_ms = result.start_ms;
+        let end_ms = start_ms + result.n_win as f64 * result.dt_ms;
+        let span_ms = (end_ms - start_ms).max(1e-6);
+        let x_of_ms = |ms: f64| -> f32 {
+            heat_rect.left() + ((ms - start_ms) / span_ms) as f32 * heat_rect.width()
+        };
+        let n = result.n_win.max(2);
+        let x_of_i = |rct: &egui::Rect, i: usize| -> f32 {
+            rct.left() + (i as f32 / (n - 1) as f32) * rct.width()
+        };
+
+        // heatmap texture (rebuilt on color/size change)
+        let pw = heat_rect.width().round() as usize;
+        let ph = heat_rect.height().round() as usize;
+        let vmax = match self.psth.color_mode {
+            ColorMode::Percentile => result.vmax_percentile(self.psth.color_pct),
+            ColorMode::Voltage => self.psth.color_uv.max(1e-6),
+        };
+        let size_changed = self.psth.last_tex_size != Some([pw, ph]);
+        if self.psth.tex_dirty || size_changed || self.psth.texture.is_none() {
+            build_psth_heatmap_into(&mut self.psth.pixel_buf, result, pw, ph, vmax, cmap);
+            let img = egui::ColorImage::from_rgba_unmultiplied([pw, ph], &self.psth.pixel_buf);
+            self.psth.texture = Some(ui.ctx().load_texture("psth_heatmap", img, TextureOptions::NEAREST));
+            self.psth.last_tex_size = Some([pw, ph]);
+            self.psth.tex_dirty = false;
+        }
+        if let Some(tex) = &self.psth.texture {
+            painter.image(
+                tex.id(),
+                heat_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+
+        // marker lines for the selected channels (like the main window)
+        let n_disp = result.display_rows.len().max(1);
+        let draw_marker = |ch: usize, color: egui::Color32| {
+            if let Some(d) = result.display_rows.iter().position(
+                |r| matches!(r, DisplayRow::Data { first_ch, .. } if *first_ch + 1 == ch),
+            ) {
+                let frac_y = ((n_disp - 1 - d) as f32 + 0.5) / n_disp as f32;
+                let y = heat_rect.top() + frac_y * heat_rect.height();
+                painter.line_segment(
+                    [egui::pos2(heat_rect.left(), y), egui::pos2(heat_rect.right(), y)],
+                    egui::Stroke::new(2.0, color),
+                );
+            }
+        };
+        if let Some(c) = self.psth.sel_ch1 {
+            draw_marker(c, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 128));
+        }
+        if let Some(c) = self.psth.sel_ch2 {
+            draw_marker(c, egui::Color32::from_rgba_unmultiplied(255, 182, 23, 128));
+        }
+
+        // channel selection: click the heatmap
+        let resp = ui.interact(heat_rect, ui.id().with("psth_heat_click"), egui::Sense::click());
+        let click = if resp.clicked() {
+            resp.interact_pointer_pos().map(|p| (p, false))
+        } else if resp.secondary_clicked() {
+            resp.interact_pointer_pos().map(|p| (p, true))
+        } else {
+            None
+        };
+        if let Some((pos, right)) = click {
+            if let Some(ch) = channel_at_heatmap_y(result, heat_rect, pos.y) {
+                if right { self.psth.sel_ch2 = Some(ch); } else { self.psth.sel_ch1 = Some(ch); }
+            }
+        }
+
+        // ---- selected-channel line plot ----
+        painter.rect_filled(sel_rect, 0.0, c_zero);
+        let mut sel_traces: Vec<(usize, egui::Color32)> = Vec::new();
+        if let Some(c) = self.psth.sel_ch1 { sel_traces.push((c, ch1_color)); }
+        if let Some(c) = self.psth.sel_ch2 { sel_traces.push((c, ch2_color)); }
+        // symmetric scale across all shown channel traces
+        let mut sel_max = 1e-6f32;
+        for (ch, _) in &sel_traces {
+            if let Some(row) = channel_row(result, *ch) {
+                let s = &result.data[row * result.n_win..(row + 1) * result.n_win];
+                sel_max = sel_max.max(s.iter().fold(0.0f32, |m, &v| m.max(v.abs())));
+            }
+        }
+        let sel_mid = sel_rect.center().y;
+        let sel_half = sel_rect.height() * 0.5 - 2.0;
+        painter.line_segment(
+            [egui::pos2(sel_rect.left(), sel_mid), egui::pos2(sel_rect.right(), sel_mid)],
+            egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+        );
+        for (ch, color) in &sel_traces {
+            if let Some(row) = channel_row(result, *ch) {
+                let s = &result.data[row * result.n_win..(row + 1) * result.n_win];
+                let pts: Vec<egui::Pos2> = (0..result.n_win).map(|i| {
+                    egui::pos2(x_of_i(&sel_rect, i), sel_mid - (s[i] / sel_max) * sel_half)
+                }).collect();
+                painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, *color)));
+            }
+        }
+
+        // ---- mean-across-channels line plot ----
+        painter.rect_filled(avg_rect, 0.0, c_zero);
+        let tmax = result.avg_trace.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-6);
+        let avg_mid = avg_rect.center().y;
+        let avg_half = avg_rect.height() * 0.5 - 2.0;
+        painter.line_segment(
+            [egui::pos2(avg_rect.left(), avg_mid), egui::pos2(avg_rect.right(), avg_mid)],
+            egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+        );
+        let pts: Vec<egui::Pos2> = (0..result.n_win).map(|i| {
+            egui::pos2(x_of_i(&avg_rect, i), avg_mid - (result.avg_trace[i] / tmax) * avg_half)
+        }).collect();
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, accent)));
+
+        // onset marker at t = 0 across all three plots
+        if start_ms < 0.0 && end_ms > 0.0 {
+            let x0 = x_of_ms(0.0);
+            let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(150));
+            painter.line_segment([egui::pos2(x0, sel_rect.top()), egui::pos2(x0, sel_rect.bottom())], stroke);
+            painter.line_segment([egui::pos2(x0, avg_rect.top()), egui::pos2(x0, avg_rect.bottom())], stroke);
+            painter.line_segment([egui::pos2(x0, heat_rect.top()), egui::pos2(x0, heat_rect.bottom())], stroke);
+        }
+
+        // labels
+        let txt = egui::Color32::from_gray(200);
+        let fid = egui::FontId::proportional(11.0);
+        painter.text(egui::pos2(rect.left() + 2.0, sel_mid), egui::Align2::LEFT_CENTER, "chan µV", fid.clone(), txt);
+        painter.text(egui::pos2(rect.left() + 2.0, avg_mid), egui::Align2::LEFT_CENTER, "mean µV", fid.clone(), txt);
+        painter.text(egui::pos2(rect.left() + 2.0, heat_rect.top() + 2.0), egui::Align2::LEFT_TOP, format!("ch {}", self.psth.ch_last + 1), fid.clone(), txt);
+        painter.text(egui::pos2(rect.left() + 2.0, heat_rect.bottom() - 2.0), egui::Align2::LEFT_BOTTOM, format!("ch {}", self.psth.ch_first + 1), fid.clone(), txt);
+        let y_txt = rect.bottom() - x_axis_h + 4.0;
+        painter.text(egui::pos2(heat_rect.left(), y_txt), egui::Align2::LEFT_TOP, format!("{:.0} ms", start_ms), fid.clone(), txt);
+        if start_ms < 0.0 && end_ms > 0.0 {
+            painter.text(egui::pos2(x_of_ms(0.0), y_txt), egui::Align2::CENTER_TOP, "0", fid.clone(), txt);
+        }
+        painter.text(egui::pos2(heat_rect.right(), y_txt), egui::Align2::RIGHT_TOP, format!("{:.0} ms", end_ms), fid, txt);
+    }
+
     pub fn update(&mut self, ctx: &egui::Context) {
+        self.poll_and_maybe_dispatch_psth(ctx);
+        self.draw_psth_window(ctx);
+
         let mut show_prefs = self.show_preferences;
         if show_prefs {
             egui::Window::new("Preferences")
@@ -764,6 +1476,7 @@ impl NPXplorerApp {
                         if cm != self.colormap_choice {
                             self.colormap_choice = cm;
                             self.heatmap_texture = None; // Force redraw
+                            self.psth.tex_dirty = true; // PSTH heatmap tracks the same colormap
                         }
                     });
 

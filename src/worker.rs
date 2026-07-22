@@ -78,7 +78,7 @@ pub type SharedCancel = Arc<AtomicBool>;
 // Depth averaging
 // ---------------------------------------------------------------------------
 
-fn average_depth_rows(raw: &[f32], n_samp: usize, display_rows: &[DisplayRow]) -> Vec<f32> {
+pub(crate) fn average_depth_rows(raw: &[f32], n_samp: usize, display_rows: &[DisplayRow]) -> Vec<f32> {
     use rayon::prelude::*;
     let n_data_rows = display_rows.iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
     let mut out = vec![0.0f32; n_data_rows * n_samp];
@@ -150,6 +150,14 @@ fn memory_pressure(mem_pressure_pct: f32, mem_reserve_bytes: u64) -> bool {
 // Worker thread
 // ---------------------------------------------------------------------------
 
+/// Number of worker threads to use for heavy CPU work (preprocessing, PSTH).
+/// Leaves 2 cores free for the UI thread and the OS so the app stays responsive.
+pub fn compute_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(2))
+        .unwrap_or(2)
+}
+
 pub fn spawn_worker(
     raw: Arc<RawData>,
     meta: Arc<Meta>,
@@ -159,9 +167,7 @@ pub fn spawn_worker(
     ctx: egui::Context,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let n_threads = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(2).max(2))
-            .unwrap_or(2);
+        let n_threads = compute_thread_count();
         let pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
 
         let (lock, cvar) = &*shared;

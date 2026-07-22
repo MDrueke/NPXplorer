@@ -28,6 +28,7 @@ mod data;
 mod geometry;
 mod mtscomp;
 mod preprocess;
+mod psth;
 mod render;
 mod worker;
 
@@ -292,6 +293,8 @@ impl eframe::App for MainApp {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    psth::ensure_default_layout();
 
     if args.debug {
         DEBUG_LOGGING.store(true, std::sync::atomic::Ordering::Relaxed);

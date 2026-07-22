@@ -330,3 +330,69 @@ pub fn build_heatmap_into(
             }
         });
 }
+
+/// Render a PSTH result (a dense, already-aligned rows×time matrix) into an RGBA
+/// buffer of size `pixel_w × pixel_h`. Rows are drawn ch_last at top / ch_first at
+/// bottom, matching the main heatmap; gaps and shank boundaries render identically.
+pub fn build_psth_heatmap_into(
+    out: &mut Vec<u8>,
+    result: &crate::psth::PsthResult,
+    pixel_w: usize,
+    pixel_h: usize,
+    vmax: f32,
+    cmap: &crate::app::ColorMapChoice,
+) {
+    use rayon::prelude::*;
+
+    out.resize(pixel_w * pixel_h * 4, 0);
+    if pixel_w == 0 || pixel_h == 0 {
+        return;
+    }
+
+    let display_rows = &result.display_rows;
+    let n_rows = display_rows.len();
+    let n_win = result.n_win;
+    let data = &result.data;
+    if n_rows == 0 || n_win == 0 {
+        return;
+    }
+
+    let row_bytes = pixel_w * 4;
+    out.par_chunks_mut(row_bytes)
+        .enumerate()
+        .for_each(|(py, row)| {
+            let disp_idx = n_rows
+                .saturating_sub(1)
+                .saturating_sub((py * n_rows) / pixel_h)
+                .min(n_rows - 1);
+
+            match &display_rows[disp_idx] {
+                DisplayRow::IntraShankGap => {
+                    for (px_idx, px) in row.chunks_exact_mut(4).enumerate() {
+                        let (r, g, b) = if (px_idx / 4) % 2 == 0 {
+                            (0x60, 0x60, 0x60)
+                        } else {
+                            (C_ZERO[0], C_ZERO[1], C_ZERO[2])
+                        };
+                        px[0] = r; px[1] = g; px[2] = b; px[3] = 255;
+                    }
+                }
+                DisplayRow::ShankBoundary => {
+                    for px in row.chunks_exact_mut(4) {
+                        px[0] = 255; px[1] = 255; px[2] = 255; px[3] = 255;
+                    }
+                }
+                DisplayRow::Data { data_idx, .. } => {
+                    let ch_data = &data[data_idx * n_win..(data_idx + 1) * n_win];
+                    for (px_col, px) in row.chunks_exact_mut(4).enumerate() {
+                        let t0 = (px_col * n_win) / pixel_w;
+                        let t1 = (((px_col + 1) * n_win) / pixel_w).min(n_win).max(t0 + 1);
+                        let v = ch_data[t0..t1.min(n_win)].iter().copied().sum::<f32>()
+                            / (t1.min(n_win) - t0) as f32;
+                        let rgba = voltage_to_rgba(v, vmax, cmap);
+                        px[0] = rgba[0]; px[1] = rgba[1]; px[2] = rgba[2]; px[3] = rgba[3];
+                    }
+                }
+            }
+        });
+}
