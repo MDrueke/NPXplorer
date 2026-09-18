@@ -75,8 +75,8 @@ impl StimLayout {
         let mut n_header_rows = 0usize;
         for line in text.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue; // ignore blank lines in the layout
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue; // ignore blank lines and comments in the layout
             }
             let tokens = split_fields(trimmed);
             let onset_cols: Vec<usize> = tokens
@@ -239,7 +239,7 @@ pub fn compute_psth(
     // sides; 0.15 s is comfortably longer than either transient
     let pad = (0.15 * fs).round() as i64;
 
-    let display_rows_full = Arc::new(meta.build_display_rows(cfg.avg_depths, &cfg.removed_channels));
+    let display_rows_full = Arc::new(meta.build_display_rows(cfg.avg_depths, &cfg.removed_channels, cfg.channel_order, cfg.shank_order));
     let data_rows: Vec<usize> = display_rows_full
         .iter()
         .enumerate()
@@ -416,7 +416,16 @@ pub fn default_layout_path() -> PathBuf {
     config_dir().join("stims_file_layout.csv")
 }
 
-const DEFAULT_LAYOUT: &str = "header\no\n";
+const DEFAULT_LAYOUT: &str = "\
+# This file tells NPXplorer how to read a stimulus-times file.
+# Lines here mirror the structure of that file, one line each (comment lines
+# like this one are ignored and don't count). Lines with no 'o' are header
+# rows in the stimulus file, to be skipped. The first line containing 'o'
+# marks which comma-separated column(s) hold the onset times (in seconds);
+# 'x' marks a column to ignore.
+header
+o
+";
 
 /// Write the default layout file into `config/` if it does not exist yet.
 pub fn ensure_default_layout() {

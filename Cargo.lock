@@ -3,6 +3,26 @@
 version = 4
 
 [[package]]
+name = "NPXplorer"
+version = "0.5.1"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "clap",
+ "eframe",
+ "egui",
+ "flate2",
+ "memmap2",
+ "rayon",
+ "rfd",
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "toml",
+]
+
+[[package]]
 name = "ab_glyph"
 version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2016,26 +2036,6 @@ name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
-
-[[package]]
-name = "npxplorer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "clap",
- "eframe",
- "egui",
- "flate2",
- "memmap2",
- "rayon",
- "rfd",
- "roxmltree",
- "serde",
- "serde_json",
- "sysinfo",
- "toml",
-]
 
 [[package]]
 name = "ntapi"

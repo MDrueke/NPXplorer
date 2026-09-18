@@ -6,7 +6,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::data::{DisplayRow, Meta, RawData, open_data};
+use crate::data::{ChannelOrder, DisplayRow, Meta, RawData, ShankOrder, open_data};
 use crate::preprocess::{Filters, PreprocConfig, SpatialFilter};
 use crate::psth::{PsthParams, PsthResult, compute_psth, resolve_layout, load_stim_times, default_layout_path};
 use crate::render::{build_heatmap_into, build_psth_heatmap_into};
@@ -389,6 +389,8 @@ impl NPXplorerApp {
             sample_rate: fs,
             im_dat_prb_type: meta.im_dat_prb_type,
             removed_channels: Default::default(),
+            channel_order: Default::default(),
+            shank_order: Default::default(),
         };
 
         let mut view_dur_s = 0.5;
@@ -425,7 +427,7 @@ impl NPXplorerApp {
         // defensively re-clamp in case prefs were saved on a machine with more RAM,
         // or with an initial_buffer_s/view_dur_s combination that no longer satisfies
         // the no-oscillation bound
-        let n_data_rows = meta.build_display_rows(preproc_cfg.avg_depths, &preproc_cfg.removed_channels)
+        let n_data_rows = meta.build_display_rows(preproc_cfg.avg_depths, &preproc_cfg.removed_channels, preproc_cfg.channel_order, preproc_cfg.shank_order)
             .iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
         initial_buffer_s = initial_buffer_s.min(max_feasible_buffer_s(n_data_rows, fs, mem_reserve_mb));
         extension_margin_s = extension_margin_s.min(max_extension_margin_s(initial_buffer_s, view_dur_s));
@@ -1163,7 +1165,7 @@ impl NPXplorerApp {
             let x = rect.min.x + w * frac;
             painter.line_segment(
                 [egui::pos2(x, rect.max.y - 6.0), egui::pos2(x, rect.max.y)],
-                egui::Stroke::new(1.0, egui::Color32::GRAY),
+                egui::Stroke::new(1.0_f32, egui::Color32::GRAY),
             );
             painter.text(
                 egui::pos2(x, rect.max.y - 8.0),
@@ -1214,7 +1216,7 @@ impl NPXplorerApp {
             .default_size(win_size)
             .default_pos(win_pos)
             .frame(egui::Frame::new().fill(c_zero).inner_margin(8.0)
-                .stroke(egui::Stroke::new(2.0, accent_50)))
+                .stroke(egui::Stroke::new(2.0_f32, accent_50)))
             .show(ctx, |ui| {
                 // force every widget in this window onto the app background
                 ui.visuals_mut().panel_fill = c_zero;
@@ -1472,7 +1474,7 @@ impl NPXplorerApp {
                 let y = heat_rect.top() + frac_y * heat_rect.height();
                 painter.line_segment(
                     [egui::pos2(heat_rect.left(), y), egui::pos2(heat_rect.right(), y)],
-                    egui::Stroke::new(2.0, color),
+                    egui::Stroke::new(2.0_f32, color),
                 );
             }
         };
@@ -1515,7 +1517,7 @@ impl NPXplorerApp {
         let sel_half = sel_rect.height() * 0.5 - 2.0;
         painter.line_segment(
             [egui::pos2(sel_rect.left(), sel_mid), egui::pos2(sel_rect.right(), sel_mid)],
-            egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)),
         );
         for (ch, color) in &sel_traces {
             if let Some(row) = channel_row(result, *ch) {
@@ -1523,7 +1525,7 @@ impl NPXplorerApp {
                 let pts: Vec<egui::Pos2> = (0..result.n_win).map(|i| {
                     egui::pos2(x_of_i(&sel_rect, i), sel_mid - (s[i] / sel_max) * sel_half)
                 }).collect();
-                painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, *color)));
+                painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, *color)));
             }
         }
 
@@ -1534,17 +1536,17 @@ impl NPXplorerApp {
         let avg_half = avg_rect.height() * 0.5 - 2.0;
         painter.line_segment(
             [egui::pos2(avg_rect.left(), avg_mid), egui::pos2(avg_rect.right(), avg_mid)],
-            egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)),
         );
         let pts: Vec<egui::Pos2> = (0..result.n_win).map(|i| {
             egui::pos2(x_of_i(&avg_rect, i), avg_mid - (result.avg_trace[i] / tmax) * avg_half)
         }).collect();
-        painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, accent)));
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, accent)));
 
         // onset marker at t = 0 across all three plots
         if start_ms < 0.0 && end_ms > 0.0 {
             let x0 = x_of_ms(0.0);
-            let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(150));
+            let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(150));
             painter.line_segment([egui::pos2(x0, sel_rect.top()), egui::pos2(x0, sel_rect.bottom())], stroke);
             painter.line_segment([egui::pos2(x0, avg_rect.top()), egui::pos2(x0, avg_rect.bottom())], stroke);
             painter.line_segment([egui::pos2(x0, heat_rect.top()), egui::pos2(x0, heat_rect.bottom())], stroke);
@@ -1578,6 +1580,11 @@ impl NPXplorerApp {
                 .collapsible(false)
                 .open(&mut show_prefs)
                 .show(ctx, |ui| {
+                    // scrollable so every section stays reachable regardless of window
+                    // height (the content has grown past a typical screen's height)
+                    egui::ScrollArea::vertical()
+                        .max_height(ui.ctx().screen_rect().height() - 80.0)
+                        .show(ui, |ui| {
                     ui.label(egui::RichText::new("Appearance").strong());
 
                     ui.horizontal(|ui| {
@@ -1604,6 +1611,49 @@ impl NPXplorerApp {
                             self.colormap_choice = cm;
                             self.heatmap_texture = None; // Force redraw
                             self.psth.tex_dirty = true; // PSTH heatmap tracks the same colormap
+                        }
+                    });
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("Channel layout").strong());
+
+                    ui.horizontal(|ui| {
+                        ui.label("Order channels by:");
+                        let mut co = self.preproc_cfg.channel_order;
+                        egui::ComboBox::from_id_salt("channel_order_combo")
+                            .selected_text(match co {
+                                ChannelOrder::Id => "ID",
+                                ChannelOrder::Depth => "Depth",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut co, ChannelOrder::Id, "ID");
+                                ui.selectable_value(&mut co, ChannelOrder::Depth, "Depth");
+                            });
+                        if co != self.preproc_cfg.channel_order {
+                            self.preproc_cfg.channel_order = co;
+                            self.heatmap_texture = None;
+                            self.pending_cfg_recompute = true;
+                            self.save_prefs();
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Order shanks by:");
+                        let mut so = self.preproc_cfg.shank_order;
+                        egui::ComboBox::from_id_salt("shank_order_combo")
+                            .selected_text(match so {
+                                ShankOrder::Id => "ID",
+                                ShankOrder::XCoord => "x coordinate",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut so, ShankOrder::Id, "ID");
+                                ui.selectable_value(&mut so, ShankOrder::XCoord, "x coordinate");
+                            });
+                        if so != self.preproc_cfg.shank_order {
+                            self.preproc_cfg.shank_order = so;
+                            self.heatmap_texture = None;
+                            self.pending_cfg_recompute = true;
+                            self.save_prefs();
                         }
                     });
 
@@ -1643,7 +1693,7 @@ impl NPXplorerApp {
                     ui.separator();
                     ui.label(egui::RichText::new("Buffer").strong());
 
-                    let n_data_rows = self.meta.build_display_rows(self.preproc_cfg.avg_depths, &self.preproc_cfg.removed_channels)
+                    let n_data_rows = self.meta.build_display_rows(self.preproc_cfg.avg_depths, &self.preproc_cfg.removed_channels, self.preproc_cfg.channel_order, self.preproc_cfg.shank_order)
                         .iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
                     let max_feasible = max_feasible_buffer_s(n_data_rows, self.meta.sample_rate, self.mem_reserve_mb);
 
@@ -1705,6 +1755,7 @@ impl NPXplorerApp {
                         egui::RichText::new("buffer growth stops once free memory drops below either threshold")
                             .small().color(egui::Color32::GRAY)
                     );
+                        });
                 });
         }
         self.show_preferences = show_prefs;
@@ -2083,7 +2134,7 @@ impl NPXplorerApp {
                                         let y = resp.rect.top() + frac_y * resp.rect.height();
                                         ui.painter().line_segment(
                                             [egui::pos2(resp.rect.left(), y), egui::pos2(resp.rect.right(), y)],
-                                            egui::Stroke::new(2.0, color)
+                                            egui::Stroke::new(2.0_f32, color)
                                         );
                                         break;
                                     }
@@ -2096,6 +2147,32 @@ impl NPXplorerApp {
                         }
                         if let Some(ch2) = self.selected_channel_2 {
                             draw_line(ch2, egui::Color32::from_rgba_unmultiplied(255, 182, 23, 128));
+                        }
+
+                        // label each shank's section with "shank N", at the top-right
+                        // corner of its (possibly partial) visible span — only when more
+                        // than one shank is actually visible
+                        let mut shank_tops: Vec<(u32, usize)> = Vec::new(); // (shank, topmost visible row idx)
+                        for r in first_row..=last_row {
+                            if let DisplayRow::Data { shank, .. } = &display_rows[r] {
+                                match shank_tops.last_mut() {
+                                    Some((s, top)) if *s == *shank => *top = r,
+                                    _ => shank_tops.push((*shank, r)),
+                                }
+                            }
+                        }
+                        if shank_tops.len() > 1 {
+                            for (shank, top_idx) in shank_tops {
+                                let frac_top = (last_row - top_idx) as f32 / n_rows as f32;
+                                let y = resp.rect.top() + frac_top * resp.rect.height();
+                                ui.painter().text(
+                                    egui::pos2(resp.rect.right() - 6.0, y + 2.0),
+                                    egui::Align2::RIGHT_TOP,
+                                    format!("shank {shank}"),
+                                    egui::FontId::proportional(12.0),
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
+                                );
+                            }
                         }
 
                         // draw projection overlay

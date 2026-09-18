@@ -1,4 +1,4 @@
-# NPXplorer v0.5
+# NPXplorer v0.5.1
 
 A lightweight viewer for raw Neuropixels electrophysiology data. Renders voltage traces as a heatmap mapped to the physical probe geometry in real time.
 
@@ -34,6 +34,12 @@ Just launch, and pick a file from the file dialog.
 
 This is useful for determining i.e. layer boundaries from ephys data.
 
+### Removing channels
+
+Click **Remove channels…** in the top bar to exclude channels entirely — from the heatmap, from depth averaging, and from the CMR/destripe reference computation for the remaining channels. Useful for a noisy or dead channel that would otherwise contaminate the median reference of its neighbors.
+
+Enter a comma-separated list of 1-based channel numbers and/or ranges (e.g. `3,17,40-50`) and press **Apply** or Enter. **Load from file…** reads the list from a file instead (`.csv`, `.txt`, `.tsv`, `.dat`), using the same kind of layout file as the PSTH stimulus file (see below) — a `channel_remove_layout.csv` placed next to the channel-list file, or the default at `config/channel_remove_layout.csv`. **Reset** clears the removed-channel list.
+
 ### Preprocessing options
 
 All filters run in real time on the displayed chunk. The pipeline order is fixed:
@@ -49,6 +55,13 @@ All filters run in real time on the displayed chunk. The pipeline order is fixed
 5. **Avg depths** — when enabled, channels at the same depth on the same shank are averaged into a single display row.
 
 For multi-shank probes, all spatial filters operate independently per shank.
+
+### Channel layout
+
+Two settings in Preferences control display order (both apply to the main heatmap and to PSTH):
+
+- **Order channels by** — **Depth** (default) sorts channels by physical depth (y position), deepest channel on each shank at the bottom. **ID** sorts by raw hardware channel number instead, ascending from bottom to top; the gap indicator between rows is skipped in this mode, since row adjacency no longer reflects physical spacing.
+- **Order shanks by** — **ID** (default) uses the shank index from the meta file. **x coordinate** orders shanks left-to-right by their physical x position instead.
 
 ### Spike projection overlay
 
@@ -86,11 +99,11 @@ header
 o,x,x
 ```
 
-skips one header row and reads onsets from the first column. A `stims_file_layout.csv` placed next to the stim file is used if present; otherwise the default at `config/stims_file_layout.csv` (next to the executable) applies. If the layout does not match the file, an error describing the mismatch is shown.
+skips one header row and reads onsets from the first column. A `stims_file_layout.csv` placed next to the stim file is used if present; otherwise the default at `config/stims_file_layout.csv` (next to the executable) applies. If the layout does not match the file, an error describing the mismatch is shown. Lines starting with `#` are comments and are ignored (the default layout file explains the syntax this way).
 
 ## Configuration
 
-Preferences are saved to `config/npxplorer_prefs.toml` in a `config/` folder next to the executable (a `npxplorer_prefs.toml` left next to the executable by an older version is still read if the new one is absent). This includes preprocessing settings, colormap, color scale mode, spike threshold, window duration, and the last opened directory. The `config/` folder also holds the default `stims_file_layout.csv` used by the PSTH tool; it is created on first launch.
+Preferences are saved to `config/npxplorer_prefs.toml` in a `config/` folder next to the executable (a `npxplorer_prefs.toml` left next to the executable by an older version is still read if the new one is absent). This includes preprocessing settings, colormap, color scale mode, spike threshold, window duration, channel/shank ordering, and the last opened directory (the removed-channels list itself is not saved, since it's specific to a recording). The `config/` folder also holds the default `stims_file_layout.csv` (PSTH) and `channel_remove_layout.csv` (Remove channels) layout files; both are created on first launch.
 
 The Preferences window also exposes background prefetch tuning:
 

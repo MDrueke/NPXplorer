@@ -1,10 +1,10 @@
 [package]
-name = "npxplorer"
-version = "0.1.0"
+name = "NPXplorer"
+version = "0.5.1"
 edition = "2021"
 
 [[bin]]
-name = "npxplorer"
+name = "NPXplorer"
 path = "src/main.rs"
 
 [dependencies]

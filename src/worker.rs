@@ -215,7 +215,7 @@ fn run_full(
     cancel: &AtomicBool,
     ctx: &egui::Context,
 ) {
-    let display_rows = Arc::new(meta.build_display_rows(cfg.avg_depths, &cfg.removed_channels));
+    let display_rows = Arc::new(meta.build_display_rows(cfg.avg_depths, &cfg.removed_channels, cfg.channel_order, cfg.shank_order));
 
     let first = center_sample.saturating_sub(half_window);
     let n_samp = (half_window * 2).min(meta.n_samples.saturating_sub(first));

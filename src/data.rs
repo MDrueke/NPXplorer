@@ -18,6 +18,37 @@ pub enum DisplayRow {
     ShankBoundary,
 }
 
+/// How channels are ordered top-to-bottom within a shank in the display.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ChannelOrder {
+    /// Raw hardware channel number, ascending from bottom to top.
+    Id,
+    /// Physical depth (y_um), ascending from bottom to top — the deepest channel
+    /// on each shank is at the bottom.
+    Depth,
+}
+
+impl Default for ChannelOrder {
+    fn default() -> Self {
+        ChannelOrder::Depth
+    }
+}
+
+/// How shanks are ordered left-to-right in the display.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ShankOrder {
+    /// Raw shank index from the meta file, ascending.
+    Id,
+    /// Physical x position (mean over the shank's electrodes), ascending — left to right.
+    XCoord,
+}
+
+impl Default for ShankOrder {
+    fn default() -> Self {
+        ShankOrder::Id
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Meta {
     pub n_saved_chans: usize,
@@ -237,14 +268,47 @@ impl Meta {
         result
     }
 
+    /// Rank shanks for left-to-right display order. `ShankOrder::Id` ranks by the raw
+    /// shank index; `ShankOrder::XCoord` ranks by each shank's mean x_um, ascending.
+    fn shank_rank_map(&self, order: ShankOrder) -> HashMap<u32, u32> {
+        let mut shanks: Vec<u32> = self.channel_geom.iter().map(|g| g.shank).collect();
+        shanks.sort_unstable();
+        shanks.dedup();
+
+        match order {
+            ShankOrder::Id => shanks.iter().map(|&s| (s, s)).collect(),
+            ShankOrder::XCoord => {
+                let mut mean_x: Vec<(u32, f32)> = shanks.iter().map(|&s| {
+                    let xs: Vec<f32> = self.channel_geom.iter()
+                        .filter(|g| g.shank == s)
+                        .map(|g| g.x_um)
+                        .collect();
+                    (s, xs.iter().sum::<f32>() / xs.len() as f32)
+                }).collect();
+                mean_x.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                mean_x.into_iter().enumerate().map(|(rank, (s, _))| (s, rank as u32)).collect()
+            }
+        }
+    }
+
     /// Build the ordered list of display rows for rendering.
     ///
     /// If `avg_depths` is true, channels at the same (shank, y_um) are averaged into one row.
-    /// Gap rows are inserted wherever the vertical distance between consecutive rows
-    /// exceeds 1.5× the typical pitch for that shank.
     /// `removed` holds 0-based channel indices to exclude entirely, as if they were
     /// never on the probe (they take no part in depth averaging or any spatial filter).
-    pub fn build_display_rows(&self, avg_depths: bool, removed: &BTreeSet<usize>) -> Vec<DisplayRow> {
+    /// `channel_order`/`shank_order` control the display order (see their docs); depth
+    /// grouping for `avg_depths` always uses true physical proximity regardless of the
+    /// chosen display order, so averaging stays correct even when ordering by ID.
+    /// Gap rows are inserted wherever the vertical distance between consecutive rows
+    /// exceeds 1.5× the typical pitch for that shank — only meaningful (and only done)
+    /// when `channel_order` is `Depth`, since row adjacency isn't spatial otherwise.
+    pub fn build_display_rows(
+        &self,
+        avg_depths: bool,
+        removed: &BTreeSet<usize>,
+        channel_order: ChannelOrder,
+        shank_order: ShankOrder,
+    ) -> Vec<DisplayRow> {
         let pitch_map = self.typical_pitch_per_shank();
 
         // collect (shank, y_um, channel_idx) tuples
@@ -253,7 +317,9 @@ impl Meta {
             .filter(|(i, _)| !removed.contains(i))
             .map(|(i, g)| (g.shank, g.y_um, i))
             .collect();
-        // sort by shank, then y ascending
+        // sort by shank, then y ascending — always by true depth here, so that
+        // same-depth channels end up adjacent and get merged correctly below,
+        // independent of the final display order chosen
         entries.sort_by(|a, b| {
             a.0.cmp(&b.0).then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         });
@@ -276,6 +342,16 @@ impl Meta {
             chs.sort_unstable();
         }
 
+        // reorder the (already correctly-grouped) rows for display
+        let shank_rank = self.shank_rank_map(shank_order);
+        groups.sort_by(|a, b| {
+            let rank_a = shank_rank.get(&a.0).copied().unwrap_or(a.0);
+            let rank_b = shank_rank.get(&b.0).copied().unwrap_or(b.0);
+            let key_a = match channel_order { ChannelOrder::Depth => a.1, ChannelOrder::Id => a.2[0] as f32 };
+            let key_b = match channel_order { ChannelOrder::Depth => b.1, ChannelOrder::Id => b.2[0] as f32 };
+            rank_a.cmp(&rank_b).then(key_a.partial_cmp(&key_b).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
         // build display rows with gap detection
         let mut rows: Vec<DisplayRow> = Vec::new();
         let mut data_idx = 0usize;
@@ -288,11 +364,10 @@ impl Meta {
                 if *shank != prev_shank {
                     // different shank: always insert a ShankBoundary
                     rows.push(DisplayRow::ShankBoundary);
-                } else {
-                    // same shank: gap if spacing > 1.5× pitch
-                    if (y - prev_y) > pitch * 1.5 {
-                        rows.push(DisplayRow::IntraShankGap);
-                    }
+                } else if channel_order == ChannelOrder::Depth && (y - prev_y) > pitch * 1.5 {
+                    // same shank: gap if spacing > 1.5× pitch (Depth order only — row
+                    // adjacency in ID order doesn't correspond to physical spacing)
+                    rows.push(DisplayRow::IntraShankGap);
                 }
             }
 

@@ -1,3 +1,7 @@
+/// Single source of truth for the displayed app version — bump `version` in
+/// Cargo.toml to change it everywhere (window title, title bar, taskbar).
+const APP_TITLE: &str = concat!("NPXplorer v", env!("CARGO_PKG_VERSION"));
+
 pub static DEBUG_LOGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Logging macro that only writes when --debug is active.
@@ -159,7 +163,7 @@ impl MainApp {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add_space(8.0);
                         ui.label(
-                            egui::RichText::new("NPXplorer v0.5")
+                            egui::RichText::new(APP_TITLE)
                                 .color(egui::Color32::WHITE)
                                 .size(14.0),
                         );
@@ -305,7 +309,7 @@ fn main() -> anyhow::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("NPXplorer v0.2")
+            .with_title(APP_TITLE)
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([800.0, 500.0])
             .with_decorations(false),
@@ -318,7 +322,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     eframe::run_native(
-        "NPXplorer v0.2",
+        APP_TITLE,
         options,
         Box::new(move |cc| Ok(Box::new(MainApp::new(&cc.egui_ctx, args.file)))),
     )

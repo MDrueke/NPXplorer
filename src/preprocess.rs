@@ -101,6 +101,10 @@ pub struct PreprocConfig {
     /// never persisted to the saved preferences.
     #[serde(default, skip_serializing)]
     pub removed_channels: std::collections::BTreeSet<usize>,
+    #[serde(default)]
+    pub channel_order: crate::data::ChannelOrder,
+    #[serde(default)]
+    pub shank_order: crate::data::ShankOrder,
 }
 
 #[derive(Clone)]
