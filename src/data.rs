@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Clone, Debug)]
 pub struct ChannelGeom {
@@ -242,12 +242,15 @@ impl Meta {
     /// If `avg_depths` is true, channels at the same (shank, y_um) are averaged into one row.
     /// Gap rows are inserted wherever the vertical distance between consecutive rows
     /// exceeds 1.5× the typical pitch for that shank.
-    pub fn build_display_rows(&self, avg_depths: bool) -> Vec<DisplayRow> {
+    /// `removed` holds 0-based channel indices to exclude entirely, as if they were
+    /// never on the probe (they take no part in depth averaging or any spatial filter).
+    pub fn build_display_rows(&self, avg_depths: bool, removed: &BTreeSet<usize>) -> Vec<DisplayRow> {
         let pitch_map = self.typical_pitch_per_shank();
 
         // collect (shank, y_um, channel_idx) tuples
         let mut entries: Vec<(u32, f32, usize)> = self.channel_geom.iter()
             .enumerate()
+            .filter(|(i, _)| !removed.contains(i))
             .map(|(i, g)| (g.shank, g.y_um, i))
             .collect();
         // sort by shank, then y ascending

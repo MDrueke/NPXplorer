@@ -24,6 +24,7 @@ macro_rules! file_log {
 }
 
 mod app;
+mod channel_remove;
 mod data;
 mod geometry;
 mod mtscomp;
@@ -295,6 +296,7 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     psth::ensure_default_layout();
+    channel_remove::ensure_default_layout();
 
     if args.debug {
         DEBUG_LOGGING.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -307,6 +309,11 @@ fn main() -> anyhow::Result<()> {
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([800.0, 500.0])
             .with_decorations(false),
+        // Wayland compositors (Hyprland included) stop sending frame callbacks to a
+        // window on a hidden workspace; a vsync-synced buffer swap then blocks until
+        // the workspace is visible again, which reads as "not responding". Disabling
+        // vsync avoids that wait.
+        vsync: false,
         ..Default::default()
     };
 

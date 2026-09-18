@@ -1,1 +1,9 @@
 1. A mechanism to open a window to view the single channel waveform
+2. Button that opens a dialog text field where channels to remove can be entered as a list. That dialog also should have a file picker button that reads the file which should have the channel numbers to remove. Format has to be specified in a format file channel_remove_layout.csv that is in the config folder alongside the stims_file_layout.csv
+3. Long - term: Option to read Allen Mouse Atlas, let the user enter lambda-bregma distance (scale the atlas to it), and the insertion coordinates, and then label areas according to the atlas as an overlay over the plotted ephys data.
+4. Make sure channels are ordered not by number, but by depth
+5. If multi-shank data is displayed, overlay the number of that shank on each shank section. Order shanks not by number, but left-to-right, according to the coordinates that that channel's electrodes have in the meta file.
+6. Currently, right and left click label channels. Change this to Alt+(Left/Right Click). Right clicking a channel opens a context menu for this channel. Unpopulated for now.
+7. SpikeGLX-like electrode selection interface that is a popup that shows the probe (one or multiple shanks) and lets the user left click on channels to include them, right click to exclude them. Can also hold left click and drag to draw a rectangle that selects multiple electrodes.
+8. Bad channel detection
+9. Surface detection

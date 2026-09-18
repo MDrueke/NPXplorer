@@ -96,6 +96,11 @@ pub struct PreprocConfig {
     pub avg_depths: bool,
     pub sample_rate: f64,
     pub im_dat_prb_type: u32,
+    /// 0-based channel indices excluded from display and from every computation
+    /// (CMR/destripe reference, depth averaging). Recording-specific, so it is
+    /// never persisted to the saved preferences.
+    #[serde(default, skip_serializing)]
+    pub removed_channels: std::collections::BTreeSet<usize>,
 }
 
 #[derive(Clone)]

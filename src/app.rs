@@ -1,4 +1,5 @@
 use egui::{CentralPanel, TextureHandle, TextureOptions, TopBottomPanel, Ui, Vec2};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -236,6 +237,21 @@ fn spawn_stim_picker(dir: Option<PathBuf>) -> mpsc::Receiver<Option<PathBuf>> {
     rx
 }
 
+/// Spawn the native picker for a channel-numbers-to-remove file on a background thread.
+fn spawn_channel_list_picker(dir: Option<PathBuf>) -> mpsc::Receiver<Option<PathBuf>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut dlg = rfd::FileDialog::new()
+            .add_filter("Channel list", &["csv", "txt", "tsv", "dat"])
+            .add_filter("All files", &["*"]);
+        if let Some(d) = dir {
+            dlg = dlg.set_directory(d);
+        }
+        let _ = tx.send(dlg.pick_file());
+    });
+    rx
+}
+
 /// Spawn the native save dialog for the PSTH PNG on a background thread.
 fn spawn_png_saver(dir: Option<PathBuf>, default_name: String) -> mpsc::Receiver<Option<PathBuf>> {
     let (tx, rx) = mpsc::channel();
@@ -312,6 +328,12 @@ pub struct NPXplorerApp {
     selected_channel_1: Option<usize>,
     selected_channel_2: Option<usize>,
 
+    // channel removal
+    show_remove_channels: bool,
+    remove_channels_text: String,
+    remove_channels_error: Option<String>,
+    remove_channels_pick_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
+
     // async worker
     worker_state: SharedWorkerState,
     worker_cancel: SharedCancel,
@@ -366,6 +388,7 @@ impl NPXplorerApp {
             avg_depths: true,
             sample_rate: fs,
             im_dat_prb_type: meta.im_dat_prb_type,
+            removed_channels: Default::default(),
         };
 
         let mut view_dur_s = 0.5;
@@ -402,7 +425,7 @@ impl NPXplorerApp {
         // defensively re-clamp in case prefs were saved on a machine with more RAM,
         // or with an initial_buffer_s/view_dur_s combination that no longer satisfies
         // the no-oscillation bound
-        let n_data_rows = meta.build_display_rows(preproc_cfg.avg_depths)
+        let n_data_rows = meta.build_display_rows(preproc_cfg.avg_depths, &preproc_cfg.removed_channels)
             .iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
         initial_buffer_s = initial_buffer_s.min(max_feasible_buffer_s(n_data_rows, fs, mem_reserve_mb));
         extension_margin_s = extension_margin_s.min(max_extension_margin_s(initial_buffer_s, view_dur_s));
@@ -465,6 +488,10 @@ impl NPXplorerApp {
             spike_smoothing_sigma,
             selected_channel_1: None,
             selected_channel_2: None,
+            show_remove_channels: false,
+            remove_channels_text: String::new(),
+            remove_channels_error: None,
+            remove_channels_pick_rx: None,
             worker_state: shared,
             worker_cancel: cancel,
             worker_half_window: half_window,
@@ -534,6 +561,101 @@ impl NPXplorerApp {
         let (lock, cvar) = &*self.worker_state;
         lock.lock().unwrap().request = Some(req);
         cvar.notify_one();
+    }
+
+    // -----------------------------------------------------------------------
+    // Channel removal
+    // -----------------------------------------------------------------------
+
+    fn apply_removed_channels(&mut self, set: BTreeSet<usize>) {
+        self.preproc_cfg.removed_channels = set;
+        self.heatmap_texture = None;
+        self.pending_cfg_recompute = true;
+    }
+
+    /// Parse `remove_channels_text` and apply it, or set an error message on failure.
+    fn apply_remove_channels_text(&mut self) {
+        match crate::channel_remove::parse_channel_list(&self.remove_channels_text) {
+            Ok(set) => {
+                self.remove_channels_error = None;
+                self.apply_removed_channels(set);
+            }
+            Err(e) => self.remove_channels_error = Some(e.to_string()),
+        }
+    }
+
+    fn poll_remove_channels_picker(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.remove_channels_pick_rx {
+            match rx.try_recv() {
+                Ok(picked) => {
+                    self.remove_channels_pick_rx = None;
+                    if let Some(path) = picked {
+                        let default_layout = crate::channel_remove::default_layout_path();
+                        let result = crate::channel_remove::resolve_layout(&path, &default_layout)
+                            .and_then(|layout| crate::channel_remove::load_removed_channels(&path, &layout));
+                        match result {
+                            Ok(set) => {
+                                self.remove_channels_text = crate::channel_remove::format_channel_list(&set);
+                                self.remove_channels_error = None;
+                                self.apply_removed_channels(set);
+                            }
+                            Err(e) => self.remove_channels_error = Some(e.to_string()),
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.remove_channels_pick_rx = None,
+            }
+        }
+    }
+
+    fn draw_remove_channels_window(&mut self, ctx: &egui::Context) {
+        if !self.show_remove_channels {
+            return;
+        }
+        let mut open = self.show_remove_channels;
+        egui::Window::new("Remove channels")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Channels to exclude from display and computation (1-based, e.g. \"3,17,40-50\"):");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.remove_channels_text)
+                        .desired_width(250.0)
+                        .hint_text("e.g. 3,17,40-50"),
+                );
+                if resp.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    self.apply_remove_channels_text();
+                }
+
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        self.apply_remove_channels_text();
+                    }
+                    if ui.button("Load from file…").clicked() && self.remove_channels_pick_rx.is_none() {
+                        self.remove_channels_pick_rx = Some(spawn_channel_list_picker(
+                            self.bin_path.parent().map(|p| p.to_path_buf()),
+                        ));
+                    }
+                    if ui.button("Reset").clicked() {
+                        self.remove_channels_text.clear();
+                        self.remove_channels_error = None;
+                        self.apply_removed_channels(BTreeSet::new());
+                    }
+                });
+
+                let n_removed = self.preproc_cfg.removed_channels.len();
+                if n_removed > 0 {
+                    ui.label(format!("{n_removed} channel(s) currently removed."));
+                }
+                if let Some(err) = &self.remove_channels_error {
+                    ui.colored_label(egui::Color32::from_rgb(0xff, 0x66, 0x66), err);
+                }
+            });
+        self.show_remove_channels = open;
     }
 
     // -----------------------------------------------------------------------
@@ -795,6 +917,9 @@ impl NPXplorerApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Preferences").clicked() {
                     self.show_preferences = !self.show_preferences;
+                }
+                if ui.button("Remove channels…").clicked() {
+                    self.show_remove_channels = !self.show_remove_channels;
                 }
                 if ui.button("PSTH").clicked() {
                     self.psth.open = true;
@@ -1443,6 +1568,8 @@ impl NPXplorerApp {
     pub fn update(&mut self, ctx: &egui::Context) {
         self.poll_and_maybe_dispatch_psth(ctx);
         self.draw_psth_window(ctx);
+        self.poll_remove_channels_picker(ctx);
+        self.draw_remove_channels_window(ctx);
 
         let mut show_prefs = self.show_preferences;
         if show_prefs {
@@ -1516,7 +1643,7 @@ impl NPXplorerApp {
                     ui.separator();
                     ui.label(egui::RichText::new("Buffer").strong());
 
-                    let n_data_rows = self.meta.build_display_rows(self.preproc_cfg.avg_depths)
+                    let n_data_rows = self.meta.build_display_rows(self.preproc_cfg.avg_depths, &self.preproc_cfg.removed_channels)
                         .iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
                     let max_feasible = max_feasible_buffer_s(n_data_rows, self.meta.sample_rate, self.mem_reserve_mb);
 
@@ -2108,5 +2235,11 @@ impl NPXplorerApp {
                     );
                 }
             });
+
+        // Idle heartbeat: some Wayland compositors flag a window that stops submitting
+        // frames entirely (fully event-driven idle, no pending repaint requests) as
+        // "not responding", even though the event loop is fine. Keep a low-frequency
+        // repaint going at all times so a frame always lands within ~1s.
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
     }
 }

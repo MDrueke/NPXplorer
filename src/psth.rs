@@ -239,7 +239,7 @@ pub fn compute_psth(
     // sides; 0.15 s is comfortably longer than either transient
     let pad = (0.15 * fs).round() as i64;
 
-    let display_rows_full = Arc::new(meta.build_display_rows(cfg.avg_depths));
+    let display_rows_full = Arc::new(meta.build_display_rows(cfg.avg_depths, &cfg.removed_channels));
     let data_rows: Vec<usize> = display_rows_full
         .iter()
         .enumerate()
