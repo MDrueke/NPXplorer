@@ -71,7 +71,10 @@ fn draw_recent_files_menu(ui: &mut egui::Ui, recent: &[PathBuf]) -> Option<PathB
     }
     let mut clicked = None;
     for path in recent {
-        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let resp = ui.button(name).on_hover_text(path.to_string_lossy());
         if resp.clicked() {
             clicked = Some(path.clone());
