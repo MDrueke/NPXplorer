@@ -40,6 +40,16 @@ Click **Remove channels…** in the top bar to exclude channels entirely — fro
 
 Enter a comma-separated list of 1-based channel numbers and/or ranges (e.g. `3,17,40-50`) and press **Apply** or Enter. **Load from file…** reads the list from a file instead (`.csv`, `.txt`, `.tsv`, `.dat`), using the same kind of layout file as the PSTH stimulus file (see below) — a `channel_remove_layout.csv` placed next to the channel-list file, or the default at `config/channel_remove_layout.csv`. **Reset** clears the removed-channel list.
 
+### Channel classification
+
+An IBL-style automated QC pass that classifies each channel as dead, noisy, out-of-brain, or good.
+
+Click **Channel Classification** in the top bar to run it — it doesn't run automatically, since scanning the recording takes a moment. A progress popup (with an **Abort** button) shows while it runs. Once done, every non-good channel gets a semi-transparent colored stripe over its row on the heatmap: dead — magenta, noisy — red, out-of-brain — green.
+
+A small box in the heatmap's top-right corner shows the legend and an **Enable/Disable Overlay** toggle. Disabling it hides the stripes and collapses the box down to just the button, without discarding the result — only pressing **Channel Classification** again re-runs the scan.
+
+**Chunks to sample** (default 100), under "Channel Classification" in Preferences, sets how many short snippets spread across the recording go into the classification's majority vote — more chunks are more robust but slower.
+
 ### Preprocessing options
 
 All filters run in real time on the displayed chunk. The pipeline order is fixed:

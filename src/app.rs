@@ -1,7 +1,7 @@
 use egui::{CentralPanel, TextureHandle, TextureOptions, TopBottomPanel, Ui, Vec2};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
@@ -51,6 +51,9 @@ fn default_spike_overlay_scale() -> f32 {
 fn default_spike_smoothing_sigma() -> f32 {
     1.5
 }
+fn default_n_classify_chunks() -> usize {
+    crate::channel_classify::DEFAULT_N_CLASSIFY_CHUNKS
+}
 
 /// Largest buffer duration (s) that fits in currently-available system memory, minus
 /// `mem_reserve_mb`. Used both to clamp saved preferences at load time and to bound
@@ -95,6 +98,10 @@ pub struct Preferences {
     /// firing-rate overlay across depth
     #[serde(default = "default_spike_smoothing_sigma")]
     pub spike_smoothing_sigma: f32,
+    /// number of evenly-spaced chunks sampled across the recording for the
+    /// channel-classification majority vote
+    #[serde(default = "default_n_classify_chunks")]
+    pub n_classify_chunks: usize,
     /// total size (s) of the buffer loaded on initial load / full recompute; also the
     /// steady-state cap that incremental extension growth settles back to
     #[serde(default = "default_initial_buffer_s")]
@@ -302,6 +309,22 @@ fn zero_item_gap(ui: &mut Ui) {
     ui.spacing_mut().item_spacing.x = 0.0;
 }
 
+/// Opacity (0-255) of the per-row classification overlay stripes on the heatmap.
+/// 26 ≈ 0.1. Legend swatches in the toggle box are always drawn fully opaque,
+/// independent of this.
+const CLASSIFICATION_OVERLAY_ALPHA: u8 = 5;
+
+/// Color for a channel-classification label (1 dead, 2 noisy, 3 outside of the
+/// brain), at the given alpha. Label 0 (good) has no overlay color.
+fn classification_color(label: u8, alpha: u8) -> egui::Color32 {
+    match label {
+        1 => egui::Color32::from_rgba_unmultiplied(255, 0, 255, alpha), // dead: magenta
+        2 => egui::Color32::from_rgba_unmultiplied(230, 40, 40, alpha), // noisy: red
+        3 => egui::Color32::from_rgba_unmultiplied(40, 200, 80, alpha), // outside of brain: green
+        _ => egui::Color32::TRANSPARENT,
+    }
+}
+
 /// data-row index (into `result.data`) for a 1-based channel number, or None if the
 /// channel is not among the computed display rows.
 fn channel_row(result: &PsthResult, ch: usize) -> Option<usize> {
@@ -380,6 +403,20 @@ pub struct NPXplorerApp {
     remove_channels_error: Option<String>,
     remove_channels_pick_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
 
+    // IBL-style channel classification (dead/noisy/outside-of-brain/good)
+    channel_labels: Option<Arc<Vec<u8>>>,
+    show_classification_overlay: bool,
+    classifying: bool,
+    classify_error: Option<String>,
+    classify_rx: Option<mpsc::Receiver<Result<Vec<u8>, String>>>,
+    classify_cancel: Arc<AtomicBool>,
+    classify_progress: Arc<AtomicUsize>,
+    /// user-configurable number of chunks for the majority vote (Preferences)
+    classify_n_chunks: usize,
+    /// snapshot of `classify_n_chunks` taken when the in-flight run was dispatched,
+    /// so the progress bar stays correct even if the preference changes mid-run
+    classify_run_total: usize,
+
     // async worker
     worker_state: SharedWorkerState,
     worker_cancel: SharedCancel,
@@ -455,6 +492,7 @@ impl NPXplorerApp {
         let mut mem_pressure_pct = default_mem_pressure_pct();
         let mut mem_reserve_mb = default_mem_reserve_mb();
         let mut recent_files: Vec<PathBuf> = Vec::new();
+        let mut n_classify_chunks = default_n_classify_chunks();
 
         if let Some(p) = prefs {
             preproc_cfg = p.preproc_cfg;
@@ -473,6 +511,7 @@ impl NPXplorerApp {
             mem_pressure_pct = p.mem_pressure_pct;
             mem_reserve_mb = p.mem_reserve_mb;
             recent_files = p.recent_files.iter().map(PathBuf::from).collect();
+            n_classify_chunks = p.n_classify_chunks;
         }
 
         // move this recording to the front of the recent-files list (max 5)
@@ -564,6 +603,15 @@ impl NPXplorerApp {
             remove_channels_text: String::new(),
             remove_channels_error: None,
             remove_channels_pick_rx: None,
+            channel_labels: None,
+            show_classification_overlay: false,
+            classifying: false,
+            classify_error: None,
+            classify_rx: None,
+            classify_cancel: Arc::new(AtomicBool::new(false)),
+            classify_progress: Arc::new(AtomicUsize::new(0)),
+            classify_n_chunks: n_classify_chunks,
+            classify_run_total: 0,
             worker_state: shared,
             worker_cancel: cancel,
             worker_half_window: half_window,
@@ -612,6 +660,7 @@ impl NPXplorerApp {
             spike_threshold: self.spike_threshold,
             spike_overlay_scale: self.spike_overlay_scale,
             spike_smoothing_sigma: self.spike_smoothing_sigma,
+            n_classify_chunks: self.classify_n_chunks,
             initial_buffer_s: self.initial_buffer_s,
             extension_margin_s: self.extension_margin_s,
             mem_pressure_pct: self.mem_pressure_pct,
@@ -760,6 +809,105 @@ impl NPXplorerApp {
                 }
             });
         self.show_remove_channels = open;
+    }
+
+    // -----------------------------------------------------------------------
+    // IBL-style channel classification (dead/noisy/outside-of-brain/good)
+    // -----------------------------------------------------------------------
+
+    fn dispatch_classify(&mut self, ctx: &egui::Context) {
+        self.classify_cancel.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.classify_cancel = Arc::clone(&cancel);
+        let progress = Arc::new(AtomicUsize::new(0));
+        self.classify_progress = Arc::clone(&progress);
+
+        let (tx, rx) = mpsc::channel();
+        self.classify_rx = Some(rx);
+        self.classifying = true;
+        self.classify_error = None;
+
+        let raw = Arc::clone(&self.raw);
+        let meta = Arc::clone(&self.meta);
+        let n_chunks = self.classify_n_chunks.max(1);
+        self.classify_run_total = n_chunks;
+        let ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            let res = crate::channel_classify::classify_recording(
+                &raw, &meta, n_chunks, &cancel, &progress,
+            )
+            .ok_or_else(|| "cancelled".to_string());
+            let _ = tx.send(res);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_classify(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.classify_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.classify_rx = None;
+                    self.classifying = false;
+                    match res {
+                        Ok(labels) => {
+                            self.channel_labels = Some(Arc::new(labels));
+                            self.show_classification_overlay = true;
+                            self.classify_error = None;
+                        }
+                        Err(e) if e == "cancelled" => {}
+                        Err(e) => self.classify_error = Some(e),
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.classify_rx = None;
+                    self.classifying = false;
+                }
+            }
+        }
+    }
+
+    fn draw_classify_progress_window(&mut self, ctx: &egui::Context) {
+        if self.classifying {
+            let done = self.classify_progress.load(Ordering::Relaxed);
+            let total = self.classify_run_total;
+            egui::Window::new("Channel Classification")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(220.0);
+                    ui.label("Scanning recording for dead / noisy / out-of-brain channels…");
+                    ui.add(
+                        egui::ProgressBar::new(done as f32 / total.max(1) as f32).show_percentage(),
+                    );
+                    ui.label(format!("{done} / {total} chunks"));
+                    if ui.button("Abort").clicked() {
+                        self.classify_cancel.store(true, Ordering::Relaxed);
+                    }
+                });
+            return;
+        }
+
+        if let Some(err) = self.classify_error.clone() {
+            let mut dismiss = false;
+            egui::Window::new("Channel Classification failed")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.colored_label(egui::Color32::from_rgb(0xff, 0x66, 0x66), &err);
+                    if ui.button("OK").clicked() {
+                        dismiss = true;
+                    }
+                });
+            if dismiss {
+                self.classify_error = None;
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1241,6 +1389,16 @@ impl NPXplorerApp {
                     ui.add(egui::Separator::default().vertical().spacing(1.0));
                     if ui.button("Remove channels…").clicked() {
                         self.show_remove_channels = !self.show_remove_channels;
+                    }
+                    ui.add(egui::Separator::default().vertical().spacing(1.0));
+                    if ui
+                        .add_enabled(
+                            !self.classifying,
+                            egui::Button::new("Channel Classification"),
+                        )
+                        .clicked()
+                    {
+                        self.dispatch_classify(ui.ctx());
                     }
                     ui.add(egui::Separator::default().vertical().spacing(1.0));
                     if ui.button("PSTH").clicked() {
@@ -2082,6 +2240,8 @@ impl NPXplorerApp {
         self.draw_psth_window(ctx);
         self.poll_remove_channels_picker(ctx);
         self.draw_remove_channels_window(ctx);
+        self.poll_classify(ctx);
+        self.draw_classify_progress_window(ctx);
         self.draw_channel_context_menu(ctx);
 
         let mut show_prefs = self.show_preferences;
@@ -2200,6 +2360,26 @@ impl NPXplorerApp {
                             self.save_prefs();
                         }
                     });
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("Channel Classification").strong());
+
+                    ui.horizontal(|ui| {
+                        ui.label("Chunks to sample:");
+                        if ui.add(
+                            egui::DragValue::new(&mut self.classify_n_chunks)
+                                .speed(1.0).range(1..=500)
+                        ).changed() {
+                            self.save_prefs();
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "number of 300 ms snippets, evenly spaced across the recording, that \
+                             the majority vote is taken over on the next run — more chunks are \
+                             more robust but slower"
+                        ).small().color(egui::Color32::GRAY)
+                    );
 
                     ui.separator();
                     ui.label(egui::RichText::new("Buffer").strong());
@@ -2797,6 +2977,88 @@ impl NPXplorerApp {
                             if !mesh.is_empty() {
                                 ui.painter().add(egui::Shape::mesh(mesh));
                             }
+                        }
+
+                        // channel classification overlay: horizontal stripe per
+                        // non-good row (worst label wins when avg_depths merges
+                        // several raw channels into one row: dead > noisy > outside)
+                        if self.show_classification_overlay {
+                            if let Some(labels) = &self.channel_labels {
+                                let top_y = resp.rect.top();
+                                let h = resp.rect.height();
+                                let row_h = h / n_rows as f32;
+                                let min_x = resp.rect.left();
+                                let max_x = resp.rect.right();
+
+                                for r in first_row..=last_row {
+                                    if let DisplayRow::Data { channels, .. } = &display_rows[r] {
+                                        let worst = channels
+                                            .iter()
+                                            .filter_map(|&ch| labels.get(ch).copied())
+                                            .max_by_key(|&l| match l { 1 => 3, 2 => 2, 3 => 1, _ => 0 });
+                                        if let Some(l) = worst {
+                                            if l != 0 {
+                                                let frac_top = (last_row - r) as f32 / n_rows as f32;
+                                                let y0 = top_y + frac_top * h;
+                                                let rect = egui::Rect::from_min_size(
+                                                    egui::pos2(min_x, y0),
+                                                    egui::vec2(max_x - min_x, row_h),
+                                                );
+                                                ui.painter().rect_filled(rect, 0.0, classification_color(l, CLASSIFICATION_OVERLAY_ALPHA));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // classification legend / overlay-toggle box, pinned to the
+                        // heatmap's top-right corner — only shown once a classification
+                        // has actually been run this session
+                        if self.channel_labels.is_some() {
+                            let anchor = resp.rect.right_top() + egui::vec2(-8.0, 8.0);
+                            egui::Area::new(egui::Id::new("classification_legend"))
+                                .fixed_pos(anchor)
+                                .pivot(egui::Align2::RIGHT_TOP)
+                                .order(egui::Order::Foreground)
+                                .show(ctx, |ui| {
+                                    let bg = egui::Color32::from_rgba_unmultiplied(
+                                        crate::render::C_ZERO[0],
+                                        crate::render::C_ZERO[1],
+                                        crate::render::C_ZERO[2],
+                                        77,
+                                    );
+                                    egui::Frame::new()
+                                        .fill(bg)
+                                        .corner_radius(8.0)
+                                        .inner_margin(8.0)
+                                        .show(ui, |ui| {
+                                            if self.show_classification_overlay {
+                                                let legend_row = |ui: &mut Ui, label: u8, text: &str| {
+                                                    ui.horizontal(|ui| {
+                                                        let (rect, _) = ui.allocate_exact_size(
+                                                            egui::vec2(12.0, 12.0),
+                                                            egui::Sense::hover(),
+                                                        );
+                                                        ui.painter().rect_filled(rect, 2.0, classification_color(label, 255));
+                                                        ui.label(text);
+                                                    });
+                                                };
+                                                legend_row(ui, 1, "Dead");
+                                                legend_row(ui, 2, "Noisy");
+                                                legend_row(ui, 3, "Out of brain");
+                                                ui.add_space(4.0);
+                                            }
+                                            let btn_label = if self.show_classification_overlay {
+                                                "Disable Overlay"
+                                            } else {
+                                                "Enable Overlay"
+                                            };
+                                            if ui.button(btn_label).clicked() {
+                                                self.show_classification_overlay = !self.show_classification_overlay;
+                                            }
+                                        });
+                                });
                         }
                     }
 
