@@ -95,6 +95,9 @@ pub struct Preferences {
     pub mem_reserve_mb: f64,
     #[serde(default)]
     pub last_dir: Option<String>,
+    /// paths of the most recently opened recordings, most recent first (max 5)
+    #[serde(default)]
+    pub recent_files: Vec<String>,
 }
 
 impl Preferences {
@@ -360,6 +363,9 @@ pub struct NPXplorerApp {
     // UI state
     pending_cfg_recompute: bool,
     pub file_dialog_request: bool,
+    /// set by the toolbar's "Recent files" menu; polled by MainApp to switch recordings
+    pub open_recent_request: Option<PathBuf>,
+    recent_files: Vec<PathBuf>,
     projection_sums: Vec<f32>,
     // spike projection cache keys
     proj_view_first: usize,
@@ -405,6 +411,7 @@ impl NPXplorerApp {
         let mut extension_margin_s = default_extension_margin_s();
         let mut mem_pressure_pct = default_mem_pressure_pct();
         let mut mem_reserve_mb = default_mem_reserve_mb();
+        let mut recent_files: Vec<PathBuf> = Vec::new();
 
         if let Some(p) = prefs {
             preproc_cfg = p.preproc_cfg;
@@ -422,7 +429,13 @@ impl NPXplorerApp {
             extension_margin_s = p.extension_margin_s;
             mem_pressure_pct = p.mem_pressure_pct;
             mem_reserve_mb = p.mem_reserve_mb;
+            recent_files = p.recent_files.iter().map(PathBuf::from).collect();
         }
+
+        // move this recording to the front of the recent-files list (max 5)
+        recent_files.retain(|p| p != &bin_path);
+        recent_files.insert(0, bin_path.clone());
+        recent_files.truncate(5);
 
         // defensively re-clamp in case prefs were saved on a machine with more RAM,
         // or with an initial_buffer_s/view_dur_s combination that no longer satisfies
@@ -464,7 +477,7 @@ impl NPXplorerApp {
 
         let n_ap = meta.n_ap_chans;
         let psth_total_s = meta.n_samples as f64 / meta.sample_rate;
-        Ok(Self {
+        let app = Self {
             bin_path,
             meta,
             raw: Arc::clone(&raw),
@@ -513,6 +526,8 @@ impl NPXplorerApp {
             last_requested_center: 0,
             pending_cfg_recompute: false,
             file_dialog_request: false,
+            open_recent_request: None,
+            recent_files,
             projection_sums: Vec::new(),
             proj_view_first: usize::MAX,
             proj_view_n: 0,
@@ -520,7 +535,9 @@ impl NPXplorerApp {
             proj_sigma: 0.0,
             proj_cfg: None,
             psth: PsthState::new(0, n_ap.saturating_sub(1), psth_total_s),
-        })
+        };
+        app.save_prefs();
+        Ok(app)
     }
 
     pub fn save_prefs(&self) {
@@ -540,6 +557,7 @@ impl NPXplorerApp {
             mem_pressure_pct: self.mem_pressure_pct,
             mem_reserve_mb: self.mem_reserve_mb,
             last_dir,
+            recent_files: self.recent_files.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
         };
         prefs.save();
     }
@@ -855,6 +873,12 @@ impl NPXplorerApp {
                     self.file_dialog_request = true;
                     ui.close_menu();
                 }
+                ui.menu_button("Recent files", |ui| {
+                    if let Some(path) = crate::draw_recent_files_menu(ui, &self.recent_files) {
+                        self.open_recent_request = Some(path);
+                        ui.close_menu();
+                    }
+                });
             });
             ui.separator();
             ui.label(format!(

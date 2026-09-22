@@ -1,8 +1,6 @@
 1. A mechanism to open a window to view the single channel waveform
-2. If multi-shank data is displayed, overlay the number of that shank on each shank section.
-3. Long - term: Option to read Allen Mouse Atlas, let the user enter lambda-bregma distance (scale the atlas to it), and the insertion coordinates, and then label areas according to the atlas as an overlay over the plotted ephys data.
-4. Currently, right and left click label channels. Change this to Alt+(Left/Right Click). Right clicking a channel opens a context menu for this channel. Unpopulated for now.
-5. SpikeGLX-like electrode selection interface that is a popup that shows the probe (one or multiple shanks) and lets the user left click on channels to include them, right click to exclude them. Can also hold left click and drag to draw a rectangle that selects multiple electrodes.
-6. Bad channel detection
-7. Surface detection
-8. Add "Recent files" under the "File" button. When hovering this, a panel extends to the right with the 5 last openend files.
+2. Long - term: Option to read Allen Mouse Atlas, let the user enter lambda-bregma distance (scale the atlas to it), and the insertion coordinates, and then label areas according to the atlas as an overlay over the plotted ephys data.
+3. Currently, right and left click label channels. Change this to Alt+(Left/Right Click). Right clicking a channel opens a context menu for this channel. Unpopulated for now.
+4. SpikeGLX-like electrode selection interface that is a popup that shows the probe (one or multiple shanks) and lets the user left click on channels to include them, right click to exclude them. Can also hold left click and drag to draw a rectangle that selects multiple electrodes.
+5. Bad channel detection
+6. Surface detection

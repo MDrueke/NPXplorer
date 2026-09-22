@@ -16,7 +16,7 @@ A lightweight viewer for raw Neuropixels electrophysiology data. Renders voltage
 
 ## Usage
 
-Just launch, and pick a file from the file dialog. 
+Just launch, and pick a file from the file dialog. **File > Recent files** lists the last 5 recordings opened (hover to expand); this persists across restarts.
 
 ### Navigation
 
@@ -103,7 +103,7 @@ skips one header row and reads onsets from the first column. A `stims_file_layou
 
 ## Configuration
 
-Preferences are saved to `config/npxplorer_prefs.toml` in a `config/` folder next to the executable (a `npxplorer_prefs.toml` left next to the executable by an older version is still read if the new one is absent). This includes preprocessing settings, colormap, color scale mode, spike threshold, window duration, channel/shank ordering, and the last opened directory (the removed-channels list itself is not saved, since it's specific to a recording). The `config/` folder also holds the default `stims_file_layout.csv` (PSTH) and `channel_remove_layout.csv` (Remove channels) layout files; both are created on first launch.
+Preferences are saved to `config/npxplorer_prefs.toml` in a `config/` folder next to the executable (a `npxplorer_prefs.toml` left next to the executable by an older version is still read if the new one is absent). This includes preprocessing settings, colormap, color scale mode, spike threshold, window duration, channel/shank ordering, the last opened directory, and the recent-files list (the removed-channels list itself is not saved, since it's specific to a recording). The `config/` folder also holds the default `stims_file_layout.csv` (PSTH) and `channel_remove_layout.csv` (Remove channels) layout files; both are created on first launch.
 
 The Preferences window also exposes background prefetch tuning:
 

@@ -62,6 +62,24 @@ fn spawn_file_picker(last_dir: Option<PathBuf>) -> mpsc::Receiver<Option<PathBuf
     rx
 }
 
+/// Draw the contents of a "Recent files" submenu (most recent first) and return the
+/// clicked path, if any. Shared between the empty-state File menu and the toolbar's.
+fn draw_recent_files_menu(ui: &mut egui::Ui, recent: &[PathBuf]) -> Option<PathBuf> {
+    if recent.is_empty() {
+        ui.label("(none yet)");
+        return None;
+    }
+    let mut clicked = None;
+    for path in recent {
+        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let resp = ui.button(name).on_hover_text(path.to_string_lossy());
+        if resp.clicked() {
+            clicked = Some(path.clone());
+        }
+    }
+    clicked
+}
+
 #[derive(Parser)]
 #[command(name = "npxplorer", about = "Neuropixels raw data viewer")]
 struct Args {
@@ -84,6 +102,7 @@ struct MainApp {
     last_dir: Option<PathBuf>,
     error_msg: Option<String>,
     pending_pick: Option<mpsc::Receiver<Option<PathBuf>>>,
+    recent_files: Vec<PathBuf>,
 }
 
 impl MainApp {
@@ -123,11 +142,18 @@ impl MainApp {
         } else {
             AppState::Empty
         };
+
+        // re-read prefs in case NPXplorerApp::new() above just updated the recent-files list
+        let recent_files: Vec<PathBuf> = app::Preferences::load()
+            .map(|p| p.recent_files.iter().map(PathBuf::from).collect())
+            .unwrap_or_default();
+
         Self {
             state,
             last_dir,
             error_msg,
             pending_pick: None,
+            recent_files,
         }
     }
 
@@ -228,6 +254,12 @@ impl eframe::App for MainApp {
                                 }
                                 ui.close_menu();
                             }
+                            ui.menu_button("Recent files", |ui| {
+                                if let Some(path) = draw_recent_files_menu(ui, &self.recent_files) {
+                                    file_to_open = Some(path);
+                                    ui.close_menu();
+                                }
+                            });
                         });
                     });
                 });
@@ -271,6 +303,9 @@ impl eframe::App for MainApp {
                         self.pending_pick = Some(spawn_file_picker(self.last_dir.clone()));
                     }
                 }
+                if let Some(path) = app.open_recent_request.take() {
+                    file_to_open = Some(path);
+                }
             }
         }
 
@@ -278,6 +313,11 @@ impl eframe::App for MainApp {
             self.last_dir = path.parent().map(|p| p.to_path_buf());
             match app::NPXplorerApp::new(ctx, path) {
                 Ok(a) => {
+                    // NPXplorerApp::new() above already updated and saved the
+                    // recent-files list — re-read it to keep our copy in sync
+                    self.recent_files = app::Preferences::load()
+                        .map(|p| p.recent_files.iter().map(PathBuf::from).collect())
+                        .unwrap_or_default();
                     self.state = AppState::Loaded(a);
                     self.error_msg = None;
                 }
