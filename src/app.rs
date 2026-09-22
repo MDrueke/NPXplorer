@@ -284,6 +284,24 @@ fn spawn_png_saver(dir: Option<PathBuf>, default_name: String) -> mpsc::Receiver
     rx
 }
 
+/// Mirrors egui's internal (private) `menu::set_menu_style`, so a custom popup's
+/// buttons render flat — transparent until hovered, no per-item border — exactly
+/// like real menu items (e.g. the "File" dropdown's "Open"/"Recent files").
+fn apply_menu_item_style(style: &mut egui::Style) {
+    style.spacing.button_padding = egui::vec2(2.0, 0.0);
+    style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+    style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+}
+
+/// Zero horizontal gaps between widgets in this scope — the flat fill/corner/border
+/// styling itself is set app-wide in `MainApp::new` (main.rs), so this only needs to
+/// handle the toolbar-specific "buttons flush together, thin separators" layout.
+fn zero_item_gap(ui: &mut Ui) {
+    ui.spacing_mut().item_spacing.x = 0.0;
+}
+
 /// data-row index (into `result.data`) for a 1-based channel number, or None if the
 /// channel is not among the computed display rows.
 fn channel_row(result: &PsthResult, ch: usize) -> Option<usize> {
@@ -656,6 +674,17 @@ impl NPXplorerApp {
         }
     }
 
+    /// Add a single 1-based channel to the removed-channels list (e.g. from the
+    /// context menu), keeping the Remove-channels dialog's text field in sync, and
+    /// force an immediate recompute.
+    fn remove_channel(&mut self, ch: usize) {
+        let mut set = self.preproc_cfg.removed_channels.clone();
+        set.insert(ch - 1);
+        self.remove_channels_text = crate::channel_remove::format_channel_list(&set);
+        self.remove_channels_error = None;
+        self.apply_removed_channels(set);
+    }
+
     fn poll_remove_channels_picker(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.remove_channels_pick_rx {
             match rx.try_recv() {
@@ -748,12 +777,21 @@ impl NPXplorerApp {
             .fixed_pos(pos)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                apply_menu_item_style(ui.style_mut());
+                egui::Frame::menu(ui.style()).show(ui, |ui| {
                     ui.set_min_width(170.0);
-                    if ui.button(format!("View waveform (ch {ch})")).clicked() {
-                        self.waveform_channel = Some(ch);
-                        still_open = false;
-                    }
+                    // justified so each item's hover highlight spans the full row,
+                    // exactly like a real menu's entries (see menu_popup upstream)
+                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                        if ui.button(format!("View waveform (ch {ch})")).clicked() {
+                            self.waveform_channel = Some(ch);
+                            still_open = false;
+                        }
+                        if ui.button(format!("Remove channel {ch}")).clicked() {
+                            self.remove_channel(ch);
+                            still_open = false;
+                        }
+                    });
                 });
             });
 
@@ -1105,19 +1143,22 @@ impl NPXplorerApp {
 
     fn draw_toolbar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("Open").clicked() {
-                    self.file_dialog_request = true;
-                    ui.close_menu();
-                }
-                ui.menu_button("Recent files", |ui| {
-                    if let Some(path) = crate::draw_recent_files_menu(ui, &self.recent_files) {
-                        self.open_recent_request = Some(path);
+            ui.scope(|ui| {
+                zero_item_gap(ui);
+                ui.menu_button("File", |ui| {
+                    if ui.button("Open").clicked() {
+                        self.file_dialog_request = true;
                         ui.close_menu();
                     }
+                    ui.menu_button("Recent files", |ui| {
+                        if let Some(path) = crate::draw_recent_files_menu(ui, &self.recent_files) {
+                            self.open_recent_request = Some(path);
+                            ui.close_menu();
+                        }
+                    });
                 });
+                ui.add(egui::Separator::default().vertical().spacing(1.0));
             });
-            ui.separator();
             ui.label(format!(
                 "{}",
                 self.bin_path
@@ -1192,20 +1233,25 @@ impl NPXplorerApp {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Preferences").clicked() {
-                    self.show_preferences = !self.show_preferences;
-                }
-                if ui.button("Remove channels…").clicked() {
-                    self.show_remove_channels = !self.show_remove_channels;
-                }
-                if ui.button("PSTH").clicked() {
-                    self.psth.open = true;
-                    if self.psth.pick_rx.is_none() {
-                        self.psth.pick_rx = Some(spawn_stim_picker(
-                            self.bin_path.parent().map(|p| p.to_path_buf()),
-                        ));
+                ui.scope(|ui| {
+                    zero_item_gap(ui);
+                    if ui.button("Preferences").clicked() {
+                        self.show_preferences = !self.show_preferences;
                     }
-                }
+                    ui.add(egui::Separator::default().vertical().spacing(1.0));
+                    if ui.button("Remove channels…").clicked() {
+                        self.show_remove_channels = !self.show_remove_channels;
+                    }
+                    ui.add(egui::Separator::default().vertical().spacing(1.0));
+                    if ui.button("PSTH").clicked() {
+                        self.psth.open = true;
+                        if self.psth.pick_rx.is_none() {
+                            self.psth.pick_rx = Some(spawn_stim_picker(
+                                self.bin_path.parent().map(|p| p.to_path_buf()),
+                            ));
+                        }
+                    }
+                });
             });
         });
     }

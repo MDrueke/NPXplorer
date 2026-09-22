@@ -118,6 +118,35 @@ impl MainApp {
         visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x28, 0x28, 0x28);
         visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0x38, 0x38, 0x38);
         visuals.extreme_bg_color = visuals.widgets.inactive.bg_fill;
+
+        // flat, square-cornered, borderless widget style app-wide (buttons, sliders,
+        // checkboxes, etc.), fill color derived from the background — applies to every
+        // window (Preferences, PSTH, Remove channels, ...), not just the toolbar
+        let lighten = |amt: u8| {
+            egui::Color32::from_rgb(
+                crate::render::C_ZERO[0].saturating_add(amt),
+                crate::render::C_ZERO[1].saturating_add(amt),
+                crate::render::C_ZERO[2].saturating_add(amt),
+            )
+        };
+        for widgets in [
+            &mut visuals.widgets.inactive,
+            &mut visuals.widgets.hovered,
+            &mut visuals.widgets.active,
+            &mut visuals.widgets.open,
+        ] {
+            widgets.corner_radius = egui::CornerRadius::ZERO;
+            widgets.bg_stroke = egui::Stroke::NONE;
+        }
+        visuals.widgets.inactive.weak_bg_fill = lighten(14);
+        visuals.widgets.inactive.bg_fill = lighten(14);
+        visuals.widgets.hovered.weak_bg_fill = lighten(28);
+        visuals.widgets.hovered.bg_fill = lighten(28);
+        visuals.widgets.active.weak_bg_fill = lighten(40);
+        visuals.widgets.active.bg_fill = lighten(40);
+        visuals.widgets.open.weak_bg_fill = lighten(40);
+        visuals.widgets.open.bg_fill = lighten(40);
+
         ctx.set_visuals(visuals);
         ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::Dark);
 
