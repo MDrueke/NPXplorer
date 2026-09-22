@@ -1,6 +1,6 @@
 use crate::data::DisplayRow;
 
-pub const C_ZERO: [u8; 3] = [0x26, 0x29, 0x30]; // #262930 grey
+pub const C_ZERO: [u8; 3] = [0x17, 0x1b, 0x21]; // #171b21 (was #262930 grey)
 
 /// Single representative accent color per colormap. This is the one place to edit
 /// when tuning colors that need to track the active colormap outside the heatmap
