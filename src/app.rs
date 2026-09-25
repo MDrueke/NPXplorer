@@ -1479,7 +1479,7 @@ impl NPXplorerApp {
 
             // depth averaging checkbox
             let mut avg = self.preproc_cfg.avg_depths;
-            if ui.checkbox(&mut avg, "Avg depths").changed() {
+            if ui.checkbox(&mut avg, "Avg adjacent chans").changed() {
                 self.preproc_cfg.avg_depths = avg;
                 self.heatmap_texture = None;
                 self.pending_cfg_recompute = true;
