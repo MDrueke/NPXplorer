@@ -1,9 +1,20 @@
 
-1. Long - term: Option to read Allen Mouse Atlas, let the user enter lambda-bregma distance (scale the atlas to it), and the insertion coordinates, and then label areas according to the atlas as an overlay over the plotted ephys data.
+1. Fine-tune atlas overlay colors:
+    - Region color per colormap (border lines, heatmap labels, table names): `atlas_color()` in src/render.rs:24
+    - Box behind the region labels / table names, per colormap: `atlas_label_bg()` in src/render.rs:40; its opacity: `LABEL_BG_ALPHA` in src/atlas_ui.rs:102
+    - Border line opacity: `BORDER_ALPHA` in src/atlas_ui.rs:26 (0-255; the hovered/dragged line is always opaque)
+    - Line thickness: src/atlas_ui.rs:798
+    - Cool-Warm colormap: check its accent (`colormap_accent()`, src/render.rs:8) and the dark heatmap markers (`heatmap_fg()`, src/render.rs:50)
 
-2. SpikeGLX-like electrode selection interface that is a popup that shows the probe (one or multiple shanks) and lets the user left click on channels to include them, right click to exclude them. Can also hold left click and drag to draw a rectangle that selects multiple electrodes.
+2. Make sure multi-shank channels are correctly read and get the correct identifier assigned (also in the atlas registration output .csv). Channel IDs are now passed through from the meta file (SpikeGLX ~snsChanMap, Open Ephys channel_name) — check with a multi-shank recording what they look like.
 
-3. Implement better ephys markers:
+3. Atlas registration, once the atlas files are downloaded:
+    - check that annotation_volume_10um_by_index.npy loads (shape/order) and that regions look right
+    - compare with the Neuropixels Trajectory Explorer for one insertion (NTE: save probe positions -> probe_areas), especially rotation direction, ML sign, and multi-shank shank order
+
+4. SpikeGLX-like electrode selection interface that is a popup that shows the probe (one or multiple shanks) and lets the user left click on channels to include them, right click to exclude them. Can also hold left click and drag to draw a rectangle that selects multiple electrodes.
+
+5. Implement better ephys markers:
     a. Surface: Transition from low voltage fluctuations outside of the brain to high voltage amplitude fluctuations
     b. white matter, such as the corpus callosum (CC), which shows mainly small amplitude axonal spikes compared to the larger spikes in the neighboring gray matter
     c. ventricles, with no spikes and low amplitude voltage fluctuations

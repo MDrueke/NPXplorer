@@ -31,6 +31,7 @@ pub enum ColorMapChoice {
     IceFire,
     Vanimo,
     GreyScale,
+    CoolWarm,
 }
 
 fn default_initial_buffer_s() -> f64 {
@@ -45,6 +46,9 @@ fn default_mem_pressure_pct() -> f32 {
 fn default_mem_reserve_mb() -> f64 {
     1500.0
 }
+fn default_true() -> bool {
+    true
+}
 fn default_spike_overlay_scale() -> f32 {
     1.0
 }
@@ -53,6 +57,9 @@ fn default_spike_smoothing_sigma() -> f32 {
 }
 fn default_n_classify_chunks() -> usize {
     crate::channel_classify::DEFAULT_N_CLASSIFY_CHUNKS
+}
+fn default_bregma_lambda_mm() -> f64 {
+    crate::atlas::REFERENCE_BREGMA_LAMBDA_MM
 }
 
 /// Largest buffer duration (s) that fits in currently-available system memory, minus
@@ -91,6 +98,9 @@ pub struct Preferences {
     pub color_uv: f32,
     pub colormap_choice: ColorMapChoice,
     pub spike_threshold: f32,
+    /// whether the firing-rate overlay is shown (and computed) at all
+    #[serde(default = "default_true")]
+    pub show_firing_rate_overlay: bool,
     /// user-configurable multiplier on the firing-rate overlay's width scaling
     #[serde(default = "default_spike_overlay_scale")]
     pub spike_overlay_scale: f32,
@@ -119,6 +129,12 @@ pub struct Preferences {
     /// paths of the most recently opened recordings, most recent first (max 5)
     #[serde(default)]
     pub recent_files: Vec<String>,
+    /// folder holding the Allen CCF atlas files (Atlas Registration)
+    #[serde(default)]
+    pub atlas_dir: Option<String>,
+    /// last-used bregma-lambda distance; a recording's atlas sidecar overrides it
+    #[serde(default = "default_bregma_lambda_mm")]
+    pub bregma_lambda_mm: f64,
 }
 
 impl Preferences {
@@ -183,6 +199,9 @@ struct PsthState {
     pick_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
     compute_rx: Option<mpsc::Receiver<Result<PsthResult, String>>>,
     cancel: Arc<AtomicBool>,
+    /// stimuli processed / to process by the in-flight compute
+    progress: Arc<AtomicUsize>,
+    progress_total: Arc<AtomicUsize>,
     computing: bool,
     apply_requested: bool,
 
@@ -227,6 +246,8 @@ impl PsthState {
             pick_rx: None,
             compute_rx: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(AtomicUsize::new(0)),
+            progress_total: Arc::new(AtomicUsize::new(0)),
             computing: false,
             apply_requested: false,
             result: None,
@@ -289,6 +310,23 @@ fn spawn_png_saver(dir: Option<PathBuf>, default_name: String) -> mpsc::Receiver
         let _ = tx.send(dlg.save_file());
     });
     rx
+}
+
+/// Slider over 1-based channel positions that displays (and accepts typed) channel
+/// IDs from the meta file instead of positions.
+fn channel_slider<'a>(value: &'a mut usize, meta: &Arc<Meta>) -> egui::Slider<'a> {
+    let n = meta.n_ap_chans.max(1);
+    let (fmt_meta, parse_meta) = (Arc::clone(meta), Arc::clone(meta));
+    egui::Slider::new(value, 1..=n)
+        .custom_formatter(move |v, _| fmt_meta.channel_id((v as usize).saturating_sub(1)).to_string())
+        .custom_parser(move |s| {
+            let s = s.trim();
+            parse_meta
+                .channel_ids
+                .iter()
+                .position(|id| id.eq_ignore_ascii_case(s))
+                .map(|i| (i + 1) as f64)
+        })
 }
 
 /// Mirrors egui's internal (private) `menu::set_menu_style`, so a custom popup's
@@ -381,6 +419,7 @@ pub struct NPXplorerApp {
     // preferences
     show_preferences: bool,
     spike_threshold: f32,
+    show_firing_rate_overlay: bool,
     spike_overlay_scale: f32,
     spike_smoothing_sigma: f32,
 
@@ -455,6 +494,7 @@ pub struct NPXplorerApp {
     proj_cfg: Option<PreprocConfig>,
 
     psth: PsthState,
+    atlas: crate::atlas_ui::AtlasUi,
 }
 
 impl NPXplorerApp {
@@ -485,6 +525,7 @@ impl NPXplorerApp {
         let mut color_uv = 120.0;
         let mut colormap_choice = ColorMapChoice::IceFire;
         let mut spike_threshold = -40.0;
+        let mut show_firing_rate_overlay = true;
         let mut spike_overlay_scale = default_spike_overlay_scale();
         let mut spike_smoothing_sigma = default_spike_smoothing_sigma();
         let mut initial_buffer_s = default_initial_buffer_s();
@@ -493,6 +534,8 @@ impl NPXplorerApp {
         let mut mem_reserve_mb = default_mem_reserve_mb();
         let mut recent_files: Vec<PathBuf> = Vec::new();
         let mut n_classify_chunks = default_n_classify_chunks();
+        let mut atlas_dir = None;
+        let mut bregma_lambda_mm = default_bregma_lambda_mm();
 
         if let Some(p) = prefs {
             preproc_cfg = p.preproc_cfg;
@@ -504,6 +547,7 @@ impl NPXplorerApp {
             color_uv = p.color_uv;
             colormap_choice = p.colormap_choice;
             spike_threshold = p.spike_threshold;
+            show_firing_rate_overlay = p.show_firing_rate_overlay;
             spike_overlay_scale = p.spike_overlay_scale;
             spike_smoothing_sigma = p.spike_smoothing_sigma;
             initial_buffer_s = p.initial_buffer_s;
@@ -512,6 +556,8 @@ impl NPXplorerApp {
             mem_reserve_mb = p.mem_reserve_mb;
             recent_files = p.recent_files.iter().map(PathBuf::from).collect();
             n_classify_chunks = p.n_classify_chunks;
+            atlas_dir = p.atlas_dir;
+            bregma_lambda_mm = p.bregma_lambda_mm;
         }
 
         // move this recording to the front of the recent-files list (max 5)
@@ -568,6 +614,8 @@ impl NPXplorerApp {
         let is_compressed = bin_path.extension().and_then(|s| s.to_str()) == Some("cbin");
 
         let n_ap = meta.n_ap_chans;
+        let bin_path_for_atlas = bin_path.clone();
+        let meta_for_atlas = Arc::clone(&meta);
         let psth_total_s = meta.n_samples as f64 / meta.sample_rate;
         let app = Self {
             bin_path,
@@ -591,6 +639,7 @@ impl NPXplorerApp {
             colormap_choice,
             show_preferences: false,
             spike_threshold,
+            show_firing_rate_overlay,
             spike_overlay_scale,
             spike_smoothing_sigma,
             selected_channel_1: None,
@@ -640,6 +689,7 @@ impl NPXplorerApp {
             proj_sigma: 0.0,
             proj_cfg: None,
             psth: PsthState::new(0, n_ap.saturating_sub(1), psth_total_s),
+            atlas: crate::atlas_ui::AtlasUi::new(&bin_path_for_atlas, &meta_for_atlas, atlas_dir, bregma_lambda_mm),
         };
         app.save_prefs();
         Ok(app)
@@ -658,6 +708,7 @@ impl NPXplorerApp {
             color_uv: self.color_uv,
             colormap_choice: self.colormap_choice.clone(),
             spike_threshold: self.spike_threshold,
+            show_firing_rate_overlay: self.show_firing_rate_overlay,
             spike_overlay_scale: self.spike_overlay_scale,
             spike_smoothing_sigma: self.spike_smoothing_sigma,
             n_classify_chunks: self.classify_n_chunks,
@@ -671,6 +722,8 @@ impl NPXplorerApp {
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
+            atlas_dir: self.atlas.atlas_dir(),
+            bregma_lambda_mm: self.atlas.bregma_lambda_mm(),
         };
         prefs.save();
     }
@@ -714,7 +767,7 @@ impl NPXplorerApp {
 
     /// Parse `remove_channels_text` and apply it, or set an error message on failure.
     fn apply_remove_channels_text(&mut self) {
-        match crate::channel_remove::parse_channel_list(&self.remove_channels_text) {
+        match crate::channel_remove::parse_channel_list(&self.remove_channels_text, &self.meta.channel_ids) {
             Ok(set) => {
                 self.remove_channels_error = None;
                 self.apply_removed_channels(set);
@@ -729,7 +782,8 @@ impl NPXplorerApp {
     fn remove_channel(&mut self, ch: usize) {
         let mut set = self.preproc_cfg.removed_channels.clone();
         set.insert(ch - 1);
-        self.remove_channels_text = crate::channel_remove::format_channel_list(&set);
+        self.remove_channels_text =
+            crate::channel_remove::format_channel_list(&set, &self.meta.channel_ids);
         self.remove_channels_error = None;
         self.apply_removed_channels(set);
     }
@@ -740,15 +794,16 @@ impl NPXplorerApp {
                 Ok(picked) => {
                     self.remove_channels_pick_rx = None;
                     if let Some(path) = picked {
+                        let ids = &self.meta.channel_ids;
                         let default_layout = crate::channel_remove::default_layout_path();
                         let result = crate::channel_remove::resolve_layout(&path, &default_layout)
                             .and_then(|layout| {
-                                crate::channel_remove::load_removed_channels(&path, &layout)
+                                crate::channel_remove::load_removed_channels(&path, &layout, ids)
                             });
                         match result {
                             Ok(set) => {
                                 self.remove_channels_text =
-                                    crate::channel_remove::format_channel_list(&set);
+                                    crate::channel_remove::format_channel_list(&set, &self.meta.channel_ids);
                                 self.remove_channels_error = None;
                                 self.apply_removed_channels(set);
                             }
@@ -774,11 +829,15 @@ impl NPXplorerApp {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label("Channels to exclude from display and computation (1-based, e.g. \"3,17,40-50\"):");
+                let example = crate::channel_remove::example_list(&self.meta.channel_ids);
+                ui.label(format!(
+                    "Channels to exclude from display and computation, by channel ID \
+                     (e.g. \"{example}\"; a bare number matches the ID's number):"
+                ));
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.remove_channels_text)
                         .desired_width(250.0)
-                        .hint_text("e.g. 3,17,40-50"),
+                        .hint_text(format!("e.g. {example}")),
                 );
                 if resp.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     self.apply_remove_channels_text();
@@ -919,6 +978,7 @@ impl NPXplorerApp {
             return;
         };
         let pos = self.context_menu_pos.unwrap_or(egui::Pos2::ZERO);
+        let ch_id = self.meta.channel_id(ch - 1).to_string();
 
         let mut still_open = true;
         let area_resp = egui::Area::new(egui::Id::new("channel_context_menu"))
@@ -931,11 +991,11 @@ impl NPXplorerApp {
                     // justified so each item's hover highlight spans the full row,
                     // exactly like a real menu's entries (see menu_popup upstream)
                     ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                        if ui.button(format!("View waveform (ch {ch})")).clicked() {
+                        if ui.button(format!("View waveform ({ch_id})")).clicked() {
                             self.waveform_channel = Some(ch);
                             still_open = false;
                         }
-                        if ui.button(format!("Remove channel {ch}")).clicked() {
+                        if ui.button(format!("Remove channel {ch_id}")).clicked() {
                             self.remove_channel(ch);
                             still_open = false;
                         }
@@ -1053,7 +1113,7 @@ impl NPXplorerApp {
                         painter.text(
                             egui::pos2(rect.left() + 6.0, rect.top() + 4.0),
                             egui::Align2::LEFT_TOP,
-                            format!("Ch {ch}  ·  ±{half_range:.0} µV (Alt+scroll to rescale)"),
+                            format!("{}  ·  ±{half_range:.0} µV (Alt+scroll to rescale)", self.meta.channel_id(ch - 1)),
                             egui::FontId::proportional(13.0),
                             egui::Color32::from_gray(200),
                         );
@@ -1064,7 +1124,7 @@ impl NPXplorerApp {
             }
             None => {
                 let msg = if matches_cfg {
-                    format!("Channel {ch} isn't currently displayed (removed, or outside the loaded buffer).")
+                    format!("Channel {} isn't currently displayed (removed, or outside the loaded buffer).", self.meta.channel_id(ch - 1))
                 } else {
                     "⏳ Loading…".to_string()
                 };
@@ -1170,6 +1230,10 @@ impl NPXplorerApp {
         self.psth.cancel.store(true, Ordering::Relaxed);
         let cancel = Arc::new(AtomicBool::new(false));
         self.psth.cancel = Arc::clone(&cancel);
+        let progress = Arc::new(AtomicUsize::new(0));
+        self.psth.progress = Arc::clone(&progress);
+        let progress_total = Arc::new(AtomicUsize::new(0));
+        self.psth.progress_total = Arc::clone(&progress_total);
 
         let (tx, rx) = mpsc::channel();
         self.psth.compute_rx = Some(rx);
@@ -1204,7 +1268,8 @@ impl NPXplorerApp {
                         t_start, t_end
                     ));
                 }
-                compute_psth(&raw, &meta, &cfg, &times, &params, &cancel).map_err(|e| e.to_string())
+                compute_psth(&raw, &meta, &cfg, &times, &params, &cancel, &progress, &progress_total)
+                    .map_err(|e| e.to_string())
             })();
             let _ = tx.send(res);
             ctx.request_repaint();
@@ -1401,6 +1466,10 @@ impl NPXplorerApp {
                         self.dispatch_classify(ui.ctx());
                     }
                     ui.add(egui::Separator::default().vertical().spacing(1.0));
+                    if ui.button("Atlas Registration").clicked() {
+                        self.atlas.open = !self.atlas.open;
+                    }
+                    ui.add(egui::Separator::default().vertical().spacing(1.0));
                     if ui.button("PSTH").clicked() {
                         self.psth.open = true;
                         if self.psth.pick_rx.is_none() {
@@ -1494,17 +1563,16 @@ impl NPXplorerApp {
     }
 
     fn draw_channel_controls(&mut self, ui: &mut Ui) {
-        let n_ap = self.meta.n_ap_chans;
         ui.horizontal(|ui| {
             ui.label("Channels:");
             let mut cf = self.ch_first + 1;
             let mut cl = self.ch_last + 1;
             let mut changed = false;
             changed |= ui
-                .add(egui::Slider::new(&mut cf, 1..=n_ap).text("First"))
+                .add(channel_slider(&mut cf, &self.meta).text("First"))
                 .changed();
             changed |= ui
-                .add(egui::Slider::new(&mut cl, 1..=n_ap).text("Last"))
+                .add(channel_slider(&mut cl, &self.meta).text("Last"))
                 .changed();
             if changed {
                 self.ch_first = (cf - 1).min(cl - 1);
@@ -1580,7 +1648,7 @@ impl NPXplorerApp {
                             self.selected_channel_2 = None;
                         }
                         ui.label(
-                            egui::RichText::new(format!("Selected Channel 2: {}", ch2))
+                            egui::RichText::new(format!("Selected Channel 2: {}", self.meta.channel_id(ch2 - 1)))
                                 .color(egui::Color32::from_rgb(0xff, 0xb6, 0x17)),
                         );
                     }
@@ -1591,10 +1659,11 @@ impl NPXplorerApp {
                         if ui.button("✖").clicked() {
                             self.selected_channel_1 = None;
                         }
+                        let id = self.meta.channel_id(ch1 - 1);
                         let text = if self.selected_channel_2.is_some() {
-                            format!("Selected Channel 1: {}", ch1)
+                            format!("Selected Channel 1: {id}")
                         } else {
-                            format!("Selected Channel: {}", ch1)
+                            format!("Selected Channel: {id}")
                         };
                         ui.label(egui::RichText::new(text).color(egui::Color32::WHITE));
                     }
@@ -1720,7 +1789,6 @@ impl NPXplorerApp {
         let accent = egui::Color32::from_rgb(ar, ag, ab);
         let accent_50 = egui::Color32::from_rgba_unmultiplied(ar, ag, ab, 128);
         let cmap = self.colormap_choice.clone();
-        let n_ap = self.meta.n_ap_chans;
         let total_s = self.psth.total_s;
 
         // size the window to 2/3 of the main window and center it on first open
@@ -1785,10 +1853,10 @@ impl NPXplorerApp {
                 let mut cl = self.psth.ch_last + 1;
                 let mut changed = false;
                 changed |= ui
-                    .add(egui::Slider::new(&mut cf, 1..=n_ap).text("First"))
+                    .add(channel_slider(&mut cf, &self.meta).text("First"))
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(&mut cl, 1..=n_ap).text("Last"))
+                    .add(channel_slider(&mut cl, &self.meta).text("Last"))
                     .changed();
                 if changed {
                     self.psth.ch_first = (cf - 1).min(cl - 1);
@@ -1891,9 +1959,24 @@ impl NPXplorerApp {
             });
 
             if self.psth.computing {
+                let done = self.psth.progress.load(Ordering::Relaxed);
+                let total = self.psth.progress_total.load(Ordering::Relaxed);
                 ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Computing…");
+                    if total == 0 {
+                        // still reading the stimulus file / setting up
+                        ui.spinner();
+                        ui.label("Preparing…");
+                    } else {
+                        ui.add(
+                            egui::ProgressBar::new(done as f32 / total as f32)
+                                .desired_width(240.0)
+                                .show_percentage(),
+                        );
+                        ui.label(format!("{done} / {total} stimuli"));
+                    }
+                    if ui.button("Abort").clicked() {
+                        self.psth.cancel.store(true, Ordering::Relaxed);
+                    }
                 });
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(100));
@@ -1912,10 +1995,10 @@ impl NPXplorerApp {
                     ui.label(base);
                     ui.label("·  left-click / right-click the heatmap to plot a channel:");
                     if let Some(c) = self.psth.sel_ch1 {
-                        ui.colored_label(egui::Color32::from_rgb(255, 255, 255), format!("ch {c}"));
+                        ui.colored_label(egui::Color32::from_rgb(255, 255, 255), self.meta.channel_id(c - 1));
                     }
                     if let Some(c) = self.psth.sel_ch2 {
-                        ui.colored_label(egui::Color32::from_rgb(255, 182, 23), format!("ch {c}"));
+                        ui.colored_label(egui::Color32::from_rgb(255, 182, 23), self.meta.channel_id(c - 1));
                     }
                     if (self.psth.sel_ch1.is_some() || self.psth.sel_ch2.is_some())
                         && ui.button("Deselect").clicked()
@@ -2058,7 +2141,8 @@ impl NPXplorerApp {
                 }
             };
         if let Some(c) = self.psth.sel_ch1 {
-            draw_marker(c, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 128));
+            let [fr, fg, fb] = crate::render::heatmap_fg(&self.colormap_choice);
+            draw_marker(c, egui::Color32::from_rgba_unmultiplied(fr, fg, fb, 128));
         }
         if let Some(c) = self.psth.sel_ch2 {
             draw_marker(c, egui::Color32::from_rgba_unmultiplied(255, 182, 23, 128));
@@ -2198,14 +2282,14 @@ impl NPXplorerApp {
         painter.text(
             egui::pos2(rect.left() + 2.0, heat_rect.top() + 2.0),
             egui::Align2::LEFT_TOP,
-            format!("ch {}", self.psth.ch_last + 1),
+            self.meta.channel_id(self.psth.ch_last),
             fid.clone(),
             txt,
         );
         painter.text(
             egui::pos2(rect.left() + 2.0, heat_rect.bottom() - 2.0),
             egui::Align2::LEFT_BOTTOM,
-            format!("ch {}", self.psth.ch_first + 1),
+            self.meta.channel_id(self.psth.ch_first),
             fid.clone(),
             txt,
         );
@@ -2243,6 +2327,12 @@ impl NPXplorerApp {
         self.poll_classify(ctx);
         self.draw_classify_progress_window(ctx);
         self.draw_channel_context_menu(ctx);
+        self.atlas.poll(ctx);
+        self.atlas.draw_window(ctx, &self.meta, &self.bin_path, &self.colormap_choice);
+        self.atlas.draw_progress_window(ctx);
+        if self.atlas.take_prefs_dirty() {
+            self.save_prefs();
+        }
 
         let mut show_prefs = self.show_preferences;
         if show_prefs {
@@ -2269,6 +2359,7 @@ impl NPXplorerApp {
                                 ColorMapChoice::IceFire => "Ice-Fire",
                                 ColorMapChoice::Vanimo => "Vanimo",
                                 ColorMapChoice::GreyScale => "Greyscale",
+                                ColorMapChoice::CoolWarm => "Cool-Warm",
                             })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut cm, ColorMapChoice::YellowMagenta, "Yellow-Magenta");
@@ -2277,6 +2368,7 @@ impl NPXplorerApp {
                                 ui.selectable_value(&mut cm, ColorMapChoice::IceFire, "Ice-Fire");
                                 ui.selectable_value(&mut cm, ColorMapChoice::Vanimo, "Vanimo");
                                 ui.selectable_value(&mut cm, ColorMapChoice::GreyScale, "Greyscale");
+                                ui.selectable_value(&mut cm, ColorMapChoice::CoolWarm, "Cool-Warm");
                             });
                         if cm != self.colormap_choice {
                             self.colormap_choice = cm;
@@ -2330,6 +2422,13 @@ impl NPXplorerApp {
 
                     ui.separator();
                     ui.label(egui::RichText::new("Firing rate overlay").strong());
+
+                    if ui.checkbox(&mut self.show_firing_rate_overlay, "Show firing rate overlay").changed() {
+                        // force the (skipped while hidden) spike projection to recompute
+                        self.proj_view_first = usize::MAX;
+                        self.heatmap_texture = None;
+                        self.save_prefs();
+                    }
 
                     ui.horizontal(|ui| {
                         ui.label("Spike Threshold (µV):");
@@ -2454,7 +2553,13 @@ impl NPXplorerApp {
         // mouse-wheel scroll — 5% of window per tick; Alt+scroll instead adjusts the
         // color scale (or, in single-channel waveform view, the waveform's y-axis range)
         let alt_held = ctx.input(|i| i.modifiers.alt);
-        let ticks = ctx.input(|i| {
+        // wheel over a window (Atlas Registration, Preferences, PSTH, ...) scrolls only
+        // that window; panels, incl. the heatmap, live on the Background layer
+        let pointer_over_window = ctx
+            .input(|i| i.pointer.hover_pos())
+            .and_then(|p| ctx.layer_id_at(p))
+            .is_some_and(|layer| layer.order != egui::Order::Background);
+        let ticks = if pointer_over_window { 0.0 } else { ctx.input(|i| {
             i.events
                 .iter()
                 .filter_map(|e| match e {
@@ -2462,7 +2567,7 @@ impl NPXplorerApp {
                     _ => None,
                 })
                 .sum::<f32>()
-        });
+        }) };
         if ticks != 0.0 && alt_held {
             // inverted relative to a plain sum of tick signs: scrolling up now
             // decreases the value (mirrors the "zoom out" feel of scroll-up elsewhere)
@@ -2487,8 +2592,12 @@ impl NPXplorerApp {
             self.view_start_s = (self.view_start_s + step).clamp(0.0, max_start);
         }
 
-        // keyboard scroll
+        // keyboard scroll (not while typing into a text field)
+        let typing = ctx.wants_keyboard_input();
         ctx.input(|i| {
+            if typing {
+                return;
+            }
             let fs = self.meta.sample_rate;
             let total_s = self.meta.n_samples as f64 / fs;
             let step = self.view_dur_s * 0.5;
@@ -2638,7 +2747,7 @@ impl NPXplorerApp {
                                 || self.proj_cfg.as_ref() != Some(&self.preproc_cfg)
                                 || buf_changed;
 
-                            if proj_stale {
+                            if proj_stale && self.show_firing_rate_overlay {
                                 let visible = &display_rows[first_row..=last_row];
                                 let mut sums = vec![0.0f32; visible.len()];
 
@@ -2881,14 +2990,15 @@ impl NPXplorerApp {
                             }
                         };
 
+                        let [fr, fg, fb] = crate::render::heatmap_fg(&self.colormap_choice);
                         if let Some(ch1) = self.selected_channel_1 {
-                            draw_line(ch1, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 128));
+                            draw_line(ch1, egui::Color32::from_rgba_unmultiplied(fr, fg, fb, 128));
                         }
                         if let Some(ch2) = self.selected_channel_2 {
                             draw_line(ch2, egui::Color32::from_rgba_unmultiplied(255, 182, 23, 128));
                         }
                         if let Some(ctx_ch) = self.context_menu_channel {
-                            draw_line(ctx_ch, egui::Color32::from_rgba_unmultiplied(200, 200, 200, 128));
+                            draw_line(ctx_ch, egui::Color32::from_rgba_unmultiplied(fr, fg, fb, 100));
                         }
 
                         // label each shank's section with "shank N", at the top-right
@@ -2912,13 +3022,13 @@ impl NPXplorerApp {
                                     egui::Align2::RIGHT_TOP,
                                     format!("shank {shank}"),
                                     egui::FontId::proportional(12.0),
-                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
+                                    egui::Color32::from_rgba_unmultiplied(fr, fg, fb, 200),
                                 );
                             }
                         }
 
                         // draw projection overlay
-                        if !self.projection_sums.is_empty() {
+                        if self.show_firing_rate_overlay && !self.projection_sums.is_empty() {
                             // scale with window duration and threshold (baseline: -20 µV → 1x),
                             // plus a user-configurable multiplier (spike_overlay_scale, default 1)
                             let threshold_scale = self.spike_threshold.abs() / 20.0;
@@ -2933,6 +3043,7 @@ impl NPXplorerApp {
                                 ColorMapChoice::IceFire => 8,
                                 ColorMapChoice::Vanimo => 5,
                                 ColorMapChoice::GreyScale => 2,
+                                ColorMapChoice::CoolWarm => 10,
                             };
                             let [pr, pg, pb] = crate::render::colormap_accent(&self.colormap_choice);
                             let color = egui::Color32::from_rgba_unmultiplied(pr, pg, pb, overlay_alpha);
@@ -3012,52 +3123,69 @@ impl NPXplorerApp {
                             }
                         }
 
+                        // atlas region borders + labels, on top of the firing-rate overlay
+                        self.atlas.draw_overlay(
+                            ui,
+                            &self.meta,
+                            resp.rect,
+                            display_rows,
+                            first_row,
+                            last_row,
+                            self.preproc_cfg.channel_order,
+                            &self.colormap_choice,
+                        );
+
                         // classification legend / overlay-toggle box, pinned to the
                         // heatmap's top-right corner — only shown once a classification
-                        // has actually been run this session
+                        // has actually been run this session. Laid out inside the heatmap
+                        // panel itself (not a floating Area), so every window the user
+                        // opens stays on top of it.
                         if self.channel_labels.is_some() {
-                            let anchor = resp.rect.right_top() + egui::vec2(-8.0, 8.0);
-                            egui::Area::new(egui::Id::new("classification_legend"))
-                                .fixed_pos(anchor)
-                                .pivot(egui::Align2::RIGHT_TOP)
-                                .order(egui::Order::Foreground)
-                                .show(ctx, |ui| {
-                                    let bg = egui::Color32::from_rgba_unmultiplied(
-                                        crate::render::C_ZERO[0],
-                                        crate::render::C_ZERO[1],
-                                        crate::render::C_ZERO[2],
-                                        77,
-                                    );
-                                    egui::Frame::new()
-                                        .fill(bg)
-                                        .corner_radius(8.0)
-                                        .inner_margin(8.0)
-                                        .show(ui, |ui| {
-                                            if self.show_classification_overlay {
-                                                let legend_row = |ui: &mut Ui, label: u8, text: &str| {
-                                                    ui.horizontal(|ui| {
-                                                        let (rect, _) = ui.allocate_exact_size(
-                                                            egui::vec2(12.0, 12.0),
-                                                            egui::Sense::hover(),
-                                                        );
-                                                        ui.painter().rect_filled(rect, 2.0, classification_color(label, 255));
-                                                        ui.label(text);
-                                                    });
-                                                };
-                                                legend_row(ui, 1, "Dead");
-                                                legend_row(ui, 2, "Noisy");
-                                                legend_row(ui, 3, "Out of brain");
-                                                ui.add_space(4.0);
-                                            }
-                                            let btn_label = if self.show_classification_overlay {
-                                                "Disable Overlay"
-                                            } else {
-                                                "Enable Overlay"
+                            let box_region = egui::Rect::from_min_max(
+                                egui::pos2(resp.rect.left(), resp.rect.top() + 8.0),
+                                egui::pos2(resp.rect.right() - 8.0, resp.rect.bottom()),
+                            );
+                            let mut box_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(box_region)
+                                    .layout(egui::Layout::top_down(egui::Align::Max)),
+                            );
+                            box_ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                            let bg = egui::Color32::from_rgba_unmultiplied(
+                                crate::render::C_ZERO[0],
+                                crate::render::C_ZERO[1],
+                                crate::render::C_ZERO[2],
+                                77,
+                            );
+                            egui::Frame::new()
+                                .fill(bg)
+                                .corner_radius(8.0)
+                                .inner_margin(8.0)
+                                .show(&mut box_ui, |ui| {
+                                    // vertical() sizes to its content (with_layout would take
+                                    // the full heatmap width)
+                                    ui.vertical(|ui| {
+                                        if self.show_classification_overlay {
+                                            let legend_row = |ui: &mut Ui, label: u8, text: &str| {
+                                                ui.horizontal(|ui| {
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        egui::vec2(12.0, 12.0),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    ui.painter().rect_filled(rect, 2.0, classification_color(label, 255));
+                                                    ui.label(text);
+                                                });
                                             };
-                                            if ui.button(btn_label).clicked() {
-                                                self.show_classification_overlay = !self.show_classification_overlay;
-                                            }
-                                        });
+                                            legend_row(ui, 1, "Dead");
+                                            legend_row(ui, 2, "Noisy");
+                                            legend_row(ui, 3, "Out of brain");
+                                            ui.add_space(4.0);
+                                        }
+                                        ui.toggle_value(
+                                            &mut self.show_classification_overlay,
+                                            "Chan classification overlay",
+                                        );
+                                    });
                                 });
                         }
                     }
@@ -3082,7 +3210,13 @@ impl NPXplorerApp {
                             ).clamp(first_row, last_row);
 
                             let ch_str = match &display_rows[disp_idx] {
-                                DisplayRow::Data { first_ch, .. } => format!("Ch {}  ", first_ch),
+                                DisplayRow::Data { first_ch, .. } => {
+                                    let id = self.meta.channel_id(*first_ch);
+                                    match self.atlas.channel_region_label(*first_ch) {
+                                        Some(region) => format!("{id}  {region}  "),
+                                        None => format!("{id}  "),
+                                    }
+                                }
                                 DisplayRow::IntraShankGap => "Channel gap  ".to_string(),
                                 DisplayRow::ShankBoundary => "Shank gap  ".to_string(),
                             };
@@ -3124,7 +3258,9 @@ impl NPXplorerApp {
                     let scale_bar_h = 4.0;
                     let bar_min = resp.rect.right_bottom() - egui::vec2(scale_bar_w + 20.0, 30.0);
                     let bar_rect = egui::Rect::from_min_size(bar_min, egui::vec2(scale_bar_w, scale_bar_h));
-                    ui.painter().rect_filled(bar_rect, 0.0, egui::Color32::WHITE);
+                    let [fr, fg, fb] = crate::render::heatmap_fg(&self.colormap_choice);
+                    let fg_color = egui::Color32::from_rgb(fr, fg, fb);
+                    ui.painter().rect_filled(bar_rect, 0.0, fg_color);
 
                     let dur_ms = self.view_dur_s * (scale_bar_frac as f64) * 1000.0;
                     ui.painter().text(
@@ -3132,7 +3268,7 @@ impl NPXplorerApp {
                         egui::Align2::RIGHT_TOP,
                         format!("{:.0} ms", dur_ms),
                         egui::FontId::proportional(14.0),
-                        egui::Color32::WHITE,
+                        fg_color,
                     );
                 }
 

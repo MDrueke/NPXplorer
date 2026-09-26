@@ -28,6 +28,8 @@ macro_rules! file_log {
 }
 
 mod app;
+mod atlas;
+mod atlas_ui;
 mod channel_classify;
 mod channel_remove;
 mod data;

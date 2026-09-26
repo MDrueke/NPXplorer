@@ -1,136 +1,128 @@
-# NPXplorer v0.5.2
+# NPXplorer v0.6.0
 
-A lightweight viewer for raw Neuropixels electrophysiology data. Renders voltage traces as a heatmap mapped to the physical probe geometry in real time.
+A viewer for raw Neuropixels recordings. Shows the voltage of all channels as a heatmap laid out by the probe geometry.
 
-**This is beta software.** It has not been extensively tested across all recording configurations and probe types. Expect rough edges.
+**This is beta software.** It has not been tested with all recording configurations and probe types.
 
 ![App Screenshot](ex_screenshot.png)
 
-## Requirements
+## Supported data
 
-- Both data acquired with SpikeGLX or OpenEphys is supported. The format is detected automatically, and the app attempts to find the meta file.
-- For SpikeGLX, both the AP and LFP bands are supported (`.ap.bin`/`.lf.bin`). The matching `.ap.meta`/`.lf.meta` next to the data file is used for each band.
-- Data compressed with mtscomp is decompressed on-the-fly
-- Tested with NP 1.0, NP 2.0 single-shank, and NP 2.0 multi-shank probes via SpikeGLX.
-  OpenEphys support has only been tested against a single-shank NP 1.0 recording. Reading multi-shank data acquired with OpenEphys works in theory, but is untested.
+- SpikeGLX (`.ap.bin`, `.lf.bin`) with the matching `.meta` file next to it.
+- Open Ephys binary format (`continuous.dat`); `structure.oebin` and `settings.xml` are found automatically.
+- mtscomp-compressed files (`.cbin` with its `.ch` file).
+- Tested with NP 1.0, NP 2.0 single-shank and NP 2.0 multi-shank probes (SpikeGLX), and a single-shank NP 1.0 recording from Open Ephys.
 
 ## Usage
 
-Just launch, and pick a file from the file dialog. **File > Recent files** lists the last 5 recordings opened (hover to expand); this persists across restarts.
+Launch the app and pick a recording. **File > Recent files** lists the last 5 recordings.
+
+Channels are named as in the recording's metadata (e.g. `AP12` for SpikeGLX, `CH13` for Open Ephys), everywhere in the app and in exported files.
 
 ### Navigation
 
-- **Scroll wheel** moves the view forward/backward in time. The step size is 5% (Fine) or 30% (Coarse) of the current window width.
-- **Arrow keys** or **A/D** jump half a window at a time.
-- **Click on the navigation bar** at the bottom to jump to any point in the recording.
-- **"Jump to (s)"** field lets you type an exact time in seconds.
-- The navigation bar shows two markers in the colormap's accent color: a solid bar for the currently displayed window, and a fainter, wider shaded region behind it showing how much surrounding time has been preprocessed and is ready for smooth scrolling. The preprocessed chunk is automatically extended in the direction of scrolling once a certain margin (configurable in preferences) is met
+- **Scroll wheel**: move forward/backward in time (step size set by **Fine**/**Coarse** in the top bar).
+- **Arrow keys** or **A/D**: jump half a window.
+- **Window**: length of the displayed time window in seconds.
+- **Jump to (s)**: go to a time.
+- Click the **navigation bar** at the bottom to jump anywhere. The solid marker shows the displayed window, the shaded area the part that is already preprocessed.
+- **Channels First/Last**: show only a range of channels.
 
 ### Selecting channels
 
-- **Left-click** on the heatmap to select a channel (white marker line).
-- **Right-click** to select a second channel (orange marker line).
-- When both are selected, the vertical distance (Δ µm) between them is displayed.
-
-This is useful for determining i.e. layer boundaries from ephys data.
+- **Alt + left-click** a row to select a channel, **Alt + right-click** to select a second one. With two selected, their vertical distance (Δ µm) is shown in the top right.
+- **Right-click** a row for a menu: **View waveform** shows that channel's trace (Alt + scroll changes its vertical scale, **✖** returns to the heatmap), **Remove channel** excludes it.
 
 ### Removing channels
 
-Click **Remove channels…** in the top bar to exclude channels entirely — from the heatmap, from depth averaging, and from the CMR/destripe reference computation for the remaining channels. Useful for a noisy or dead channel that would otherwise contaminate the median reference of its neighbors.
+**Remove channels…** in the top bar excludes channels from the display and from all processing. Enter channel IDs or ranges separated by commas (e.g. `AP3,AP17,AP40-AP50`) and press **Apply** or Enter; a bare number (`17`, `40-50`) matches the channels whose ID ends in that number. **Load from file…** reads the list from a `.csv`/`.txt`/`.tsv`/`.dat` file, using a layout file like the PSTH one (see below): `channel_remove_layout.csv` next to the list file, or the default in `config/`. **Reset** clears the list.
 
-Enter a comma-separated list of 1-based channel numbers and/or ranges (e.g. `3,17,40-50`) and press **Apply** or Enter. **Load from file…** reads the list from a file instead (`.csv`, `.txt`, `.tsv`, `.dat`), using the same kind of layout file as the PSTH stimulus file (see below) — a `channel_remove_layout.csv` placed next to the channel-list file, or the default at `config/channel_remove_layout.csv`. **Reset** clears the removed-channel list.
+### Preprocessing
 
-### Channel classification
+The second toolbar row sets the preprocessing applied to the display:
 
-An IBL-style automated QC pass that classifies each channel as dead, noisy, out-of-brain, or good.
-
-Click **Channel Classification** in the top bar to run it — it doesn't run automatically, since scanning the recording takes a moment. A progress popup (with an **Abort** button) shows while it runs. Once done, every non-good channel gets a semi-transparent colored stripe over its row on the heatmap: dead — magenta, noisy — red, out-of-brain — green.
-
-A small box in the heatmap's top-right corner shows the legend and an **Enable/Disable Overlay** toggle. Disabling it hides the stripes and collapses the box down to just the button, without discarding the result — only pressing **Channel Classification** again re-runs the scan.
-
-**Chunks to sample** (default 100), under "Channel Classification" in Preferences, sets how many short snippets spread across the recording go into the classification's majority vote — more chunks are more robust but slower.
-
-### Preprocessing options
-
-All filters run in real time on the displayed chunk. The pipeline order is fixed:
-
-1. **DC removal** — subtracts the per-channel mean.
-2. **Phase shift correction** — compensates the ADC multiplexing delay across channel groups using linear interpolation. The group size depends on the probe type.
-3. **300 Hz highpass** — 3rd-order Butterworth, applied forward-backward (zero phase). Automatically enabled and locked on when Destripe is selected.
-4. **Spatial filter** — choose one:
-   - **Off** — no spatial filtering.
-   - **Global CMR** — subtracts the median across all channels at sample.
-   - **Local CMR** — subtracts the median of channels within a 100–400 µm annulus around each channel. Uses Euclidean distance from probe geometry.
-   - **Destripe** — IBL-style kfilt: AGC normalization → spatial highpass (0.01 Wn Butterworth, forward-backward) → rescale. Includes mirror padding at probe edges.
-5. **Avg depths** — when enabled, channels at the same depth on the same shank are averaged into a single display row.
-
-For multi-shank probes, all spatial filters operate independently per shank.
-
-### Channel layout
-
-Two settings in Preferences control display order (both apply to the main heatmap and to PSTH):
-
-- **Order channels by** — **Depth** (default) sorts channels by physical depth (y position), deepest channel on each shank at the bottom. **ID** sorts by raw hardware channel number instead, ascending from bottom to top; the gap indicator between rows is skipped in this mode, since row adjacency no longer reflects physical spacing.
-- **Order shanks by** — **ID** (default) uses the shank index from the meta file. **x coordinate** orders shanks left-to-right by their physical x position instead.
-
-### Spike projection overlay
-
-A semi-transparent bar overlay on the left side of the heatmap shows threshold crossings per channel, computed over the visible time window. This gives a quick approximation of firing rate by depth.
-
-All related settings are grouped under "Firing rate overlay" in Preferences:
-
-- **Threshold** — default −40 µV. A 1.5 ms refractory period is enforced between counted crossings.
-- **Overlay scale** — the overlay width scales with both the time window duration and the threshold (at −20 µV it has a baseline size; at −40 µV it's 2× as wide, at −80 µV it's 4×, etc.), multiplied by this manual factor. Default 1, i.e. no change.
-- **Depth smoothing sigma** — standard deviation, in channels, of the Gaussian used to smooth the overlay across depth. Default 1.5.
+- **DC**: remove each channel's mean.
+- **Phase Shift**: correct the sampling delay between channels.
+- **300 Hz HP**: highpass filter (always on with Destripe).
+- **Spatial**: **Off**, **Global CMR** (subtract the median of all channels), **Local CMR** (median of nearby channels), or **Destripe** (IBL-style).
+- **Avg adjacent chans**: average channels at the same depth into one row.
 
 ### Color scale
 
-- **Percentile mode** — the color range is set by a percentile of the absolute voltage distribution in the current buffer (default: 99th percentile, adjustable 95–100%).
-- **±µV mode** — manually set the symmetric color range (10–300 µV).
-- **Colormaps** — six options available in Preferences: Ice-Fire (default), Yellow-Magenta, Red-Blue, Orange-Blue, Vanimo, and Greyscale.
+- **%ile**: the color range follows a percentile of the displayed voltages; **±µV**: a fixed range. **Alt + scroll** adjusts either.
+- **Colormap** (Preferences): Ice-Fire, Yellow-Magenta, Red-Blue, Orange-Blue, Vanimo, Greyscale, Cool-Warm.
+
+### Firing rate overlay
+
+A bar on the left of the heatmap shows the number of threshold crossings per channel in the displayed window. Settings under "Firing rate overlay" in Preferences: **Show firing rate overlay**, **Spike Threshold** (default −40 µV), **Overlay scale**, and **Depth smoothing sigma**.
+
+### Channel layout
+
+In Preferences:
+
+- **Order channels by**: **Depth** (default; deepest channel at the bottom) or **ID**.
+- **Order shanks by**: **ID** (default) or **x coordinate**.
+
+### Channel classification
+
+**Channel Classification** in the top bar marks dead (magenta), noisy (red) and out-of-brain (green) channels with a colored stripe. A progress bar with **Abort** shows while it runs. The box in the heatmap's top-right corner shows the legend; its **Chan classification overlay** button shows or hides the stripes. **Chunks to sample** in Preferences sets how many snippets of the recording are used (more is more reliable but slower).
+
+### Atlas registration
+
+Draws the borders between brain regions of the Allen mouse atlas (CCF) on the heatmap, from the probe's insertion coordinates. It uses the atlas files of the [Neuropixels Trajectory Explorer](https://github.com/petersaj/neuropixels_trajectory_explorer): a folder containing `annotation_volume_10um_by_index.npy` and `structure_tree_safe_2017.csv`.
+
+Click **Atlas Registration** in the top bar:
+
+1. Choose the atlas folder with **Browse…**, or paste its path.
+2. Enter the animal's bregma–lambda distance (default 4.1 mm).
+3. Enter the insertion point (AP and ML in mm from bregma; AP positive = anterior, ML positive = right) and the angles, either as **Azimuth / elevation / rotation** (azimuth from the lambda→bregma axis, elevation from horizontal) or as **Polar / azimuth / roll** (polar angle from vertical, azimuth from +ML). Rotation/roll turns the probe around its axis, which matters for multi-shank probes.
+4. Enter the insertion depth (from the brain surface to the tip, along the probe) and the distance from the tip to the first electrode row (default 195 µm).
+5. Press **Apply**.
+
+The heatmap then shows the region borders, with each region's acronym on the left (hover for the full name); the hovered channel's region also appears in the readout at the bottom left. **Region level** chooses between the finest level (including cortical layers) and coarser levels. **Show overlay** hides or shows it. With channels ordered by ID, borders and labels are hidden.
+
+To match the borders to the data:
+
+- Adjust the depth with **⏶/⏷** (10 µm steps) or the slider; the overlay follows immediately.
+- **Alt + drag** any border to move all borders together; the depth field follows.
+- **Drag** a single border to move just that one (it stops at its neighbors). Dragged borders are kept when the depth changes, and only **Reset borders** undoes them.
+
+**Save** writes `<recording>_regions.csv` next to the data file, with each channel's ID and region.
+
+The window also lists the regions along the probe from the brain surface to the tip (per shank on multi-shank probes), marking those covered by recorded channels, plus the entry and tip coordinates and warnings.
+
+The coordinates and dragged borders are saved in `<recording>.npx_atlas.toml` next to the data file (shared by the AP and LF files) and filled in when the recording is opened again. The atlas itself is only loaded when you press **Apply** or tick **Show overlay**.
 
 ### PSTH (peri-stimulus average)
 
-Click **PSTH** in the top bar and pick a file of stimulus onset times (`.csv`, `.txt`, `.tsv`, `.dat`; UTF-8/UTF-16/Latin-1 are handled). For each stimulus, the preprocessed signal in a window around the onset is averaged across stimuli (mean, using the main window's current preprocessing settings). The window shows three plots sharing a time axis: the selected-channel traces, the mean across the channel range, and a heatmap over all channels in the range.
+Click **PSTH** and pick a file with stimulus onset times in seconds (`.csv`, `.txt`, `.tsv`, `.dat`). The window shows the average signal around the stimuli, using the main window's preprocessing: traces of selected channels, the mean over the channel range, and a heatmap.
 
-Set the controls, then press **Apply settings** to compute or recompute:
+Set **Channels**, **Stim time (s)** (which stimuli to include), **Window (ms)** (e.g. −50 to 200) and the color scale, then press **Apply settings**. A progress bar with **Abort** shows while it computes. **Left-click / right-click** the heatmap to plot up to two channels; **Deselect** clears them. **Export PNG…** saves the plots.
 
-- **Channels** — first/last channel to include.
-- **Stim time (s)** — only stimuli whose onset falls in this range are averaged. Defaults to the whole recording.
-- **Window (ms)** — start and end of the peri-stimulus window relative to onset (e.g. −50 to 200).
-- **Color scale** — percentile or ±µV, as for the main heatmap. Changing it re-colors without recomputing.
-
-**Left-click / right-click** the heatmap to plot a channel's trace (white / orange, up to two). **Deselect** clears them. **Export PNG…** writes the three plots to an image; the default filename is `<recording>_<stim file>_psth.png`.
-
-Stimulus onset times are read according to a layout file. Each line of the layout mirrors the structure of the stim file: leading lines without an `o` are header rows to skip, and the first line containing `o` marks which comma-separated column(s) hold the onset times (in seconds); `x` marks columns to ignore, and trailing `x` beyond the file's columns are ignored. For example:
+The stimulus file is read according to a layout file. Its lines mirror the stim file: lines without an `o` are header rows to skip, and the first line with an `o` marks the column(s) holding the onset times (`x` = ignore). For example
 
 ```
 header
 o,x,x
 ```
 
-skips one header row and reads onsets from the first column. A `stims_file_layout.csv` placed next to the stim file is used if present; otherwise the default at `config/stims_file_layout.csv` (next to the executable) applies. If the layout does not match the file, an error describing the mismatch is shown. Lines starting with `#` are comments and are ignored (the default layout file explains the syntax this way).
+skips one header row and reads the first column. A `stims_file_layout.csv` next to the stim file is used if present, otherwise the default in `config/`. Lines starting with `#` are comments.
 
 ## Configuration
 
-Preferences are saved to `config/npxplorer_prefs.toml` in a `config/` folder next to the executable (a `npxplorer_prefs.toml` left next to the executable by an older version is still read if the new one is absent). This includes preprocessing settings, colormap, color scale mode, spike threshold, window duration, channel/shank ordering, the last opened directory, and the recent-files list (the removed-channels list itself is not saved, since it's specific to a recording). The `config/` folder also holds the default `stims_file_layout.csv` (PSTH) and `channel_remove_layout.csv` (Remove channels) layout files; both are created on first launch.
+Preferences are saved in `config/npxplorer_prefs.toml` next to the executable, together with the default layout files for PSTH and Remove channels. The list of removed channels is not saved.
 
-The Preferences window also exposes background prefetch tuning:
-
-- **Initial buffer size (s)** — total width of the preprocessed buffer loaded on initial load, on a config change, or on a jump to an unloaded region. Also the steady-state size that continuous scrolling settles back to. Default 30 s, clamped to what currently-available system memory allows.
-- **Extension margin (s)** — how close the view is allowed to get to the edge of the preprocessed buffer before more is fetched in that direction; also the size of each fetch. Default 5 s, capped well below a third of the initial buffer size so growing on one side and trimming the other can't oscillate back and forth.
-- **Memory pressure threshold (%)** / **Memory reserve (MB)** — while scrolling continuously in one direction, the buffer keeps growing without trimming the trailing side, up to the initial buffer size. If free system memory drops below either threshold first, growth stops (net-zero: trimming keeps pace with further extension) rather than waiting to hit the size cap.
+The **Buffer** section in Preferences controls how much of the recording is preprocessed ahead of time: **Initial buffer size**, **Extension margin**, and the memory limits (**Memory pressure threshold**, **Memory reserve**) at which the buffer stops growing.
 
 ## Building from source
 
-Requires Rust (stable). Build with:
+Requires Rust (stable):
+
 ```bash
 cargo build --release
 ```
 
 ## Known limitations
 
-- Only tested on SpikeGLX (`.ap.bin`/`.lf.bin`/`.ap.cbin`) and OpenEphys binary format (`continuous.dat`/`.cbin`).
-- Compressed `.cbin` files are a bit slower to navigate since each chunk must be decompressed on the fly.
-- OpenEphys: only a single probe/stream per file is handled — if a `PROCESSOR` block in `settings.xml` contains multiple `NP_PROBE` entries (multiple probes on one PXI card), only the first is used.
-- OpenEphys: multi-shank NP 2.0 geometry and multi-experiment/multi-recording sessions are untested (see Requirements).
+- `.cbin` files are slower to navigate, since they are decompressed on the fly.
+- Open Ephys: only the first probe of a `settings.xml` processor is used; multi-shank probes and multi-experiment/multi-recording sessions are untested.

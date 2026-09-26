@@ -341,8 +341,8 @@ fn classify_chunk(raw_in: &[f32], nc: usize, ns: usize, fs: f64) -> Vec<u8> {
 
 // ---------------------------------------------------------------------------
 // Whole-recording classification: majority vote across N_CLASSIFY_CHUNKS
-// evenly-spaced chunks. Runs on whatever thread calls it — the caller (app.rs)
-// spawns this on a background thread and polls `progress`/`cancel`.
+// evenly-spaced chunks, classified in parallel. The caller (app.rs) spawns this on
+// a background thread and polls `progress`/`cancel`.
 // ---------------------------------------------------------------------------
 
 /// Returns `None` if cancelled partway through.
@@ -358,31 +358,58 @@ pub fn classify_recording(
     let total_dur = meta.n_samples as f64 / fs;
     let max_t0 = (total_dur - CLASSIFY_CHUNK_DUR_S).max(0.0);
 
-    let mut votes = vec![[0u32; 4]; nc];
-
-    for i in 0..n_chunks {
-        if cancel.load(Ordering::Relaxed) {
-            return None;
-        }
-        let t0 = if n_chunks <= 1 {
-            0.0
-        } else {
-            max_t0 * i as f64 / (n_chunks - 1) as f64
-        };
-        let first_sample = (t0 * fs) as usize;
-        let n_samp = ((CLASSIFY_CHUNK_DUR_S * fs) as usize).min(meta.n_samples.saturating_sub(first_sample));
-
-        if n_samp > 0 {
-            let chunk = raw.read_chunk_uv(first_sample, n_samp, meta);
-            if cancel.load(Ordering::Relaxed) {
-                return None;
-            }
-            let labels = classify_chunk(&chunk, nc, n_samp, fs);
-            for (ch, &l) in labels.iter().enumerate() {
-                votes[ch][l as usize] += 1;
-            }
-        }
-        progress.fetch_add(1, Ordering::Relaxed);
+    // chunks are independent, so they're classified in parallel (each chunk's own
+    // steps are parallel across channels too) on a pool that leaves cores free for
+    // the UI, like PSTH; votes are summed per worker and merged at the end
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(crate::worker::compute_thread_count())
+        .build()
+        .ok()?;
+    let votes = pool.install(|| {
+        (0..n_chunks)
+            .into_par_iter()
+            .fold(
+                || vec![[0u32; 4]; nc],
+                |mut votes, i| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return votes;
+                    }
+                    let t0 = if n_chunks <= 1 {
+                        0.0
+                    } else {
+                        max_t0 * i as f64 / (n_chunks - 1) as f64
+                    };
+                    let first_sample = (t0 * fs) as usize;
+                    let n_samp = ((CLASSIFY_CHUNK_DUR_S * fs) as usize)
+                        .min(meta.n_samples.saturating_sub(first_sample));
+                    if n_samp > 0 {
+                        let chunk = raw.read_chunk_uv(first_sample, n_samp, meta);
+                        if cancel.load(Ordering::Relaxed) {
+                            return votes;
+                        }
+                        let labels = classify_chunk(&chunk, nc, n_samp, fs);
+                        for (ch, &l) in labels.iter().enumerate() {
+                            votes[ch][l as usize] += 1;
+                        }
+                    }
+                    progress.fetch_add(1, Ordering::Relaxed);
+                    votes
+                },
+            )
+            .reduce(
+                || vec![[0u32; 4]; nc],
+                |mut a, b| {
+                    for (x, y) in a.iter_mut().zip(&b) {
+                        for l in 0..4 {
+                            x[l] += y[l];
+                        }
+                    }
+                    a
+                },
+            )
+    });
+    if cancel.load(Ordering::Relaxed) {
+        return None;
     }
 
     let final_labels: Vec<u8> = votes

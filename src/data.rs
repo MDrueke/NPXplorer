@@ -58,9 +58,18 @@ pub struct Meta {
     pub uv_per_bit: f32,
     pub im_dat_prb_type: u32,
     pub channel_geom: Vec<ChannelGeom>,
+    /// channel identifier per saved signal channel, as named by the acquisition
+    /// software (SpikeGLX `~snsChanMap`, e.g. "AP12"; Open Ephys `channel_name`, e.g.
+    /// "CH13") — shown everywhere a channel is identified, and used in exported files
+    pub channel_ids: Vec<String>,
 }
 
 impl Meta {
+    /// Identifier of the channel at 0-based position `idx` in the data file.
+    pub fn channel_id(&self, idx: usize) -> &str {
+        self.channel_ids.get(idx).map(|s| s.as_str()).unwrap_or("?")
+    }
+
     /// Detect the acquisition format from the data file's location and load metadata
     /// accordingly. SpikeGLX is identified by a sibling `.meta` file; Open Ephys is
     /// identified by a `structure.oebin` found in an ancestor directory (with a
@@ -96,6 +105,7 @@ impl Meta {
         let mut n_sy: Option<usize> = None;
         let mut geom_str: Option<String> = None;
         let mut im_dat_prb_type: Option<u32> = None;
+        let mut chan_map_str: Option<String> = None;
 
         for line in text.lines() {
             let line = line.trim_end_matches('\r');
@@ -120,6 +130,9 @@ impl Meta {
                     // both ~snsGeomMap (new) and snsGeomMap (no tilde) variants
                     k if k == "~snsGeomMap" || k == "snsGeomMap" => {
                         geom_str = Some(val.to_string());
+                    }
+                    k if k == "~snsChanMap" || k == "snsChanMap" => {
+                        chan_map_str = Some(val.to_string());
                     }
                     _ => {}
                 }
@@ -146,6 +159,7 @@ impl Meta {
         let gain = if is_lf_band { lf_gain } else { ap_gain };
         let uv_per_bit = (ai_range_max / max_int / gain * 1e6) as f32;
         let channel_geom = parse_geom_map(geom_str.as_deref(), n_ap_chans);
+        let channel_ids = parse_chan_map(chan_map_str.as_deref(), n_ap_chans);
 
         Ok(Meta {
             n_saved_chans,
@@ -155,6 +169,7 @@ impl Meta {
             uv_per_bit,
             im_dat_prb_type: im_dat_prb_type.unwrap_or(0),
             channel_geom,
+            channel_ids,
         })
     }
 
@@ -212,7 +227,14 @@ impl Meta {
         // bit_volts is already a direct µV-per-bit scale (unlike SpikeGLX's gain formula);
         // key name varies across GUI versions (bit_volts vs bitVolts)
         let mut bit_volts_vals = Vec::with_capacity(channels.len());
-        for ch in channels {
+        let mut channel_ids = Vec::with_capacity(num_channels);
+        for (i, ch) in channels.iter().enumerate() {
+            channel_ids.push(
+                ch.get("channel_name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| i.to_string()),
+            );
             let bv = ch
                 .get("bit_volts")
                 .or_else(|| ch.get("bitVolts"))
@@ -243,6 +265,9 @@ impl Meta {
             uv_per_bit: uv_per_bit as f32,
             im_dat_prb_type,
             channel_geom,
+            channel_ids: (0..num_channels)
+                .map(|i| channel_ids.get(i).cloned().unwrap_or_else(|| i.to_string()))
+                .collect(),
         })
     }
 
@@ -387,6 +412,24 @@ impl Meta {
 
         rows
     }
+}
+
+/// Channel names from SpikeGLX's `~snsChanMap`, e.g. "(384,384,1)(AP0;0:0)(AP1;1:1)…",
+/// which lists the saved channels in file order as `name;acquisition index:order`.
+/// Falls back to the 0-based file position for any channel the map doesn't cover.
+fn parse_chan_map(s: Option<&str>, n_ap: usize) -> Vec<String> {
+    let mut ids: Vec<String> = s
+        .unwrap_or("")
+        .split(')')
+        .map(|t| t.trim_start_matches('('))
+        .filter_map(|t| t.split_once(';').map(|(name, _)| name.trim().to_string()))
+        .filter(|name| !name.is_empty())
+        .take(n_ap)
+        .collect();
+    while ids.len() < n_ap {
+        ids.push(ids.len().to_string());
+    }
+    ids
 }
 
 fn parse_geom_map(s: Option<&str>, n_ap: usize) -> Vec<ChannelGeom> {
@@ -662,5 +705,19 @@ pub fn open_data(bin_path: &Path, meta: &Meta) -> Result<(RawData, usize)> {
             bail!("mmap pointer is not 2-byte aligned");
         }
         Ok((RawData::Uncompressed(mmap), meta.n_samples))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chan_map_names_in_file_order() {
+        // saved subset (AP5, AP6, AP200) + sync channel, as SpikeGLX writes it
+        let map = "(384,384,1)(AP5;5:5)(AP6;6:6)(AP200;200:200)(SY0;768:768)";
+        assert_eq!(parse_chan_map(Some(map), 3), vec!["AP5", "AP6", "AP200"]);
+        // missing map: fall back to file positions
+        assert_eq!(parse_chan_map(None, 2), vec!["0", "1"]);
     }
 }

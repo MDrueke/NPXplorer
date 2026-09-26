@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering, AtomicUsize};
 
 use crate::data::{DisplayRow, Meta, RawData};
 use crate::preprocess::{Filters, PreprocConfig, preprocess};
@@ -216,6 +216,8 @@ impl PsthResult {
 /// a window (plus filter-settle padding) is read from disk, depth-averaged and
 /// preprocessed exactly as the main view, then the aligned segment is accumulated.
 /// Stimuli whose full padded window falls outside the recording are skipped.
+/// `progress_total` is set to the number of stimuli used once known, and `progress`
+/// counts them as they are processed.
 pub fn compute_psth(
     raw: &Arc<RawData>,
     meta: &Meta,
@@ -223,6 +225,8 @@ pub fn compute_psth(
     stim_times_s: &[f64],
     params: &PsthParams,
     cancel: &AtomicBool,
+    progress: &AtomicUsize,
+    progress_total: &AtomicUsize,
 ) -> Result<PsthResult> {
     let fs = meta.sample_rate;
     if params.end_ms <= params.start_ms {
@@ -292,6 +296,7 @@ pub fn compute_psth(
     if n_used == 0 {
         bail!("all {} stimuli fall too close to the recording edges for the chosen window.", stim_times_s.len());
     }
+    progress_total.store(n_used, Ordering::Relaxed);
 
     let filt = Filters::new(cfg);
     let pool = rayon::ThreadPoolBuilder::new()
@@ -325,6 +330,7 @@ pub fn compute_psth(
                             dst_row[t] += src_row[t] as f64;
                         }
                     }
+                    progress.fetch_add(1, Ordering::Relaxed);
                     acc
                 },
             )

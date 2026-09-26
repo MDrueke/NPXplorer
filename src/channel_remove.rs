@@ -13,56 +13,98 @@ fn split_fields(line: &str) -> Vec<&str> {
     }
 }
 
-/// A single channel number or an inclusive range ("40-50"), 1-based to match the UI.
-/// Returns 0-based channel indices.
-fn parse_token(tok: &str) -> Result<Vec<usize>> {
-    let tok = tok.trim();
-    if let Some((lo, hi)) = tok.split_once('-') {
-        let lo: usize = lo.trim().parse()
-            .map_err(|_| anyhow::anyhow!("'{tok}' is not a valid channel range"))?;
-        let hi: usize = hi.trim().parse()
-            .map_err(|_| anyhow::anyhow!("'{tok}' is not a valid channel range"))?;
-        if lo == 0 || hi < lo {
-            bail!("'{tok}' is not a valid channel range (channels are numbered from 1)");
-        }
-        Ok((lo..=hi).map(|c| c - 1).collect())
-    } else {
-        let c: usize = tok.parse().map_err(|_| anyhow::anyhow!("'{tok}' is not a valid channel number"))?;
-        if c == 0 {
-            bail!("channel numbers start at 1");
-        }
-        Ok(vec![c - 1])
-    }
+/// Split a channel ID into its text prefix and trailing number, e.g. "AP12" ->
+/// ("AP", Some(12)); IDs without a trailing number give None.
+fn split_id(id: &str) -> (&str, Option<u64>) {
+    let digits = id.len() - id.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    let (prefix, num) = id.split_at(id.len() - digits);
+    (prefix, num.parse().ok())
 }
 
-/// Parse a manually-entered list like "3,17,40-50" into 0-based channel indices.
-pub fn parse_channel_list(text: &str) -> Result<BTreeSet<usize>> {
+/// Resolve one entry to 0-based channel indices, matching against the channel IDs
+/// from the meta file (`ids`, one per channel in file order):
+/// - an exact ID ("AP12", case-insensitive) selects that channel;
+/// - a bare number ("12") selects the channel(s) whose ID ends in that number;
+/// - a range ("AP40-AP50" or "40-50") selects every channel whose ID number lies in
+///   it (restricted to the given prefix, if any).
+fn parse_token(tok: &str, ids: &[String]) -> Result<Vec<usize>> {
+    let tok = tok.trim();
+    if let Some(i) = ids.iter().position(|id| id.eq_ignore_ascii_case(tok)) {
+        return Ok(vec![i]);
+    }
+    let bound = |s: &str| -> Result<(String, u64)> {
+        let (prefix, num) = split_id(s.trim());
+        let num = num.ok_or_else(|| anyhow::anyhow!("'{tok}' is not a channel ID or range"))?;
+        Ok((prefix.to_ascii_lowercase(), num))
+    };
+    let ((p_lo, lo), (p_hi, hi)) = match tok.split_once('-') {
+        Some((a, b)) => (bound(a)?, bound(b)?),
+        None => (bound(tok)?, bound(tok)?),
+    };
+    if hi < lo {
+        bail!("'{tok}' is not a valid channel range");
+    }
+    let matches: Vec<usize> = ids
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| {
+            let (prefix, num) = split_id(id);
+            let prefix = prefix.to_ascii_lowercase();
+            num.is_some_and(|n| n >= lo && n <= hi)
+                && (p_lo.is_empty() || p_lo == prefix)
+                && (p_hi.is_empty() || p_hi == prefix)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if matches.is_empty() {
+        bail!("'{tok}' does not match any channel ID of this recording");
+    }
+    Ok(matches)
+}
+
+/// Parse a manually-entered list like "AP3,AP17,AP40-AP50" into 0-based channel indices.
+pub fn parse_channel_list(text: &str, ids: &[String]) -> Result<BTreeSet<usize>> {
     let mut out = BTreeSet::new();
     for tok in text.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()) {
-        for ch in parse_token(tok)? {
+        for ch in parse_token(tok, ids)? {
             out.insert(ch);
         }
     }
     Ok(out)
 }
 
-/// Render a set of 0-based channel indices back into a compact 1-based list,
-/// collapsing consecutive runs into ranges (e.g. "3,17,40-50").
-pub fn format_channel_list(channels: &BTreeSet<usize>) -> String {
+/// Render a set of 0-based channel indices back into a compact list of channel IDs,
+/// collapsing runs of consecutive IDs into ranges (e.g. "AP3,AP17,AP40-AP50").
+pub fn format_channel_list(channels: &BTreeSet<usize>, ids: &[String]) -> String {
+    let id = |i: usize| ids.get(i).map(|s| s.as_str()).unwrap_or("?");
+    let follows = |a: usize, b: usize| {
+        let ((pa, na), (pb, nb)) = (split_id(id(a)), split_id(id(b)));
+        pa == pb && matches!((na, nb), (Some(x), Some(y)) if y == x + 1)
+    };
     let mut parts = Vec::new();
     let mut iter = channels.iter().copied().peekable();
     while let Some(start) = iter.next() {
         let mut end = start;
-        while iter.peek() == Some(&(end + 1)) {
-            end = iter.next().unwrap();
+        while let Some(&next) = iter.peek() {
+            if !follows(end, next) {
+                break;
+            }
+            end = next;
+            iter.next();
         }
         if end == start {
-            parts.push(format!("{}", start + 1));
+            parts.push(id(start).to_string());
         } else {
-            parts.push(format!("{}-{}", start + 1, end + 1));
+            parts.push(format!("{}-{}", id(start), id(end)));
         }
     }
     parts.join(",")
+}
+
+/// Example entry text for this recording's IDs, e.g. "AP3,AP17,AP40-AP50".
+pub fn example_list(ids: &[String]) -> String {
+    let prefix = ids.first().map(|id| split_id(id).0).unwrap_or("");
+    format!("{prefix}3,{prefix}17,{prefix}40-{prefix}50")
 }
 
 // ---------------------------------------------------------------------------
@@ -108,9 +150,9 @@ impl ChannelRemoveLayout {
     }
 }
 
-/// Read channel numbers/ranges from `list_path`, using `layout` to locate the marked
+/// Read channel IDs/ranges from `list_path`, using `layout` to locate the marked
 /// column(s) and skip header rows. Returns 0-based channel indices.
-pub fn load_removed_channels(list_path: &Path, layout: &ChannelRemoveLayout) -> Result<BTreeSet<usize>> {
+pub fn load_removed_channels(list_path: &Path, layout: &ChannelRemoveLayout, ids: &[String]) -> Result<BTreeSet<usize>> {
     let text = read_text_file(list_path)?;
     let name = list_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
 
@@ -133,11 +175,11 @@ pub fn load_removed_channels(list_path: &Path, layout: &ChannelRemoveLayout) -> 
                 );
             }
             let tok = fields[c];
-            match parse_token(tok) {
+            match parse_token(tok, ids) {
                 Ok(chs) => out.extend(chs),
                 Err(_) => bail!(
-                    "could not read a channel number from '{name}': the value '{tok}' in row {}, \
-                     column {} is not a valid channel number or range.",
+                    "could not read a channel from '{name}': the value '{tok}' in row {}, \
+                     column {} does not match any channel ID or range of this recording.",
                     line_no + 1,
                     c + 1
                 ),
@@ -179,8 +221,9 @@ const DEFAULT_LAYOUT: &str = "\
 # Lines here mirror the structure of that file, one line each (comment lines
 # like this one are ignored and don't count). Lines with no 'o' are header
 # rows in the channel-list file, to be skipped. The first line containing 'o'
-# marks which comma-separated column(s) hold the channel numbers (e.g. '5' or
-# a range like '40-50'); 'x' marks a column to ignore.
+# marks which comma-separated column(s) hold the channels, as channel IDs
+# (e.g. 'AP5', a bare number like '5', or a range like 'AP40-AP50'); 'x' marks
+# a column to ignore.
 header
 o
 ";
@@ -193,5 +236,41 @@ pub fn ensure_default_layout() {
             let _ = std::fs::create_dir_all(dir);
         }
         let _ = std::fs::write(&path, DEFAULT_LAYOUT);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(prefix: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefix}{i}")).collect()
+    }
+
+    #[test]
+    fn parse_ids_numbers_and_ranges() {
+        let ids = ids("AP", 60);
+        let set = parse_channel_list("AP3, 17 ap40-AP42,50-51", &ids).unwrap();
+        assert_eq!(set.into_iter().collect::<Vec<_>>(), vec![3, 17, 40, 41, 42, 50, 51]);
+        assert!(parse_channel_list("LF3", &ids).is_err());
+        assert!(parse_channel_list("AP99", &ids).is_err());
+    }
+
+    #[test]
+    fn format_round_trip() {
+        let ids = ids("AP", 60);
+        let set: BTreeSet<usize> = [3, 17, 40, 41, 42].into_iter().collect();
+        let text = format_channel_list(&set, &ids);
+        assert_eq!(text, "AP3,AP17,AP40-AP42");
+        assert_eq!(parse_channel_list(&text, &ids).unwrap(), set);
+    }
+
+    #[test]
+    fn subset_saved_channels() {
+        // file holds only some hardware channels: IDs, not positions, are matched
+        let ids: Vec<String> = ["AP10", "AP11", "AP20"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_channel_list("20", &ids).unwrap().into_iter().collect::<Vec<_>>(), vec![2]);
+        let all: BTreeSet<usize> = [0, 1, 2].into_iter().collect();
+        assert_eq!(format_channel_list(&all, &ids), "AP10-AP11,AP20");
     }
 }

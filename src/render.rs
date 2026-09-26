@@ -13,6 +13,44 @@ pub fn colormap_accent(cmap: &crate::app::ColorMapChoice) -> [u8; 3] {
         crate::app::ColorMapChoice::IceFire => [166, 217, 237],
         crate::app::ColorMapChoice::Vanimo => [202, 237, 166],
         crate::app::ColorMapChoice::GreyScale => [255, 255, 255],
+        crate::app::ColorMapChoice::CoolWarm => [120, 150, 240],
+    }
+}
+
+/// Color of the atlas region borders, region labels on the heatmap and region names in
+/// the Atlas Registration table — one per colormap, picked to stand out against the map
+/// and against the other heatmap lines (white shank boundaries, grey channel gaps,
+/// white/orange selections). This is the one place to edit to change them.
+pub fn atlas_color(cmap: &crate::app::ColorMapChoice) -> [u8; 3] {
+    match cmap {
+        crate::app::ColorMapChoice::YellowMagenta => [0, 220, 255],
+        crate::app::ColorMapChoice::RedBlue => [0, 235, 170],
+        crate::app::ColorMapChoice::OrangeBlue => [140, 255, 90],
+        crate::app::ColorMapChoice::IceFire => [150, 255, 60],
+        crate::app::ColorMapChoice::Vanimo => [0, 210, 255],
+        crate::app::ColorMapChoice::GreyScale => [0, 220, 255],
+        crate::app::ColorMapChoice::CoolWarm => [0, 0, 0],
+    }
+}
+
+/// Background of the boxes behind the region labels on the heatmap and behind the
+/// region names in the Atlas Registration table (drawn semi-transparent) — must
+/// contrast with `atlas_color`: dark for the light region colors, white for Cool-Warm's
+/// black ones.
+pub fn atlas_label_bg(cmap: &crate::app::ColorMapChoice) -> [u8; 3] {
+    match cmap {
+        crate::app::ColorMapChoice::CoolWarm => [255, 255, 255],
+        _ => C_ZERO,
+    }
+}
+
+/// Color of the markers drawn directly on top of the heatmap (shank boundaries,
+/// "shank N" labels, first selected channel, scale bar): white on the maps whose
+/// zero is the dark background, near-black on Cool-Warm, whose zero is light grey.
+pub fn heatmap_fg(cmap: &crate::app::ColorMapChoice) -> [u8; 3] {
+    match cmap {
+        crate::app::ColorMapChoice::CoolWarm => [25, 25, 25],
+        _ => [255, 255, 255],
     }
 }
 
@@ -193,6 +231,34 @@ pub fn voltage_to_rgba(v: f32, vmax: f32, cmap: &crate::app::ColorMapChoice) -> 
                 )
             }
         }
+        // matplotlib's "coolwarm" (Moreland) colors: blue - light grey - red. Oriented
+        // like the other maps, negative (spikes) in the warm color; unlike them, zero is
+        // light grey rather than the background
+        crate::app::ColorMapChoice::CoolWarm => {
+            if t >= 0.0 {
+                interpolate_stops(
+                    t,
+                    &[
+                        [0xdd, 0xdd, 0xdd],
+                        [0xb8, 0xd0, 0xf9],
+                        [0x8d, 0xb0, 0xfe],
+                        [0x62, 0x82, 0xea],
+                        [0x3b, 0x4c, 0xc0],
+                    ],
+                )
+            } else {
+                interpolate_stops(
+                    -t,
+                    &[
+                        [0xdd, 0xdd, 0xdd],
+                        [0xf5, 0xc4, 0xad],
+                        [0xf4, 0x9a, 0x7b],
+                        [0xde, 0x60, 0x4d],
+                        [0xb4, 0x04, 0x26],
+                    ],
+                )
+            }
+        }
     };
     [r, g, b, 255]
 }
@@ -271,11 +337,12 @@ pub fn build_heatmap_into(
                     }
                 }
                 DisplayRow::ShankBoundary => {
-                    // solid white inter-shank separator
+                    // solid inter-shank separator (white, or dark on light-centered maps)
+                    let [r, g, b] = heatmap_fg(cmap);
                     for px in row.chunks_exact_mut(4) {
-                        px[0] = 255;
-                        px[1] = 255;
-                        px[2] = 255;
+                        px[0] = r;
+                        px[1] = g;
+                        px[2] = b;
                         px[3] = 255;
                     }
                 }
@@ -378,8 +445,9 @@ pub fn build_psth_heatmap_into(
                     }
                 }
                 DisplayRow::ShankBoundary => {
+                    let [r, g, b] = heatmap_fg(cmap);
                     for px in row.chunks_exact_mut(4) {
-                        px[0] = 255; px[1] = 255; px[2] = 255; px[3] = 255;
+                        px[0] = r; px[1] = g; px[2] = b; px[3] = 255;
                     }
                 }
                 DisplayRow::Data { data_idx, .. } => {
