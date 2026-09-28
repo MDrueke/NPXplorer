@@ -944,8 +944,11 @@ id,atlas_id,name,acronym,st_level,ontology_id,hemisphere_id,weight,parent_struct
             n_ap_chans: 3,
             sample_rate: 30000.0,
             n_samples: 0,
-            uv_per_bit: 1.0,
+            uv_per_bit: vec![1.0; 3],
             im_dat_prb_type: 0,
+            sample_shift: vec![0.0; 3],
+            warnings: Vec::new(),
+            reference_channels: Default::default(),
             channel_ids: vec!["AP0".into(), "AP1".into(), "AP2".into()],
             channel_geom: vec![
                 crate::data::ChannelGeom { x_um: 0.0, y_um: 0.0, shank: 0 },

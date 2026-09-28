@@ -1,6 +1,8 @@
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::data::{DisplayRow, GAP_PITCH_FACTOR};
+
 // ---------------------------------------------------------------------------
 // SOS biquad — f32 arithmetic
 // ---------------------------------------------------------------------------
@@ -11,25 +13,80 @@ pub struct Sos {
     pub a1: f32, pub a2: f32,
 }
 
-pub fn sosfilt_inplace(sos: &[Sos], x: &mut [f32]) {
-    for s in sos {
-        let (b0, b1, b2, a1, a2) = (s.b0, s.b1, s.b2, s.a1, s.a2);
-        let (mut z0, mut z1) = (0.0f32, 0.0f32);
-        for v in x.iter_mut() {
-            let xi = *v;
-            let yi = b0 * xi + z0;
-            z0 = b1 * xi - a1 * yi + z1;
-            z1 = b2 * xi - a2 * yi;
-            *v = yi;
-        }
-    }
+/// Cascade of second-order sections with scipy-compatible zero-phase filtering:
+/// `filtfilt` extends the signal by odd reflection (`padlen` samples) and starts each
+/// pass from the steady-state initial conditions for the first sample, so the ends of
+/// a segment carry no start-up transient (`scipy.signal.sosfiltfilt` semantics).
+#[derive(Clone, Debug)]
+pub struct SosFilter {
+    pub sos: Vec<Sos>,
+    /// steady-state section states for a unit step input (`sosfilt_zi`)
+    zi: Vec<[f32; 2]>,
+    padlen: usize,
 }
 
-pub fn sosfiltfilt_inplace(sos: &[Sos], x: &mut [f32]) {
-    sosfilt_inplace(sos, x);
-    x.reverse();
-    sosfilt_inplace(sos, x);
-    x.reverse();
+impl SosFilter {
+    pub fn new(sos: Vec<Sos>) -> Self {
+        // per section: state after infinitely many unit-step inputs, scaled by the DC
+        // gain of the sections before it (that is the input the section actually sees)
+        let mut zi = Vec::with_capacity(sos.len());
+        let mut scale = 1.0f64;
+        for s in &sos {
+            let (b0, b1, b2, a1, a2) = (s.b0 as f64, s.b1 as f64, s.b2 as f64, s.a1 as f64, s.a2 as f64);
+            let g = (b0 + b1 + b2) / (1.0 + a1 + a2);
+            let z1 = b2 - a2 * g;
+            let z0 = b1 - a1 * g + z1;
+            zi.push([(z0 * scale) as f32, (z1 * scale) as f32]);
+            scale *= g;
+        }
+        let n_b2_zero = sos.iter().filter(|s| s.b2 == 0.0).count();
+        let n_a2_zero = sos.iter().filter(|s| s.a2 == 0.0).count();
+        let ntaps = 2 * sos.len() + 1 - n_b2_zero.min(n_a2_zero);
+        Self { sos, zi, padlen: 3 * ntaps }
+    }
+
+    /// Single forward pass starting from `zi * x0` (transposed direct form II).
+    fn filt_with_zi(&self, x: &mut [f32], x0: f32) {
+        for (s, z) in self.sos.iter().zip(&self.zi) {
+            let (b0, b1, b2, a1, a2) = (s.b0, s.b1, s.b2, s.a1, s.a2);
+            let (mut z0, mut z1) = (z[0] * x0, z[1] * x0);
+            for v in x.iter_mut() {
+                let xi = *v;
+                let yi = b0 * xi + z0;
+                z0 = b1 * xi - a1 * yi + z1;
+                z1 = b2 * xi - a2 * yi;
+                *v = yi;
+            }
+        }
+    }
+
+    /// Zero-phase filter `x` in place. `scratch` is reused between calls to avoid
+    /// allocating the extended signal each time.
+    pub fn filtfilt(&self, x: &mut [f32], scratch: &mut Vec<f32>) {
+        let n = x.len();
+        if n < 2 {
+            return;
+        }
+        let padlen = self.padlen.min(n - 1);
+        scratch.clear();
+        scratch.reserve(n + 2 * padlen);
+        // odd extension: mirror the signal around its end points
+        for i in 0..padlen {
+            scratch.push(2.0 * x[0] - x[padlen - i]);
+        }
+        scratch.extend_from_slice(x);
+        for i in 0..padlen {
+            scratch.push(2.0 * x[n - 1] - x[n - 2 - i]);
+        }
+        let ext = scratch.as_mut_slice();
+        let x0 = ext[0];
+        self.filt_with_zi(ext, x0);
+        ext.reverse();
+        let y0 = ext[0];
+        self.filt_with_zi(ext, y0);
+        ext.reverse();
+        x.copy_from_slice(&ext[padlen..padlen + n]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -75,6 +132,10 @@ pub fn butter_highpass_sos(n: usize, wn: f64) -> Vec<Sos> {
     sections
 }
 
+pub fn butter_highpass(n: usize, wn: f64) -> SosFilter {
+    SosFilter::new(butter_highpass_sos(n, wn))
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -90,12 +151,13 @@ pub enum SpatialFilter {
 #[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PreprocConfig {
     pub dc_removal: bool,
+    /// correct each channel's ADC sampling delay (applied while reading, before
+    /// depth averaging — see `RawData::read_rows`)
     pub phase_shift: bool,
     pub highpass: bool,
     pub spatial_filter: SpatialFilter,
     pub avg_depths: bool,
     pub sample_rate: f64,
-    pub im_dat_prb_type: u32,
     /// 0-based channel indices excluded from display and from every computation
     /// (CMR/destripe reference, depth averaging). Recording-specific, so it is
     /// never persisted to the saved preferences.
@@ -109,8 +171,8 @@ pub struct PreprocConfig {
 
 #[derive(Clone)]
 pub struct Filters {
-    pub hp_sos: Vec<Sos>,
-    pub kfilt_sos: Vec<Sos>,
+    pub hp: SosFilter,
+    pub kfilt: SosFilter,
     pub kfilt_lagc: usize,
 }
 
@@ -118,21 +180,26 @@ impl Filters {
     pub fn new(cfg: &PreprocConfig) -> Self {
         let fs = cfg.sample_rate;
         Filters {
-            hp_sos: butter_highpass_sos(3, 300.0 / fs * 2.0),
-            kfilt_sos: butter_highpass_sos(3, 0.01),
+            hp: butter_highpass(3, 300.0 / fs * 2.0),
+            kfilt: butter_highpass(3, 0.01),
             kfilt_lagc: (fs / 10.0).round() as usize,
         }
     }
 }
 
-use crate::data::DisplayRow;
-
 // ---------------------------------------------------------------------------
 // Top-level entry point
-// Order: depth-averaging is done by the caller before this function.
-// Here: DC offset -> Phase shift -> Temporal HP -> Spatial filter
+// Order: depth-averaging (and the ADC delay correction) happen while reading.
+// Here: DC offset -> Temporal HP -> Spatial filter, per shank.
 // ---------------------------------------------------------------------------
 
+/// Preprocess `data` (`[n_data_rows][n_samp]`) in place.
+///
+/// Destripe's AGC floor (`epsilon`, one per block of neighbouring rows) normally comes
+/// from the data itself. `agc_eps` lets a caller reuse the values of an earlier run —
+/// used when extending a buffer, so a chunk that is stitched onto it gets the floor
+/// of the buffer it joins instead of its own, and no seam appears at the join.
+/// Returns the floors actually used (empty unless the spatial filter is Destripe).
 pub fn preprocess(
     data: &mut [f32],
     n_samp: usize,
@@ -140,19 +207,21 @@ pub fn preprocess(
     filt: &Filters,
     cancel: &AtomicBool,
     display_rows: &[DisplayRow],
-) {
-    if display_rows.is_empty() || n_samp == 0 { return; }
+    agc_eps: Option<&[f32]>,
+) -> Vec<f32> {
+    let mut eps_used = Vec::new();
+    if display_rows.is_empty() || n_samp == 0 { return eps_used; }
 
     // Identify contiguous chunks of DisplayRow::Data that share the same shank.
     let mut shank_blocks = Vec::new();
     let mut current_shank = None;
     let mut start_idx = 0;
-    
+
     // We only care about Data rows for partitioning the data array
     let data_rows: Vec<&DisplayRow> = display_rows.iter()
         .filter(|r| matches!(r, DisplayRow::Data { .. }))
         .collect();
-        
+
     for (i, row) in data_rows.iter().enumerate() {
         if let DisplayRow::Data { shank, .. } = row {
             if current_shank.is_none() {
@@ -171,46 +240,83 @@ pub fn preprocess(
     // Split data into independent, isolated slices per shank
     // Since `data` is completely ordered exactly as `data_rows`, we can chunk it cleanly.
     let mut current_data_offset = 0;
-    
+
     for (start_row, end_row) in shank_blocks {
-        if cancel.load(Ordering::Relaxed) { return; }
-        
+        if cancel.load(Ordering::Relaxed) { return eps_used; }
+
         let n_shank_rows = end_row - start_row;
         let n_shank_samples = n_shank_rows * n_samp;
-        
+
         let shank_data = &mut data[current_data_offset .. current_data_offset + n_shank_samples];
         let shank_data_rows = &data_rows[start_row .. end_row];
-        
+
         // 1. DC Offset Correction
         if cfg.dc_removal {
             apply_dc_removal(shank_data, n_samp);
         }
-        if cancel.load(Ordering::Relaxed) { return; }
+        if cancel.load(Ordering::Relaxed) { return eps_used; }
 
-        // 2. Phase Shift Correction
-        if cfg.phase_shift {
-            apply_phase_shift(shank_data, n_samp, shank_data_rows, cfg.im_dat_prb_type);
-        }
-        if cancel.load(Ordering::Relaxed) { return; }
-
-        // 3. Highpass Filter
+        // 2. Highpass Filter
         if cfg.highpass {
-            apply_temporal_hp(shank_data, n_samp, &filt.hp_sos);
+            apply_temporal_hp(shank_data, n_samp, &filt.hp);
         }
-        if cancel.load(Ordering::Relaxed) { return; }
+        if cancel.load(Ordering::Relaxed) { return eps_used; }
 
-        // 4. Spatial Filter
+        // 3. Spatial Filter
         match cfg.spatial_filter {
             SpatialFilter::Off => {}
             SpatialFilter::GlobalCmr => apply_global_cmr(shank_data, n_shank_rows, n_samp),
             SpatialFilter::LocalCmr => apply_local_cmr(shank_data, n_samp, shank_data_rows),
             SpatialFilter::Destripe => {
-                apply_kfilt(shank_data, n_shank_rows, n_samp, filt, cancel);
+                // the spatial highpass runs along physical depth and only across rows
+                // that are actually neighbours on the shank — never across a gap
+                for block in contiguous_depth_blocks(shank_data_rows) {
+                    if cancel.load(Ordering::Relaxed) { return eps_used; }
+                    let reuse = agc_eps.and_then(|e| e.get(eps_used.len())).copied();
+                    eps_used.push(apply_kfilt(shank_data, n_samp, &block, filt, reuse));
+                }
             }
         }
-        
+
         current_data_offset += n_shank_samples;
     }
+    eps_used
+}
+
+/// Row indices (into one shank's rows) grouped into runs of physically adjacent rows,
+/// each run sorted by depth then x. A run ends where the next row is further away
+/// than `GAP_PITCH_FACTOR` × the shank's electrode pitch (the same rule that draws a
+/// gap in the display), so a spatial filter never mixes rows across a gap.
+pub(crate) fn contiguous_depth_blocks(rows: &[&DisplayRow]) -> Vec<Vec<usize>> {
+    let pos = |r: &DisplayRow| match r {
+        DisplayRow::Data { y_um, x_um, .. } => (*y_um, *x_um),
+        _ => (0.0, 0.0),
+    };
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (ya, xa) = pos(rows[a]);
+        let (yb, xb) = pos(rows[b]);
+        ya.partial_cmp(&yb).unwrap_or(std::cmp::Ordering::Equal)
+            .then(xa.partial_cmp(&xb).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let pitch = order
+        .windows(2)
+        .map(|w| pos(rows[w[1]]).0 - pos(rows[w[0]]).0)
+        .filter(|&d| d > 0.1)
+        .fold(f32::INFINITY, f32::min);
+    let pitch = if pitch.is_finite() { pitch } else { 20.0 };
+
+    let mut blocks: Vec<Vec<usize>> = Vec::new();
+    let mut prev_y: Option<f32> = None;
+    for r in order {
+        let y = pos(rows[r]).0;
+        match (prev_y, blocks.last_mut()) {
+            (Some(py), Some(b)) if y - py <= pitch * GAP_PITCH_FACTOR => b.push(r),
+            _ => blocks.push(vec![r]),
+        }
+        prev_y = Some(y);
+    }
+    blocks
 }
 
 // ---------------------------------------------------------------------------
@@ -224,35 +330,11 @@ fn apply_dc_removal(data: &mut [f32], n_samp: usize) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Phase Shift Correction (Fractional delay via FFT)
-// ---------------------------------------------------------------------------
-
-fn apply_phase_shift(data: &mut [f32], n_samp: usize, data_rows: &[&DisplayRow], im_dat_prb_type: u32) {
-    data.par_chunks_mut(n_samp).enumerate().for_each(|(row_idx, row)| {
-        if let DisplayRow::Data { first_ch, .. } = data_rows[row_idx] {
-            let shift_samples = match im_dat_prb_type {
-                21 | 24 | 2013 | 2014 => (*first_ch % 384 / 24) as f32 / 16.0,
-                _ => (*first_ch % 384 / 32) as f32 / 13.0,
-            };
-            
-            if shift_samples == 0.0 { return; }
-
-            let delta = shift_samples;
-            let inv_delta = 1.0 - delta;
-            
-            for t in (1..n_samp).rev() {
-                row[t] = row[t] * inv_delta + row[t - 1] * delta;
-            }
-            // For t=0, we don't have row[-1], so keep row[0] unchanged or scale it
-        }
-    });
-}
-
 use std::cell::RefCell;
 
 thread_local! {
     static LOCAL_CMR_BUF: RefCell<(Vec<f32>, Vec<f32>)> = RefCell::new((Vec::new(), Vec::new()));
+    static SCRATCH: RefCell<Vec<f32>> = RefCell::new(Vec::new());
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +344,7 @@ thread_local! {
 fn apply_local_cmr(data: &mut [f32], n_samp: usize, data_rows: &[&DisplayRow]) {
     let n_rows = data_rows.len();
     let mut neighborhoods = vec![Vec::new(); n_rows];
-    
+
     // Pre-calculate neighborhoods
     for i in 0..n_rows {
         if let DisplayRow::Data { x_um: x1, y_um: y1, .. } = data_rows[i] {
@@ -278,7 +360,7 @@ fn apply_local_cmr(data: &mut [f32], n_samp: usize, data_rows: &[&DisplayRow]) {
             }
         }
     }
-    
+
     let data_ptr = SendPtr(data.as_mut_ptr());
     (0..n_samp).into_par_iter().for_each(|t| {
         let dp = data_ptr.0;
@@ -289,7 +371,7 @@ fn apply_local_cmr(data: &mut [f32], n_samp: usize, data_rows: &[&DisplayRow]) {
             for ch in 0..n_rows {
                 buf.0[ch] = unsafe { *dp.add(ch * n_samp + t) };
             }
-            
+
             for (ch, neighbors) in neighborhoods.iter().enumerate() {
                 if neighbors.is_empty() { continue; }
                 buf.1.resize(neighbors.len(), 0.0);
@@ -315,9 +397,9 @@ fn apply_local_cmr(data: &mut [f32], n_samp: usize, data_rows: &[&DisplayRow]) {
 // Temporal HP
 // ---------------------------------------------------------------------------
 
-fn apply_temporal_hp(data: &mut [f32], n_samp: usize, sos: &[Sos]) {
+fn apply_temporal_hp(data: &mut [f32], n_samp: usize, filt: &SosFilter) {
     data.par_chunks_mut(n_samp).for_each(|ch| {
-        sosfiltfilt_inplace(sos, ch);
+        SCRATCH.with(|s| filt.filtfilt(ch, &mut s.borrow_mut()));
     });
 }
 
@@ -330,6 +412,9 @@ thread_local! {
 }
 
 fn apply_global_cmr(data: &mut [f32], n_rows: usize, n_samp: usize) {
+    if n_rows == 0 {
+        return;
+    }
     let data_ptr = SendPtr(data.as_mut_ptr());
     let half = n_rows / 2;
 
@@ -366,17 +451,35 @@ fn apply_global_cmr(data: &mut [f32], n_rows: usize, n_samp: usize) {
 // epsilon = std(data) * 0.003, matching IBL Python reference
 // ---------------------------------------------------------------------------
 
-fn compute_agc_gain(data: &[f32], n_rows: usize, n_samp: usize, win: usize) -> Vec<f32> {
-    let n_total = n_rows * n_samp;
-    let mean = data.iter().sum::<f32>() / n_total as f32;
-    let var = data.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / n_total as f32;
-    let epsilon = (var.sqrt() * 0.003).max(1e-8f32);
+/// AGC floor of a block of rows: 0.3 % of the standard deviation of all its samples.
+fn agc_epsilon(data: &[f32], n_samp: usize, rows: &[usize]) -> f32 {
+    let n_total = (rows.len() * n_samp) as f64;
+    let sum: f64 = rows
+        .par_iter()
+        .map(|&r| data[r * n_samp..(r + 1) * n_samp].iter().map(|&v| v as f64).sum::<f64>())
+        .sum();
+    let mean = sum / n_total;
+    let var: f64 = rows
+        .par_iter()
+        .map(|&r| {
+            data[r * n_samp..(r + 1) * n_samp]
+                .iter()
+                .map(|&v| (v as f64 - mean) * (v as f64 - mean))
+                .sum::<f64>()
+        })
+        .sum::<f64>()
+        / n_total;
+    ((var.sqrt() * 0.003) as f32).max(1e-8f32)
+}
 
+/// Per-row AGC gain for the rows listed in `rows` (indices into `data`'s rows);
+/// returns `[rows.len()][n_samp]`. `epsilon` is the gain's floor.
+fn compute_agc_gain(data: &[f32], n_samp: usize, rows: &[usize], win: usize, epsilon: f32) -> Vec<f32> {
     let half = win / 2;
-    let mut gain = vec![epsilon; n_rows * n_samp];
+    let mut gain = vec![epsilon; rows.len() * n_samp];
 
-    gain.par_chunks_mut(n_samp).enumerate().for_each(|(ch, g)| {
-        let src = &data[ch * n_samp..(ch + 1) * n_samp];
+    gain.par_chunks_mut(n_samp).enumerate().for_each(|(i, g)| {
+        let src = &data[rows[i] * n_samp..(rows[i] + 1) * n_samp];
         // prefix sum of |x|
         let mut prefix = vec![0.0f64; n_samp + 1];
         for t in 0..n_samp {
@@ -409,24 +512,32 @@ struct SendPtr(*mut f32);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
-fn apply_kfilt(data: &mut [f32], n_rows: usize, n_samp: usize, filt: &Filters, cancel: &AtomicBool) {
+/// Spatial highpass along `rows` (indices into `data`'s rows, ordered by depth),
+/// with AGC before and its inverse after, like IBL's `kfilt`. `epsilon` is the AGC
+/// floor to use (`None` = compute it from this data); returns the floor used.
+fn apply_kfilt(data: &mut [f32], n_samp: usize, rows: &[usize], filt: &Filters, epsilon: Option<f32>) -> f32 {
+    let n_rows = rows.len();
+    if n_rows == 0 {
+        return epsilon.unwrap_or(1e-8);
+    }
+    let epsilon = epsilon.unwrap_or_else(|| agc_epsilon(data, n_samp, rows));
     let pad = 60usize.min(n_rows);
     let n_padded = n_rows + 2 * pad;
-    let gain = compute_agc_gain(data, n_rows, n_samp, filt.kfilt_lagc);
+    let gain = compute_agc_gain(data, n_samp, rows, filt.kfilt_lagc, epsilon);
 
     // divide by gain
-    for (ch, g) in gain.chunks(n_samp).enumerate() {
-        let row = &mut data[ch * n_samp..(ch + 1) * n_samp];
+    let data_ptr = SendPtr(data.as_mut_ptr());
+    gain.par_chunks(n_samp).enumerate().for_each(|(i, g)| {
+        let dp = data_ptr.0;
+        let _ = &data_ptr;
+        let row = unsafe { std::slice::from_raw_parts_mut(dp.add(rows[i] * n_samp), n_samp) };
         for (v, &gv) in row.iter_mut().zip(g.iter()) {
             *v /= gv;
         }
-    }
+    });
 
-    if cancel.load(Ordering::Relaxed) { return; }
-
-    let data_ptr = SendPtr(data.as_mut_ptr());
     let gain_ptr = SendPtr(gain.as_ptr() as *mut f32);
-    let sos = filt.kfilt_sos.clone();
+    let sos = &filt.kfilt;
 
     let chunk_size = 512;
     (0..n_samp).into_par_iter().step_by(chunk_size).for_each(|t_start| {
@@ -441,10 +552,10 @@ fn apply_kfilt(data: &mut [f32], n_rows: usize, n_samp: usize, filt: &Filters, c
             // We use buf to store a 2D block: [n_padded][n_t] in row-major
             buf.resize(n_padded * n_t, 0.0);
 
-            // Read row by row for contiguous memory access
-            for ch in 0..n_rows {
-                let src_row = unsafe { std::slice::from_raw_parts(dp.add(ch * n_samp + t_start), n_t) };
-                let dst_row = &mut buf[(pad + ch) * n_t .. (pad + ch + 1) * n_t];
+            // Read row by row (in depth order) for contiguous memory access
+            for (i, &r) in rows.iter().enumerate() {
+                let src_row = unsafe { std::slice::from_raw_parts(dp.add(r * n_samp + t_start), n_t) };
+                let dst_row = &mut buf[(pad + i) * n_t .. (pad + i + 1) * n_t];
                 dst_row.copy_from_slice(src_row);
             }
 
@@ -470,25 +581,59 @@ fn apply_kfilt(data: &mut [f32], n_rows: usize, n_samp: usize, filt: &Filters, c
 
             // Filter each column
             let mut col = vec![0.0f32; n_padded];
-            for i in 0..n_t {
-                for r in 0..n_padded {
-                    col[r] = buf[r * n_t + i];
-                }
-                sosfiltfilt_inplace(&sos, &mut col);
-                for r in 0..n_padded {
-                    buf[r * n_t + i] = col[r];
-                }
-            }
-
-            // Write back row by row
-            for ch in 0..n_rows {
-                let dst_row = unsafe { std::slice::from_raw_parts_mut(dp.add(ch * n_samp + t_start), n_t) };
-                let src_row = &buf[(pad + ch) * n_t .. (pad + ch + 1) * n_t];
-                let g_row = unsafe { std::slice::from_raw_parts(gp.add(ch * n_samp + t_start), n_t) };
+            SCRATCH.with(|s| {
+                let mut scratch = s.borrow_mut();
                 for i in 0..n_t {
-                    dst_row[i] = src_row[i] * g_row[i];
+                    for r in 0..n_padded {
+                        col[r] = buf[r * n_t + i];
+                    }
+                    sos.filtfilt(&mut col, &mut scratch);
+                    for r in 0..n_padded {
+                        buf[r * n_t + i] = col[r];
+                    }
+                }
+            });
+
+            // Write back row by row, restoring the gain
+            for (i, &r) in rows.iter().enumerate() {
+                let dst_row = unsafe { std::slice::from_raw_parts_mut(dp.add(r * n_samp + t_start), n_t) };
+                let src_row = &buf[(pad + i) * n_t .. (pad + i + 1) * n_t];
+                let g_row = unsafe { std::slice::from_raw_parts(gp.add(i * n_samp + t_start), n_t) };
+                for k in 0..n_t {
+                    dst_row[k] = src_row[k] * g_row[k];
                 }
             }
         });
     });
+    epsilon
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filtfilt_has_no_edge_transient_on_a_constant() {
+        // a highpass with scipy-style edge handling turns a constant into (nearly) zero
+        // everywhere, including the first samples where a zero-state filter rings
+        let f = butter_highpass(3, 0.02);
+        let mut x = vec![100.0f32; 500];
+        let mut scratch = Vec::new();
+        f.filtfilt(&mut x, &mut scratch);
+        assert!(x.iter().all(|v| v.abs() < 1e-2), "max |y| = {}", x.iter().fold(0.0f32, |m, v| m.max(v.abs())));
+        // a pure high-frequency tone passes with unit gain, away from the ends
+        let mut y: Vec<f32> = (0..500).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        f.filtfilt(&mut y, &mut scratch);
+        assert!((y[250].abs() - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn depth_blocks_split_at_gaps_and_ignore_display_order() {
+        let row = |y: f32| DisplayRow::Data { data_idx: 0, channels: vec![], first_ch: 0, x_um: 0.0, y_um: y, shank: 0 };
+        // rows given out of depth order, with a 100 µm gap between 40 and 140
+        let rows = [row(140.0), row(0.0), row(40.0), row(20.0), row(160.0)];
+        let refs: Vec<&DisplayRow> = rows.iter().collect();
+        let blocks = contiguous_depth_blocks(&refs);
+        assert_eq!(blocks, vec![vec![1, 3, 2], vec![0, 4]]);
+    }
 }

@@ -302,7 +302,12 @@ impl AtlasUi {
                         self.show_overlay = true;
                         self.refresh_channel_regions();
                     }
-                    Ok(None) => {} // aborted
+                    Ok(None) => {
+                        // aborted: nothing to show unless an earlier registration exists
+                        if self.registration.is_none() {
+                            self.show_overlay = false;
+                        }
+                    }
                     Err(e) => {
                         self.error = Some(e);
                         if self.registration.is_none() {

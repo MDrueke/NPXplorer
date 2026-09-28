@@ -264,22 +264,145 @@ pub fn voltage_to_rgba(v: f32, vmax: f32, cmap: &crate::app::ColorMapChoice) -> 
 }
 
 // ---------------------------------------------------------------------------
+// Row -> pixel-row mapping shared by both heatmaps
+// ---------------------------------------------------------------------------
+
+/// Display row shown at pixel row `py` (last row at the top, first at the bottom).
+#[inline]
+fn disp_idx_of_pixel_row(py: usize, n_rows: usize, pixel_h: usize) -> usize {
+    n_rows
+        .saturating_sub(1)
+        .saturating_sub((py * n_rows) / pixel_h)
+        .min(n_rows - 1)
+}
+
+/// Fill `out` (pixel_w × pixel_h RGBA) from a per-display-row painter. Each display
+/// row is rendered once and copied to every pixel row that shows it, instead of
+/// re-rendering it per pixel row; when there are more rows than pixels, only the
+/// rows actually shown are rendered.
+fn paint_rows(
+    out: &mut [u8],
+    n_rows: usize,
+    pixel_w: usize,
+    pixel_h: usize,
+    fill_row: impl Fn(usize, &mut [u8]) + Sync,
+) {
+    use rayon::prelude::*;
+    let row_bytes = pixel_w * 4;
+    if n_rows >= pixel_h {
+        // at most one pixel row per display row: paint directly
+        out.par_chunks_mut(row_bytes).enumerate().for_each(|(py, row)| {
+            fill_row(disp_idx_of_pixel_row(py, n_rows, pixel_h), row);
+        });
+        return;
+    }
+    let mut row_px = vec![0u8; n_rows * row_bytes];
+    row_px.par_chunks_mut(row_bytes).enumerate().for_each(|(disp_idx, row)| fill_row(disp_idx, row));
+    out.par_chunks_mut(row_bytes).enumerate().for_each(|(py, row)| {
+        let d = disp_idx_of_pixel_row(py, n_rows, pixel_h);
+        row.copy_from_slice(&row_px[d * row_bytes..(d + 1) * row_bytes]);
+    });
+}
+
+#[inline]
+fn fill_solid(row: &mut [u8], rgb: [u8; 3]) {
+    for px in row.chunks_exact_mut(4) {
+        px[0] = rgb[0];
+        px[1] = rgb[1];
+        px[2] = rgb[2];
+        px[3] = 255;
+    }
+}
+
+/// Background with a dotted grey line: the marker of a gap between electrode rows.
+#[inline]
+fn fill_gap(row: &mut [u8]) {
+    for (px_idx, px) in row.chunks_exact_mut(4).enumerate() {
+        let (r, g, b) = if (px_idx / 4) % 2 == 0 {
+            (0x60, 0x60, 0x60)
+        } else {
+            (C_ZERO[0], C_ZERO[1], C_ZERO[2])
+        };
+        px[0] = r; px[1] = g; px[2] = b; px[3] = 255;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pooling: several samples per pixel column -> one value
+// ---------------------------------------------------------------------------
+
+/// Reduce the samples of one pixel column to one value: their mean, or with `peak`
+/// the sample of largest magnitude (sign kept), so short events such as spikes keep
+/// their amplitude however many samples share a column.
+#[inline]
+fn pool(samples: &[f32], peak: bool) -> f32 {
+    if peak {
+        // min and max in separate branch-free reductions (vectorizable), then the
+        // one of larger magnitude
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &v in samples {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        if -lo > hi { lo } else { hi }
+    } else {
+        samples.iter().sum::<f32>() / samples.len() as f32
+    }
+}
+
+/// Sample range `[t0, t1)` (within `n` samples) shown by pixel column `px` of `w`.
+#[inline]
+fn column_range(px: usize, n: usize, w: usize) -> (usize, usize) {
+    let t0 = (px * n) / w;
+    let t1 = (((px + 1) * n) / w).min(n).max(t0 + 1);
+    (t0, t1)
+}
+
+/// Value at percentile `pct` (0..=100) of |values|, ignoring NaN; `None` if empty.
+fn abs_percentile(values: impl Iterator<Item = f32>, pct: f32) -> Option<f32> {
+    let mut v: Vec<f32> = values.filter(|x| !x.is_nan()).map(f32::abs).collect();
+    if v.is_empty() {
+        return None;
+    }
+    let k = (((v.len() - 1) as f32) * (pct / 100.0).clamp(0.0, 1.0)).round() as usize;
+    let (_, kth, _) = v.select_nth_unstable_by(k, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(*kth)
+}
+
+/// Colour a pixel row from pooled values (NaN = no data -> background).
+fn colour_row(row: &mut [u8], pooled: &[f32], vmax: f32, cmap: &crate::app::ColorMapChoice) {
+    for (px, &v) in row.chunks_exact_mut(4).zip(pooled) {
+        let rgba = if v.is_nan() {
+            [C_ZERO[0], C_ZERO[1], C_ZERO[2], 255]
+        } else {
+            voltage_to_rgba(v, vmax, cmap)
+        };
+        px.copy_from_slice(&rgba);
+    }
+}
+
+/// How a heatmap's colour range is chosen.
+#[derive(Clone, Copy, Debug)]
+pub enum ColorScale {
+    /// fixed ±vmax (µV)
+    Fixed(f32),
+    /// this percentile (0..=100) of the |values| actually drawn
+    ViewPercentile(f32),
+}
+
+// ---------------------------------------------------------------------------
 // Heatmap renderer
 //
 // `display_rows` — the full ordered list of rows to render (Data + Gap variants).
 //   Data rows carry a `data_idx` into the flat `data` buffer.
-//   Gap rows are rendered as a solid light-grey stripe.
-//
-// `first_row_idx` / `last_row_idx` — indices into `display_rows` to render
-//   (the channel-range selection from the UI sliders).
+//   Gap rows are rendered as a dotted grey line.
 // ---------------------------------------------------------------------------
 
+/// Render the main heatmap; returns the colour range (vmax, µV) used.
 pub fn build_heatmap_into(
     out: &mut Vec<u8>,
     data: &[f32],
     display_rows: &[DisplayRow],
-    first_row_idx: usize, // first display_row index to render
-    last_row_idx: usize,  // last display_row index to render (inclusive)
     data_stride: usize,   // n_samp in the buffer
     buf_first: usize,     // absolute first sample covered by the buffer
     buf_n_samp: usize,    // number of samples covered by the buffer
@@ -287,119 +410,61 @@ pub fn build_heatmap_into(
     n_view: usize,        // number of samples in the requested view
     pixel_w: usize,
     pixel_h: usize,
-    vmax: f32,
+    scale: ColorScale,
+    peak_pooling: bool,
     cmap: &crate::app::ColorMapChoice,
-) {
+) -> f32 {
     use rayon::prelude::*;
-
     let total = pixel_w * pixel_h * 4;
     out.resize(total, 0);
+    let fallback_vmax = match scale { ColorScale::Fixed(v) => v, ColorScale::ViewPercentile(_) => 1.0 };
 
-    if pixel_w == 0 || pixel_h == 0 || n_view == 0 {
-        return;
+    if pixel_w == 0 || pixel_h == 0 || n_view == 0 || display_rows.is_empty() {
+        return fallback_vmax;
     }
-
-    let first = first_row_idx.min(display_rows.len().saturating_sub(1));
-    let last = last_row_idx.min(display_rows.len().saturating_sub(1));
-    let visible = &display_rows[first..=last];
-    let n_rows = visible.len();
-    if n_rows == 0 {
-        return;
-    }
-
-    let row_bytes = pixel_w * 4;
+    let n_rows = display_rows.len();
     let buf_end = buf_first + buf_n_samp;
 
-    out.par_chunks_mut(row_bytes)
-        .enumerate()
-        .for_each(|(py, row)| {
-            // map pixel row → display row (ch_last at top, ch_first at bottom)
-            let disp_idx = n_rows
-                .saturating_sub(1)
-                .saturating_sub((py * n_rows) / pixel_h);
-            let disp_idx = disp_idx.min(n_rows - 1);
-
-            match &visible[disp_idx] {
-                DisplayRow::IntraShankGap => {
-                    // Background grey with dotted grey line
-                    for (px_idx, px) in row.chunks_exact_mut(4).enumerate() {
-                        if (px_idx / 4) % 2 == 0 {
-                            px[0] = 0x60;
-                            px[1] = 0x60;
-                            px[2] = 0x60;
-                            px[3] = 255; // grey dot
-                        } else {
-                            px[0] = C_ZERO[0];
-                            px[1] = C_ZERO[1];
-                            px[2] = C_ZERO[2];
-                            px[3] = 255;
-                        }
-                    }
-                }
-                DisplayRow::ShankBoundary => {
-                    // solid inter-shank separator (white, or dark on light-centered maps)
-                    let [r, g, b] = heatmap_fg(cmap);
-                    for px in row.chunks_exact_mut(4) {
-                        px[0] = r;
-                        px[1] = g;
-                        px[2] = b;
-                        px[3] = 255;
-                    }
-                }
-                DisplayRow::Data { data_idx, .. } => {
-                    let row_base = data_idx * data_stride;
-                    if row_base + data_stride > data.len() {
-                        // row doesn't exist in this buffer at all — background fill
-                        for px in row.chunks_exact_mut(4) {
-                            px[0] = C_ZERO[0];
-                            px[1] = C_ZERO[1];
-                            px[2] = C_ZERO[2];
-                            px[3] = 255;
-                        }
-                        return;
-                    }
-                    let ch_data = &data[row_base..row_base + data_stride];
-                    for (px_col, px) in row.chunks_exact_mut(4).enumerate() {
-                        let t0 = (px_col * n_view) / pixel_w;
-                        let t1 = (((px_col + 1) * n_view) / pixel_w).min(n_view);
-                        let (has_range, abs_lo, abs_hi) = if t1 > t0 {
-                            (true, view_first + t0, view_first + t1)
-                        } else if t0 < n_view {
-                            (true, view_first + t0, view_first + t0 + 1)
-                        } else {
-                            (false, 0, 0)
-                        };
-                        // background fill wherever the buffer hasn't been preprocessed yet
-                        // (e.g. still extending, or a jump landed ahead of what's ready)
-                        let valid = has_range && abs_lo >= buf_first && abs_hi <= buf_end;
-                        if !valid {
-                            px[0] = C_ZERO[0];
-                            px[1] = C_ZERO[1];
-                            px[2] = C_ZERO[2];
-                            px[3] = 255;
-                            continue;
-                        }
-                        let buf_lo = abs_lo - buf_first;
-                        let buf_hi = abs_hi - buf_first;
-                        let v = if buf_hi > buf_lo {
-                            ch_data[buf_lo..buf_hi].iter().copied().sum::<f32>()
-                                / (buf_hi - buf_lo) as f32
-                        } else {
-                            ch_data[buf_lo]
-                        };
-                        let rgba = voltage_to_rgba(v, vmax, cmap);
-                        px[0] = rgba[0];
-                        px[1] = rgba[1];
-                        px[2] = rgba[2];
-                        px[3] = rgba[3];
-                    }
+    // pool every data row once: pooled[r] holds one value per pixel column
+    let pooled: Vec<Option<Vec<f32>>> = display_rows
+        .par_iter()
+        .map(|row| {
+            let DisplayRow::Data { data_idx, .. } = row else { return None };
+            let row_base = data_idx * data_stride;
+            let mut vals = vec![f32::NAN; pixel_w];
+            if row_base + data_stride > data.len() {
+                return Some(vals); // row not in this buffer: background
+            }
+            let ch_data = &data[row_base..row_base + data_stride];
+            for (px, v) in vals.iter_mut().enumerate() {
+                let (t0, t1) = column_range(px, n_view, pixel_w);
+                let (abs_lo, abs_hi) = (view_first + t0, view_first + t1);
+                // background wherever the buffer hasn't been preprocessed yet
+                if abs_lo >= buf_first && abs_hi <= buf_end {
+                    *v = pool(&ch_data[abs_lo - buf_first..abs_hi - buf_first], peak_pooling);
                 }
             }
-        });
+            Some(vals)
+        })
+        .collect();
+
+    let vmax = match scale {
+        ColorScale::Fixed(v) => v,
+        ColorScale::ViewPercentile(p) => abs_percentile(pooled.iter().flatten().flatten().copied(), p)
+            .unwrap_or(1.0)
+            .max(1.0),
+    };
+
+    paint_rows(out, n_rows, pixel_w, pixel_h, |disp_idx, row| match &display_rows[disp_idx] {
+        DisplayRow::IntraShankGap => fill_gap(row),
+        DisplayRow::ShankBoundary => fill_solid(row, heatmap_fg(cmap)),
+        DisplayRow::Data { .. } => colour_row(row, pooled[disp_idx].as_deref().unwrap_or(&[]), vmax, cmap),
+    });
+    vmax
 }
 
 /// Render a PSTH result (a dense, already-aligned rows×time matrix) into an RGBA
-/// buffer of size `pixel_w × pixel_h`. Rows are drawn ch_last at top / ch_first at
+/// buffer of size `pixel_w × pixel_h`. Rows are drawn last at top / first at
 /// bottom, matching the main heatmap; gaps and shank boundaries render identically.
 pub fn build_psth_heatmap_into(
     out: &mut Vec<u8>,
@@ -407,10 +472,9 @@ pub fn build_psth_heatmap_into(
     pixel_w: usize,
     pixel_h: usize,
     vmax: f32,
+    peak_pooling: bool,
     cmap: &crate::app::ColorMapChoice,
 ) {
-    use rayon::prelude::*;
-
     out.resize(pixel_w * pixel_h * 4, 0);
     if pixel_w == 0 || pixel_h == 0 {
         return;
@@ -424,43 +488,37 @@ pub fn build_psth_heatmap_into(
         return;
     }
 
-    let row_bytes = pixel_w * 4;
-    out.par_chunks_mut(row_bytes)
-        .enumerate()
-        .for_each(|(py, row)| {
-            let disp_idx = n_rows
-                .saturating_sub(1)
-                .saturating_sub((py * n_rows) / pixel_h)
-                .min(n_rows - 1);
+    paint_rows(out, n_rows, pixel_w, pixel_h, |disp_idx, row| match &display_rows[disp_idx] {
+        DisplayRow::IntraShankGap => fill_gap(row),
+        DisplayRow::ShankBoundary => fill_solid(row, heatmap_fg(cmap)),
+        DisplayRow::Data { data_idx, .. } => {
+            let ch_data = &data[data_idx * n_win..(data_idx + 1) * n_win];
+            let pooled: Vec<f32> = (0..pixel_w)
+                .map(|px| {
+                    let (t0, t1) = column_range(px, n_win, pixel_w);
+                    pool(&ch_data[t0..t1], peak_pooling)
+                })
+                .collect();
+            colour_row(row, &pooled, vmax, cmap);
+        }
+    });
+}
 
-            match &display_rows[disp_idx] {
-                DisplayRow::IntraShankGap => {
-                    for (px_idx, px) in row.chunks_exact_mut(4).enumerate() {
-                        let (r, g, b) = if (px_idx / 4) % 2 == 0 {
-                            (0x60, 0x60, 0x60)
-                        } else {
-                            (C_ZERO[0], C_ZERO[1], C_ZERO[2])
-                        };
-                        px[0] = r; px[1] = g; px[2] = b; px[3] = 255;
-                    }
-                }
-                DisplayRow::ShankBoundary => {
-                    let [r, g, b] = heatmap_fg(cmap);
-                    for px in row.chunks_exact_mut(4) {
-                        px[0] = r; px[1] = g; px[2] = b; px[3] = 255;
-                    }
-                }
-                DisplayRow::Data { data_idx, .. } => {
-                    let ch_data = &data[data_idx * n_win..(data_idx + 1) * n_win];
-                    for (px_col, px) in row.chunks_exact_mut(4).enumerate() {
-                        let t0 = (px_col * n_win) / pixel_w;
-                        let t1 = (((px_col + 1) * n_win) / pixel_w).min(n_win).max(t0 + 1);
-                        let v = ch_data[t0..t1.min(n_win)].iter().copied().sum::<f32>()
-                            / (t1.min(n_win) - t0) as f32;
-                        let rgba = voltage_to_rgba(v, vmax, cmap);
-                        px[0] = rgba[0]; px[1] = rgba[1]; px[2] = rgba[2]; px[3] = rgba[3];
-                    }
-                }
-            }
-        });
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peak_pooling_keeps_spike_amplitude() {
+        // a -100 µV, 8-sample trough in 214 samples of zero (one 10 s-window column)
+        let mut x = vec![0.0f32; 214];
+        for v in &mut x[100..108] {
+            *v = -100.0;
+        }
+        x[50] = 20.0;
+        assert_eq!(pool(&x, true), -100.0);
+        assert!((pool(&x, false) - (-800.0 + 20.0) / 214.0).abs() < 1e-4);
+        assert_eq!(column_range(0, 10, 20), (0, 1)); // fewer samples than pixels
+        assert_eq!(abs_percentile([1.0, -3.0, f32::NAN, 2.0].into_iter(), 100.0), Some(3.0));
+    }
 }

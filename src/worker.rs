@@ -32,6 +32,9 @@ pub struct PreprocBuffer {
     pub display_rows: Arc<Vec<DisplayRow>>,
     /// Percentile table of |data| values (0..=100.0).
     pub vmax_pct: PctTable,
+    /// Destripe AGC floors of the full recompute this buffer grew from — reused by
+    /// every extension so stitched chunks match the rest of the buffer
+    pub agc_eps: Arc<Vec<f32>>,
 }
 
 pub struct WorkerState {
@@ -63,6 +66,9 @@ pub enum RequestKind {
         /// ...or below this absolute number of free bytes, whichever hits first
         mem_reserve_bytes: u64,
     },
+    /// Exit the worker thread (sent when the recording is closed), releasing its
+    /// thread pool, the buffer and the mapped file.
+    Shutdown,
 }
 
 #[derive(Clone, Debug)]
@@ -75,40 +81,22 @@ pub type SharedWorkerState = Arc<(Mutex<WorkerState>, Condvar)>;
 pub type SharedCancel = Arc<AtomicBool>;
 
 // ---------------------------------------------------------------------------
-// Depth averaging
-// ---------------------------------------------------------------------------
-
-pub(crate) fn average_depth_rows(raw: &[f32], n_samp: usize, display_rows: &[DisplayRow]) -> Vec<f32> {
-    use rayon::prelude::*;
-    let n_data_rows = display_rows.iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
-    let mut out = vec![0.0f32; n_data_rows * n_samp];
-
-    let data_rows: Vec<&DisplayRow> = display_rows.iter()
-        .filter(|r| matches!(r, DisplayRow::Data { .. }))
-        .collect();
-
-    out.par_chunks_mut(n_samp).enumerate().for_each(|(row_idx, dst)| {
-        if let DisplayRow::Data { channels, .. } = data_rows[row_idx] {
-            let n = channels.len() as f32;
-            for t in 0..n_samp {
-                let sum: f32 = channels.iter().map(|&ch| raw[ch * n_samp + t]).sum();
-                dst[t] = sum / n;
-            }
-        }
-    });
-    out
-}
-
-// ---------------------------------------------------------------------------
 // Percentile table
 // ---------------------------------------------------------------------------
 
+/// Largest number of |values| sampled for the percentile table.
+const PCT_MAX_SAMPLES: usize = 500_000;
+
 fn compute_pct_table(data: &[f32]) -> PctTable {
-    let step = (data.len() / 2_000_000).max(1);
-    let mut vals: Vec<f32> = data.iter().step_by(step).map(|v| v.abs()).collect();
-    vals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = vals.len();
+    use rayon::prelude::*;
     let mut table = Box::new([0.0f32; 10001]);
+    if data.is_empty() {
+        return table;
+    }
+    let step = (data.len() / PCT_MAX_SAMPLES).max(1);
+    let mut vals: Vec<f32> = data.iter().step_by(step).map(|v| v.abs()).collect();
+    vals.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = vals.len();
     for p in 0..=10000usize {
         let idx = ((p * (n - 1)) / 10000).min(n - 1);
         table[p] = vals[idx];
@@ -176,6 +164,11 @@ pub fn spawn_worker(
                 let mut st = lock.lock().unwrap();
                 loop {
                     if let Some(r) = st.request.take() {
+                        if matches!(r.kind, RequestKind::Shutdown) {
+                            st.status = WorkerStatus::Idle;
+                            st.buffer = None;
+                            return;
+                        }
                         st.status = WorkerStatus::Computing;
                         st.active_request = Some(r.clone());
                         break r;
@@ -194,10 +187,19 @@ pub fn spawn_worker(
                     RequestKind::Extend { direction, extension_samp, view_first, view_n, max_buffer_samp, mem_pressure_pct, mem_reserve_bytes } => {
                         run_extend(&req.cfg, direction, extension_samp, view_first, view_n, max_buffer_samp, mem_pressure_pct, mem_reserve_bytes, &raw, &meta, &filt, &lock, &cancel, &ctx);
                     }
+                    RequestKind::Shutdown => unreachable!(),
                 }
             });
         }
     })
+}
+
+/// Ask the worker to exit; returns immediately.
+pub fn request_shutdown(shared: &SharedWorkerState, cancel: &SharedCancel, cfg: &PreprocConfig) {
+    cancel.store(true, Ordering::Relaxed);
+    let (lock, cvar) = &**shared;
+    lock.lock().unwrap().request = Some(WorkerRequest { kind: RequestKind::Shutdown, cfg: cfg.clone() });
+    cvar.notify_one();
 }
 
 // ---------------------------------------------------------------------------
@@ -220,20 +222,14 @@ fn run_full(
     let first = center_sample.saturating_sub(half_window);
     let n_samp = (half_window * 2).min(meta.n_samples.saturating_sub(first));
 
-    let raw_chunk = raw.read_chunk_uv(first, n_samp, meta);
-    if cancel.load(Ordering::Relaxed) {
-        finish_cancelled(lock);
-        return;
-    }
-
-    let mut data = average_depth_rows(&raw_chunk, n_samp, &display_rows);
+    let mut data = raw.read_rows(first, n_samp, meta, &display_rows, cfg.phase_shift);
     if cancel.load(Ordering::Relaxed) {
         finish_cancelled(lock);
         return;
     }
 
     let filt_g = filt.lock().unwrap().clone();
-    preprocess(&mut data, n_samp, cfg, &filt_g, cancel, &display_rows);
+    let agc_eps = preprocess(&mut data, n_samp, cfg, &filt_g, cancel, &display_rows, None);
     if cancel.load(Ordering::Relaxed) {
         finish_cancelled(lock);
         return;
@@ -250,6 +246,7 @@ fn run_full(
         cfg: cfg.clone(),
         display_rows,
         vmax_pct,
+        agc_eps: Arc::new(agc_eps),
     };
     publish(lock, buf, ctx);
 }
@@ -283,10 +280,11 @@ fn run_extend(
             b.n_samp,
             Arc::clone(&b.display_rows),
             b.cfg.clone(),
+            Arc::clone(&b.agc_eps),
         ))
     };
 
-    let (old_data, old_first, old_n_samp, display_rows, _old_cfg) = match current {
+    let (old_data, old_first, old_n_samp, display_rows, _old_cfg, agc_eps) = match current {
         Some(v) if v.4 == *cfg => v,
         _ => {
             // no buffer or config changed — app will issue a Full request
@@ -343,14 +341,11 @@ fn run_extend(
     };
 
     // read and preprocess the extension + overlap chunk
-    let raw_chunk = raw.read_chunk_uv(read_start, read_n, meta);
-    if cancel.load(Ordering::Relaxed) { finish_cancelled(lock); return; }
-
-    let mut ext_proc = average_depth_rows(&raw_chunk, read_n, &display_rows);
+    let mut ext_proc = raw.read_rows(read_start, read_n, meta, &display_rows, cfg.phase_shift);
     if cancel.load(Ordering::Relaxed) { finish_cancelled(lock); return; }
 
     let filt_g = filt.lock().unwrap().clone();
-    preprocess(&mut ext_proc, read_n, cfg, &filt_g, cancel, &display_rows);
+    preprocess(&mut ext_proc, read_n, cfg, &filt_g, cancel, &display_rows, Some(&agc_eps));
     if cancel.load(Ordering::Relaxed) { finish_cancelled(lock); return; }
 
     // stitch: shift old buffer + append clean new samples
@@ -378,6 +373,8 @@ fn run_extend(
                 .copy_from_slice(&old_data[old_src..old_src + keep_old]);
         }
     }
+    drop(ext_proc);
+    drop(old_data);
 
     let vmax_pct = compute_pct_table(&new_data);
     let buf = PreprocBuffer {
@@ -387,6 +384,7 @@ fn run_extend(
         cfg: cfg.clone(),
         display_rows,
         vmax_pct,
+        agc_eps,
     };
     publish(lock, buf, ctx);
 }
@@ -401,14 +399,13 @@ fn finish_cancelled(lock: &Mutex<WorkerState>) {
     st.active_request = None;
 }
 
+/// Install a finished buffer. It is always published — it carries its own config
+/// and extent, so the app can judge whether it fits — even if a newer request is
+/// already waiting; that request is then picked up right away.
 fn publish(lock: &Mutex<WorkerState>, buf: PreprocBuffer, ctx: &egui::Context) {
     let mut st = lock.lock().unwrap();
     st.active_request = None;
-    if st.request.is_some() {
-        st.status = WorkerStatus::Idle;
-    } else {
-        st.buffer = Some(buf);
-        st.status = WorkerStatus::Done;
-        ctx.request_repaint();
-    }
+    st.buffer = Some(buf);
+    st.status = if st.request.is_some() { WorkerStatus::Idle } else { WorkerStatus::Done };
+    ctx.request_repaint();
 }

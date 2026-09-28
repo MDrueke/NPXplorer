@@ -2,12 +2,19 @@
 // as used by iblsorter/preprocess.py::get_good_channels). Classifies each channel from
 // a handful of short raw-data snippets spread across the recording, then takes the
 // per-channel majority vote. Labels: 0 good, 1 dead, 2 noisy, 3 outside of the brain.
+//
+// The algorithm assumes its input channels are one shank, ordered by depth (the
+// "outside of the brain" run must touch the top of the array), so each shank is
+// classified separately with its channels sorted by depth; channels the user removed
+// are left out and keep label 0.
 
 use rayon::prelude::*;
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::data::{Meta, RawData};
-use crate::preprocess::{butter_highpass_sos, sosfiltfilt_inplace};
+use crate::preprocess::{butter_highpass, SosFilter};
 
 pub const DEFAULT_N_CLASSIFY_CHUNKS: usize = 100;
 pub const CLASSIFY_CHUNK_DUR_S: f64 = 0.3;
@@ -15,6 +22,11 @@ pub const CLASSIFY_CHUNK_DUR_S: f64 = 0.3;
 const SIMILARITY_LOW: f32 = -0.5; // below this: dead
 const SIMILARITY_HIGH: f32 = 1.0; // above this: noisy
 const DETREND_NMED: usize = 11;
+
+thread_local! {
+    static SCRATCH: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static COL: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+}
 
 // ---------------------------------------------------------------------------
 // Small hand-rolled radix-2 FFT (nperseg is always a power of two here), so
@@ -165,16 +177,20 @@ fn welch_psd_hf(chan: &[f32], fs: f64, plan: &WelchPlan) -> f32 {
 fn median_trace(raw: &[f32], nc: usize, ns: usize) -> Vec<f32> {
     let mut out = vec![0f32; ns];
     out.par_iter_mut().enumerate().for_each(|(t, o)| {
-        let mut col: Vec<f32> = (0..nc).map(|ch| raw[ch * ns + t]).collect();
-        let half = nc / 2;
-        col.select_nth_unstable_by(half, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        *o = if nc % 2 == 0 {
-            let upper = col[half];
-            col[..half].select_nth_unstable_by(half - 1, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            (upper + col[half - 1]) / 2.0
-        } else {
-            col[half]
-        };
+        COL.with(|cell| {
+            let mut col = cell.borrow_mut();
+            col.clear();
+            col.extend((0..nc).map(|ch| raw[ch * ns + t]));
+            let half = nc / 2;
+            col.select_nth_unstable_by(half, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            *o = if nc % 2 == 0 {
+                let upper = col[half];
+                col[..half].select_nth_unstable_by(half - 1, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                (upper + col[half - 1]) / 2.0
+            } else {
+                col[half]
+            };
+        });
     });
     out
 }
@@ -229,9 +245,19 @@ fn detrend(x: &[f32], nmed: usize) -> Vec<f32> {
 // Single-chunk classification
 // ---------------------------------------------------------------------------
 
-/// Classify one raw chunk (`[nc][ns]` µV, un-preprocessed). Returns a label
-/// per channel: 0 good, 1 dead, 2 noisy, 3 outside of the brain.
-fn classify_chunk(raw_in: &[f32], nc: usize, ns: usize, fs: f64) -> Vec<u8> {
+/// Per-channel features of one chunk, as in IBL's `detect_bad_channels`.
+pub(crate) struct ChunkFeatures {
+    /// detrended similarity with the median trace (dead below -0.5, noisy above 1)
+    pub xcor_hf: Vec<f32>,
+    /// low-frequency similarity trend (outside of the brain when strongly negative)
+    pub xcor_lf: Vec<f32>,
+    /// mean PSD above 80 % of Nyquist, µV²/Hz (noisy above 0.02 AP / 1.4 LF)
+    pub psd_hf: Vec<f32>,
+}
+
+/// Compute the features of one raw chunk (`[nc][ns]` µV, un-preprocessed, channels
+/// ordered by depth, one shank).
+pub(crate) fn chunk_features(raw_in: &[f32], nc: usize, ns: usize, fs: f64, hp: &SosFilter) -> ChunkFeatures {
     let mut raw = raw_in.to_vec();
     raw.par_chunks_mut(ns).for_each(|row| {
         let mean = row.iter().sum::<f32>() / ns as f32;
@@ -240,14 +266,9 @@ fn classify_chunk(raw_in: &[f32], nc: usize, ns: usize, fs: f64) -> Vec<u8> {
 
     let xcor = channels_similarity(&raw, nc, ns);
 
-    let is_ap = fs > 2600.0;
-    let psd_hf_threshold = if is_ap { 0.02 } else { 1.4 };
-    let wn = if is_ap { 300.0 / fs * 2.0 } else { 1.0 / fs * 2.0 };
-    let sos = butter_highpass_sos(3, wn);
-
     let mut hf = raw.clone();
     hf.par_chunks_mut(ns).for_each(|row| {
-        sosfiltfilt_inplace(&sos, row);
+        SCRATCH.with(|s| hp.filtfilt(row, &mut s.borrow_mut()));
     });
     let xcorf = channels_similarity(&hf, nc, ns);
 
@@ -262,8 +283,96 @@ fn classify_chunk(raw_in: &[f32], nc: usize, ns: usize, fs: f64) -> Vec<u8> {
         .into_par_iter()
         .map(|ch| welch_psd_hf(&raw[ch * ns..(ch + 1) * ns], fs, &plan))
         .collect();
+    ChunkFeatures { xcor_hf, xcor_lf, psd_hf }
+}
 
+/// How "outside of the brain" channels are found from the low-frequency similarity
+/// trend `xcor_lf` (IBL's `outside_threshold` argument).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum OutsideRule {
+    /// `xcor_lf < -0.75` — IBL's default
+    Fixed,
+    /// threshold taken where the smoothed trend drops most steeply — IBL's `'adaptive'`.
+    /// Our default: on real recordings (e.g. an Open Ephys NP 1.0 LFP file whose top
+    /// third is out of the brain) xcor_lf never reaches -0.75, so the fixed rule finds
+    /// nothing while this one finds the surface.
+    #[default]
+    Adaptive,
+}
+
+/// IBL's default `outside_threshold`.
+const OUTSIDE_THRESHOLD: f32 = -0.75;
+
+/// Channels below the outside-of-brain threshold, before the contiguity rule.
+fn outside_candidates(xcor_lf: &[f32], rule: OutsideRule) -> Vec<usize> {
+    let nc = xcor_lf.len();
+    let threshold = match rule {
+        OutsideRule::Fixed => OUTSIDE_THRESHOLD,
+        OutsideRule::Adaptive => {
+            if nc < 2 {
+                return Vec::new();
+            }
+            // 25-point moving average (zero-padded, like np.convolve mode='same')
+            let window_size = 25usize;
+            let half_k = (window_size - 1) / 2;
+            let signal_filtered: Vec<f32> = (0..nc)
+                .map(|i| {
+                    let mut sum = 0f32;
+                    for k in 0..window_size {
+                        let idx = i as isize - half_k as isize + k as isize;
+                        if idx >= 0 && (idx as usize) < nc {
+                            sum += xcor_lf[idx as usize];
+                        }
+                    }
+                    sum / window_size as f32
+                })
+                .collect();
+            let indx: Vec<usize> = (1..nc)
+                .filter(|&i| signal_filtered[i] - signal_filtered[i - 1] < -0.02)
+                .map(|i| i - 1)
+                .collect();
+            if indx.is_empty() {
+                return Vec::new();
+            }
+            let m = indx.len() / 2;
+            let median_idx = if indx.len() % 2 == 1 {
+                indx[m] as f64
+            } else {
+                (indx[m - 1] + indx[m]) as f64 / 2.0
+            };
+            xcor_lf[(median_idx.floor() as usize).min(nc - 1)]
+        }
+    };
+    (0..nc).filter(|&i| xcor_lf[i] < threshold).collect()
+}
+
+/// Classify one raw chunk (see `chunk_features`). Returns a label per channel:
+/// 0 good, 1 dead, 2 noisy, 3 outside of the brain. As in IBL, dead and noisy take
+/// precedence over outside of the brain.
+fn classify_chunk(raw_in: &[f32], nc: usize, ns: usize, fs: f64, hp: &SosFilter, rule: OutsideRule) -> Vec<u8> {
+    let ChunkFeatures { xcor_hf, xcor_lf, psd_hf } = chunk_features(raw_in, nc, ns, fs, hp);
+    let psd_hf_threshold = if fs > 2600.0 { 0.02 } else { 1.4 };
     let mut labels = vec![0u8; nc];
+
+    // outside of the brain: the run of low-xcor_lf channels contiguous with the top
+    // of the shank (only if the topmost channel is part of it)
+    let ioutside = outside_candidates(&xcor_lf, rule);
+    if ioutside.last() == Some(&(nc - 1)) {
+        let mut a = vec![0i64; ioutside.len()];
+        let mut acc = 0i64;
+        for i in 1..ioutside.len() {
+            acc += (ioutside[i] as i64 - ioutside[i - 1] as i64) - 1;
+            a[i] = acc;
+        }
+        let max_a = *a.iter().max().unwrap_or(&0);
+        for (&i, &v) in ioutside.iter().zip(a.iter()) {
+            if v == max_a {
+                labels[i] = 3;
+            }
+        }
+    }
+
+    // dead / noisy last, so they override "outside" (IBL's order)
     for ch in 0..nc {
         if xcor_hf[ch] < SIMILARITY_LOW {
             labels[ch] = 1;
@@ -274,68 +383,6 @@ fn classify_chunk(raw_in: &[f32], nc: usize, ns: usize, fs: f64) -> Vec<u8> {
             labels[ch] = 2;
         }
     }
-
-    // outside-of-brain: contiguous run of low-xcor_lf channels touching the
-    // end of the probe (uppermost channels), detected from a smoothed trend
-    if nc >= 2 {
-        let window_size = 25usize;
-        let half_k = (window_size - 1) / 2;
-        let signal_filtered: Vec<f32> = (0..nc)
-            .map(|i| {
-                let mut sum = 0f32;
-                for k in 0..window_size {
-                    let idx = i as isize - half_k as isize + k as isize;
-                    if idx >= 0 && (idx as usize) < nc {
-                        sum += xcor_lf[idx as usize];
-                    }
-                }
-                sum / window_size as f32
-            })
-            .collect();
-
-        let diff_x: Vec<f32> = (1..nc).map(|i| signal_filtered[i] - signal_filtered[i - 1]).collect();
-        let indx: Vec<usize> = diff_x
-            .iter()
-            .enumerate()
-            .filter(|(_, &d)| d < -0.02)
-            .map(|(i, _)| i)
-            .collect();
-
-        if !indx.is_empty() {
-            let m = indx.len() / 2;
-            let median_idx = if indx.len() % 2 == 1 {
-                indx[m] as f64
-            } else {
-                (indx[m - 1] + indx[m]) as f64 / 2.0
-            };
-            let indx_threshold = (median_idx.floor() as usize).min(nc - 1);
-            let threshold = xcor_lf[indx_threshold];
-            let ioutside: Vec<usize> = (0..nc).filter(|&i| xcor_lf[i] < threshold).collect();
-
-            if let Some(&last) = ioutside.last() {
-                if last == nc - 1 {
-                    // keep only the run contiguous with the end of the probe
-                    let mut a = vec![0i64; ioutside.len()];
-                    let mut acc = 0i64;
-                    for i in 1..ioutside.len() {
-                        acc += (ioutside[i] as i64 - ioutside[i - 1] as i64) - 1;
-                        a[i] = acc;
-                    }
-                    let max_a = *a.iter().max().unwrap_or(&0);
-                    let kept: Vec<usize> = ioutside
-                        .into_iter()
-                        .zip(a.iter())
-                        .filter(|(_, &v)| v == max_a)
-                        .map(|(i, _)| i)
-                        .collect();
-                    for i in kept {
-                        labels[i] = 3;
-                    }
-                }
-            }
-        }
-    }
-
     labels
 }
 
@@ -345,11 +392,35 @@ fn classify_chunk(raw_in: &[f32], nc: usize, ns: usize, fs: f64) -> Vec<u8> {
 // a background thread and polls `progress`/`cancel`.
 // ---------------------------------------------------------------------------
 
-/// Returns `None` if cancelled partway through.
+/// Channel indices of each shank, ordered by depth (then x), without `removed`.
+pub(crate) fn shank_groups(meta: &Meta, removed: &BTreeSet<usize>) -> Vec<Vec<usize>> {
+    let mut shanks: Vec<u32> = meta.channel_geom.iter().map(|g| g.shank).collect();
+    shanks.sort_unstable();
+    shanks.dedup();
+    shanks
+        .into_iter()
+        .map(|s| {
+            let mut chans: Vec<usize> = (0..meta.n_ap_chans)
+                .filter(|&c| !removed.contains(&c) && meta.channel_geom.get(c).map_or(false, |g| g.shank == s))
+                .collect();
+            chans.sort_by(|&a, &b| {
+                let (ga, gb) = (&meta.channel_geom[a], &meta.channel_geom[b]);
+                ga.y_um.partial_cmp(&gb.y_um).unwrap_or(std::cmp::Ordering::Equal)
+                    .then(ga.x_um.partial_cmp(&gb.x_um).unwrap_or(std::cmp::Ordering::Equal))
+            });
+            chans
+        })
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
+/// Returns `None` if cancelled partway through. Removed channels get label 0.
 pub fn classify_recording(
     raw: &RawData,
     meta: &Meta,
+    removed: &BTreeSet<usize>,
     n_chunks: usize,
+    outside_rule: OutsideRule,
     cancel: &AtomicBool,
     progress: &AtomicUsize,
 ) -> Option<Vec<u8>> {
@@ -357,6 +428,9 @@ pub fn classify_recording(
     let fs = meta.sample_rate;
     let total_dur = meta.n_samples as f64 / fs;
     let max_t0 = (total_dur - CLASSIFY_CHUNK_DUR_S).max(0.0);
+    let groups = shank_groups(meta, removed);
+    let is_ap = fs > 2600.0;
+    let hp = butter_highpass(3, if is_ap { 300.0 / fs * 2.0 } else { 1.0 / fs * 2.0 });
 
     // chunks are independent, so they're classified in parallel (each chunk's own
     // steps are parallel across channels too) on a pool that leaves cores free for
@@ -387,9 +461,16 @@ pub fn classify_recording(
                         if cancel.load(Ordering::Relaxed) {
                             return votes;
                         }
-                        let labels = classify_chunk(&chunk, nc, n_samp, fs);
-                        for (ch, &l) in labels.iter().enumerate() {
-                            votes[ch][l as usize] += 1;
+                        for group in &groups {
+                            // gather this shank's channels in depth order
+                            let mut sub = Vec::with_capacity(group.len() * n_samp);
+                            for &c in group {
+                                sub.extend_from_slice(&chunk[c * n_samp..(c + 1) * n_samp]);
+                            }
+                            let labels = classify_chunk(&sub, group.len(), n_samp, fs, &hp, outside_rule);
+                            for (&c, &l) in group.iter().zip(&labels) {
+                                votes[c][l as usize] += 1;
+                            }
                         }
                     }
                     progress.fetch_add(1, Ordering::Relaxed);
@@ -428,4 +509,22 @@ pub fn classify_recording(
         .collect();
 
     Some(final_labels)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outside_rules() {
+        // flat trend, then a steep drop over the top 30 channels
+        let mut x: Vec<f32> = vec![0.0; 70];
+        x.extend((0..30).map(|i| -0.1 - 0.04 * i as f32));
+        let fixed = outside_candidates(&x, OutsideRule::Fixed);
+        assert!(fixed.iter().all(|&i| x[i] < -0.75) && fixed.last() == Some(&99));
+        assert_eq!(fixed.len(), 30 - 17); // -0.1 - 0.04 i < -0.75  <=>  i > 16.25
+        let adaptive = outside_candidates(&x, OutsideRule::Adaptive);
+        assert!(!adaptive.is_empty() && adaptive.last() == Some(&99));
+        assert!(outside_candidates(&vec![0.0; 50], OutsideRule::Adaptive).is_empty());
+    }
 }

@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
 
 use crate::data::{open_data, ChannelOrder, DisplayRow, Meta, RawData, ShankOrder};
 use crate::preprocess::{Filters, PreprocConfig, SpatialFilter};
@@ -13,8 +12,8 @@ use crate::psth::{
 };
 use crate::render::{build_heatmap_into, build_psth_heatmap_into};
 use crate::worker::{
-    compute_half_window, spawn_worker, RequestKind, SharedCancel, SharedWorkerState, WorkerRequest,
-    WorkerState, WorkerStatus,
+    compute_half_window, request_shutdown, spawn_worker, RequestKind, SharedCancel,
+    SharedWorkerState, WorkerRequest, WorkerState, WorkerStatus,
 };
 
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -112,6 +111,12 @@ pub struct Preferences {
     /// channel-classification majority vote
     #[serde(default = "default_n_classify_chunks")]
     pub n_classify_chunks: usize,
+    /// how "outside of the brain" channels are detected (IBL fixed threshold / adaptive)
+    #[serde(default)]
+    pub classify_outside_rule: crate::channel_classify::OutsideRule,
+    /// heatmap: show each pixel column's extreme sample instead of its mean
+    #[serde(default = "default_true")]
+    pub peak_pooling: bool,
     /// total size (s) of the buffer loaded on initial load / full recompute; also the
     /// steady-state cap that incremental extension growth settles back to
     #[serde(default = "default_initial_buffer_s")]
@@ -176,8 +181,6 @@ struct PsthState {
     open: bool,
     stim_path: Option<PathBuf>,
     // staged settings (only committed to a recompute when "Apply settings" is pressed)
-    ch_first: usize,
-    ch_last: usize,
     start_ms: f64,
     end_ms: f64,
     start_ms_str: String,
@@ -223,12 +226,10 @@ struct PsthState {
 }
 
 impl PsthState {
-    fn new(ch_first: usize, ch_last: usize, total_s: f64) -> Self {
+    fn new(total_s: f64) -> Self {
         Self {
             open: false,
             stim_path: None,
-            ch_first,
-            ch_last,
             start_ms: -50.0,
             end_ms: 200.0,
             start_ms_str: "-50".to_string(),
@@ -312,21 +313,23 @@ fn spawn_png_saver(dir: Option<PathBuf>, default_name: String) -> mpsc::Receiver
     rx
 }
 
-/// Slider over 1-based channel positions that displays (and accepts typed) channel
-/// IDs from the meta file instead of positions.
-fn channel_slider<'a>(value: &'a mut usize, meta: &Arc<Meta>) -> egui::Slider<'a> {
-    let n = meta.n_ap_chans.max(1);
-    let (fmt_meta, parse_meta) = (Arc::clone(meta), Arc::clone(meta));
-    egui::Slider::new(value, 1..=n)
-        .custom_formatter(move |v, _| fmt_meta.channel_id((v as usize).saturating_sub(1)).to_string())
-        .custom_parser(move |s| {
-            let s = s.trim();
-            parse_meta
-                .channel_ids
-                .iter()
-                .position(|id| id.eq_ignore_ascii_case(s))
-                .map(|i| (i + 1) as f64)
-        })
+/// Index range (inclusive) of all display rows — the heatmap always shows every
+/// row that is not removed.
+fn all_rows(display_rows: &[DisplayRow]) -> (usize, usize) {
+    (0, display_rows.len().saturating_sub(1))
+}
+
+/// Channel IDs of the first and last data rows (bottom and top of the heatmap).
+fn edge_channel_ids<'a>(meta: &'a Meta, display_rows: &[DisplayRow]) -> (&'a str, &'a str) {
+    let first = display_rows.iter().find_map(|r| match r {
+        DisplayRow::Data { first_ch, .. } => Some(meta.channel_id(*first_ch)),
+        _ => None,
+    });
+    let last = display_rows.iter().rev().find_map(|r| match r {
+        DisplayRow::Data { first_ch, .. } => Some(meta.channel_id(*first_ch)),
+        _ => None,
+    });
+    (first.unwrap_or(""), last.unwrap_or(""))
 }
 
 /// Mirrors egui's internal (private) `menu::set_menu_style`, so a custom popup's
@@ -374,7 +377,7 @@ fn channel_row(result: &PsthResult, ch: usize) -> Option<usize> {
     })
 }
 
-/// 1-based channel number under a heatmap y coordinate (ch_last at top, ch_first at
+/// 1-based channel number under a heatmap y coordinate (last row at top, first row at
 /// bottom — matching `build_psth_heatmap_into`).
 fn channel_at_heatmap_y(result: &PsthResult, heat_rect: egui::Rect, y: f32) -> Option<usize> {
     let n_rows = result.display_rows.len();
@@ -400,8 +403,6 @@ pub struct NPXplorerApp {
     view_dur_s: f64,
     window_dur_str: String,
     jump_str: String,
-    ch_first: usize,
-    ch_last: usize,
 
     // preprocessing
     preproc_cfg: PreprocConfig,
@@ -452,6 +453,9 @@ pub struct NPXplorerApp {
     classify_progress: Arc<AtomicUsize>,
     /// user-configurable number of chunks for the majority vote (Preferences)
     classify_n_chunks: usize,
+    classify_outside_rule: crate::channel_classify::OutsideRule,
+    /// heatmap pixel columns show their extreme sample instead of their mean
+    peak_pooling: bool,
     /// snapshot of `classify_n_chunks` taken when the in-flight run was dispatched,
     /// so the progress bar stays correct even if the preference changes mid-run
     classify_run_total: usize,
@@ -475,10 +479,6 @@ pub struct NPXplorerApp {
     last_rendered_size: Option<[usize; 2]>,
     last_rendered_buf: Option<(usize, usize)>,
 
-    // smooth-scroll state
-    waiting_since: Option<Instant>,
-    last_requested_center: usize,
-
     // UI state
     pending_cfg_recompute: bool,
     pub file_dialog_request: bool,
@@ -500,8 +500,7 @@ pub struct NPXplorerApp {
 impl NPXplorerApp {
     pub fn new(ctx: &egui::Context, bin_path: PathBuf) -> anyhow::Result<Self> {
         let meta = Arc::new(Meta::from_data_path(&bin_path)?);
-        let (raw, _) = open_data(&bin_path, &meta)?;
-        let raw = Arc::new(raw);
+        let raw = Arc::new(open_data(&bin_path, &meta)?);
         let fs = meta.sample_rate;
 
         let prefs = Preferences::load();
@@ -513,7 +512,6 @@ impl NPXplorerApp {
             spatial_filter: SpatialFilter::GlobalCmr,
             avg_depths: true,
             sample_rate: fs,
-            im_dat_prb_type: meta.im_dat_prb_type,
             removed_channels: Default::default(),
             channel_order: Default::default(),
             shank_order: Default::default(),
@@ -534,13 +532,14 @@ impl NPXplorerApp {
         let mut mem_reserve_mb = default_mem_reserve_mb();
         let mut recent_files: Vec<PathBuf> = Vec::new();
         let mut n_classify_chunks = default_n_classify_chunks();
+        let mut classify_outside_rule = crate::channel_classify::OutsideRule::default();
+        let mut peak_pooling = true;
         let mut atlas_dir = None;
         let mut bregma_lambda_mm = default_bregma_lambda_mm();
 
         if let Some(p) = prefs {
             preproc_cfg = p.preproc_cfg;
             preproc_cfg.sample_rate = fs;
-            preproc_cfg.im_dat_prb_type = meta.im_dat_prb_type;
             view_dur_s = p.view_dur_s;
             color_mode = p.color_mode;
             color_pct = p.color_pct;
@@ -556,8 +555,16 @@ impl NPXplorerApp {
             mem_reserve_mb = p.mem_reserve_mb;
             recent_files = p.recent_files.iter().map(PathBuf::from).collect();
             n_classify_chunks = p.n_classify_chunks;
+            classify_outside_rule = p.classify_outside_rule;
+            peak_pooling = p.peak_pooling;
             atlas_dir = p.atlas_dir;
             bregma_lambda_mm = p.bregma_lambda_mm;
+        }
+
+        // reference sites carry no neural signal: start with them removed (listed in
+        // the Remove-channels dialog; Reset brings them back)
+        if meta.reference_channels.len() < meta.n_ap_chans {
+            preproc_cfg.removed_channels = meta.reference_channels.clone();
         }
 
         // move this recording to the front of the recent-files list (max 5)
@@ -613,10 +620,11 @@ impl NPXplorerApp {
 
         let is_compressed = bin_path.extension().and_then(|s| s.to_str()) == Some("cbin");
 
-        let n_ap = meta.n_ap_chans;
         let bin_path_for_atlas = bin_path.clone();
         let meta_for_atlas = Arc::clone(&meta);
         let psth_total_s = meta.n_samples as f64 / meta.sample_rate;
+        let remove_channels_text =
+            crate::channel_remove::format_channel_list(&preproc_cfg.removed_channels, &meta.channel_ids);
         let app = Self {
             bin_path,
             meta,
@@ -626,8 +634,6 @@ impl NPXplorerApp {
             view_dur_s,
             window_dur_str: format!("{:.3}", view_dur_s),
             jump_str: "0.000".to_string(),
-            ch_first: 0,
-            ch_last: n_ap.saturating_sub(1),
             preproc_cfg: preproc_cfg.clone(),
             preproc_filters: filters,
             scroll_speed_fine: true,
@@ -649,7 +655,7 @@ impl NPXplorerApp {
             waveform_channel: None,
             waveform_y_range_uv: 200.0,
             show_remove_channels: false,
-            remove_channels_text: String::new(),
+            remove_channels_text,
             remove_channels_error: None,
             remove_channels_pick_rx: None,
             channel_labels: None,
@@ -660,6 +666,8 @@ impl NPXplorerApp {
             classify_cancel: Arc::new(AtomicBool::new(false)),
             classify_progress: Arc::new(AtomicUsize::new(0)),
             classify_n_chunks: n_classify_chunks,
+            classify_outside_rule,
+            peak_pooling,
             classify_run_total: 0,
             worker_state: shared,
             worker_cancel: cancel,
@@ -676,8 +684,6 @@ impl NPXplorerApp {
             last_rendered_n: 0,
             last_rendered_size: None,
             last_rendered_buf: None,
-            waiting_since: None,
-            last_requested_center: 0,
             pending_cfg_recompute: false,
             file_dialog_request: false,
             open_recent_request: None,
@@ -688,12 +694,23 @@ impl NPXplorerApp {
             proj_threshold: 0.0,
             proj_sigma: 0.0,
             proj_cfg: None,
-            psth: PsthState::new(0, n_ap.saturating_sub(1), psth_total_s),
+            psth: PsthState::new(psth_total_s),
             atlas: crate::atlas_ui::AtlasUi::new(&bin_path_for_atlas, &meta_for_atlas, atlas_dir, bregma_lambda_mm),
         };
         app.save_prefs();
         Ok(app)
     }
+}
+
+impl Drop for NPXplorerApp {
+    /// Stop the worker thread when the recording is closed, so its thread pool, the
+    /// preprocessed buffer and the mapped data file are released.
+    fn drop(&mut self) {
+        request_shutdown(&self.worker_state, &self.worker_cancel, &self.preproc_cfg);
+    }
+}
+
+impl NPXplorerApp {
 
     pub fn save_prefs(&self) {
         let last_dir = self
@@ -712,6 +729,8 @@ impl NPXplorerApp {
             spike_overlay_scale: self.spike_overlay_scale,
             spike_smoothing_sigma: self.spike_smoothing_sigma,
             n_classify_chunks: self.classify_n_chunks,
+            classify_outside_rule: self.classify_outside_rule,
+            peak_pooling: self.peak_pooling,
             initial_buffer_s: self.initial_buffer_s,
             extension_margin_s: self.extension_margin_s,
             mem_pressure_pct: self.mem_pressure_pct,
@@ -760,6 +779,12 @@ impl NPXplorerApp {
     // -----------------------------------------------------------------------
 
     fn apply_removed_channels(&mut self, set: BTreeSet<usize>) {
+        let n_left = (0..self.meta.n_ap_chans).filter(|c| !set.contains(c)).count();
+        if n_left == 0 {
+            self.remove_channels_error =
+                Some("this would remove every channel — at least one must stay".to_string());
+            return;
+        }
         self.preproc_cfg.removed_channels = set;
         self.heatmap_texture = None;
         self.pending_cfg_recompute = true;
@@ -888,13 +913,15 @@ impl NPXplorerApp {
 
         let raw = Arc::clone(&self.raw);
         let meta = Arc::clone(&self.meta);
+        let removed = self.preproc_cfg.removed_channels.clone();
         let n_chunks = self.classify_n_chunks.max(1);
+        let outside_rule = self.classify_outside_rule;
         self.classify_run_total = n_chunks;
         let ctx = ctx.clone();
 
         std::thread::spawn(move || {
             let res = crate::channel_classify::classify_recording(
-                &raw, &meta, n_chunks, &cancel, &progress,
+                &raw, &meta, &removed, n_chunks, outside_rule, &cancel, &progress,
             )
             .ok_or_else(|| "cancelled".to_string());
             let _ = tx.send(res);
@@ -1244,8 +1271,6 @@ impl NPXplorerApp {
         let meta = Arc::clone(&self.meta);
         let cfg = self.preproc_cfg.clone();
         let params = PsthParams {
-            ch_first: self.psth.ch_first,
-            ch_last: self.psth.ch_last,
             start_ms: self.psth.start_ms,
             end_ms: self.psth.end_ms,
         };
@@ -1328,29 +1353,6 @@ impl NPXplorerApp {
     }
 
     // -----------------------------------------------------------------------
-    // resolve channel slider values → indices into display_rows
-    // -----------------------------------------------------------------------
-
-    /// Find the display_row index range corresponding to ch_first..ch_last.
-    fn visible_row_range(&self, display_rows: &[DisplayRow]) -> (usize, usize) {
-        let mut first_idx = 0usize;
-        let mut last_idx = display_rows.len().saturating_sub(1);
-        let mut found_first = false;
-        for (i, row) in display_rows.iter().enumerate() {
-            if let DisplayRow::Data { first_ch, .. } = row {
-                if !found_first && *first_ch >= self.ch_first {
-                    first_idx = i;
-                    found_first = true;
-                }
-                if *first_ch <= self.ch_last {
-                    last_idx = i;
-                }
-            }
-        }
-        (first_idx, last_idx)
-    }
-
-    // -----------------------------------------------------------------------
     // UI panels
     // -----------------------------------------------------------------------
 
@@ -1378,6 +1380,13 @@ impl NPXplorerApp {
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
+            ))
+            .on_hover_text(format!(
+                "{}\nprobe type {}, {} channels, {:.0} Hz",
+                self.bin_path.display(),
+                self.meta.im_dat_prb_type,
+                self.meta.n_ap_chans,
+                self.meta.sample_rate
             ));
             ui.separator();
             // window duration text field — stored separately to avoid overwrite each frame
@@ -1553,34 +1562,11 @@ impl NPXplorerApp {
                 self.heatmap_texture = None;
                 self.pending_cfg_recompute = true;
             }
-
-            // computing spinner
-            let _status = {
-                let (lock, _) = &*self.worker_state;
-                lock.lock().unwrap().status.clone()
-            };
         });
     }
 
     fn draw_channel_controls(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.label("Channels:");
-            let mut cf = self.ch_first + 1;
-            let mut cl = self.ch_last + 1;
-            let mut changed = false;
-            changed |= ui
-                .add(channel_slider(&mut cf, &self.meta).text("First"))
-                .changed();
-            changed |= ui
-                .add(channel_slider(&mut cl, &self.meta).text("Last"))
-                .changed();
-            if changed {
-                self.ch_first = (cf - 1).min(cl - 1);
-                self.ch_last = (cl - 1).max(cf - 1);
-                self.heatmap_texture = None;
-            }
-
-            ui.separator();
             ui.label("Jump to (s):");
             let resp = ui.add(egui::TextEdit::singleline(&mut self.jump_str).desired_width(70.0));
             if resp.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -1609,9 +1595,8 @@ impl NPXplorerApp {
             let mut ch2_visible = false;
 
             if let Some(rows) = &display_rows_arc {
-                let (first_row, last_row) = self.visible_row_range(rows);
-                for r in first_row..=last_row {
-                    if let DisplayRow::Data { first_ch, .. } = &rows[r] {
+                for r in rows.iter() {
+                    if let DisplayRow::Data { first_ch, .. } = r {
                         let ch = *first_ch + 1;
                         if Some(ch) == self.selected_channel_1 {
                             ch1_visible = true;
@@ -1689,6 +1674,13 @@ impl NPXplorerApp {
                     egui::Color32::YELLOW,
                     "Reading from compressed .cbin is slower",
                 );
+            }
+
+            // values the metadata did not provide (gain, geometry, ...)
+            for w in &self.meta.warnings {
+                ui.separator();
+                ui.colored_label(egui::Color32::from_rgb(0xff, 0xcc, 0x55), format!("⚠ {w}"))
+                    .on_hover_text(w);
             }
         });
     }
@@ -1848,23 +1840,6 @@ impl NPXplorerApp {
             });
 
             ui.horizontal(|ui| {
-                ui.label("Channels:");
-                let mut cf = self.psth.ch_first + 1;
-                let mut cl = self.psth.ch_last + 1;
-                let mut changed = false;
-                changed |= ui
-                    .add(channel_slider(&mut cf, &self.meta).text("First"))
-                    .changed();
-                changed |= ui
-                    .add(channel_slider(&mut cl, &self.meta).text("Last"))
-                    .changed();
-                if changed {
-                    self.psth.ch_first = (cf - 1).min(cl - 1);
-                    self.psth.ch_last = (cl - 1).max(cf - 1);
-                }
-
-                ui.separator();
-
                 // stimulus time-range selector (seconds)
                 ui.label("Stim time (s):");
                 let r1 = ui.add(
@@ -2103,7 +2078,7 @@ impl NPXplorerApp {
         };
         let size_changed = self.psth.last_tex_size != Some([pw, ph]);
         if self.psth.tex_dirty || size_changed || self.psth.texture.is_none() {
-            build_psth_heatmap_into(&mut self.psth.pixel_buf, result, pw, ph, vmax, cmap);
+            build_psth_heatmap_into(&mut self.psth.pixel_buf, result, pw, ph, vmax, self.peak_pooling, cmap);
             let img = egui::ColorImage::from_rgba_unmultiplied([pw, ph], &self.psth.pixel_buf);
             self.psth.texture = Some(ui.ctx().load_texture(
                 "psth_heatmap",
@@ -2279,17 +2254,18 @@ impl NPXplorerApp {
             fid.clone(),
             txt,
         );
+        let (bottom_id, top_id) = edge_channel_ids(&self.meta, &result.display_rows);
         painter.text(
             egui::pos2(rect.left() + 2.0, heat_rect.top() + 2.0),
             egui::Align2::LEFT_TOP,
-            self.meta.channel_id(self.psth.ch_last),
+            top_id,
             fid.clone(),
             txt,
         );
         painter.text(
             egui::pos2(rect.left() + 2.0, heat_rect.bottom() - 2.0),
             egui::Align2::LEFT_BOTTOM,
-            self.meta.channel_id(self.psth.ch_first),
+            bottom_id,
             fid.clone(),
             txt,
         );
@@ -2376,6 +2352,16 @@ impl NPXplorerApp {
                             self.psth.tex_dirty = true; // PSTH heatmap tracks the same colormap
                         }
                     });
+
+                    if ui
+                        .checkbox(&mut self.peak_pooling, "Peak pooling")
+                        .on_hover_text("How a heatmap pixel column shows the many samples it covers (e.g. ~11 samples per column in a 0.5 s window, ~200 in a 10 s window).\n\nOn (peak): each column shows the sample with the largest magnitude, sign kept. A spike keeps its full amplitude at any window length, like an oscilloscope's min/max display. The background looks noisier at long windows, and in %ile mode the colour range follows the values on screen.\n\nOff (mean): each column shows the average of its samples. Smooth, but it acts as a lowpass: a -100 µV spike fades to about -5 µV in a 10 s window, so mostly the LFP remains visible.")
+                        .changed()
+                    {
+                        self.heatmap_texture = None;
+                        self.psth.tex_dirty = true;
+                        self.save_prefs();
+                    }
 
                     ui.separator();
                     ui.label(egui::RichText::new("Channel layout").strong());
@@ -2479,6 +2465,27 @@ impl NPXplorerApp {
                              more robust but slower"
                         ).small().color(egui::Color32::GRAY)
                     );
+
+                    ui.horizontal(|ui| {
+                        use crate::channel_classify::OutsideRule;
+                        ui.label("Outside of brain:").on_hover_text("How channels outside the brain are found, from each channel's low-frequency similarity to its neighbours (xcor_lf; strongly negative above the brain surface). Only a run of such channels reaching the top of the shank is labelled.\n\nAdaptive (default): the threshold is taken where the smoothed similarity trend drops most steeply along the shank (IBL's optional 'adaptive' mode). Finds the brain surface even when the contrast is weak, e.g. in LFP recordings.\n\nFixed threshold: xcor_lf < -0.75, the default of IBL's ibldsp. Stricter; can miss the surface entirely.");
+                        let mut rule = self.classify_outside_rule;
+                        egui::ComboBox::from_id_salt("outside_rule_combo")
+                            .selected_text(match rule {
+                                OutsideRule::Fixed => "Fixed threshold (IBL)",
+                                OutsideRule::Adaptive => "Adaptive (default)",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut rule, OutsideRule::Fixed, "Fixed threshold (IBL)");
+                                ui.selectable_value(&mut rule, OutsideRule::Adaptive, "Adaptive (default)");
+                            })
+                            .response
+                            .on_hover_text("How channels outside the brain are found, from each channel's low-frequency similarity to its neighbours (xcor_lf; strongly negative above the brain surface). Only a run of such channels reaching the top of the shank is labelled.\n\nAdaptive (default): the threshold is taken where the smoothed similarity trend drops most steeply along the shank (IBL's optional 'adaptive' mode). Finds the brain surface even when the contrast is weak, e.g. in LFP recordings.\n\nFixed threshold: xcor_lf < -0.75, the default of IBL's ibldsp. Stricter; can miss the surface entirely.");
+                        if rule != self.classify_outside_rule {
+                            self.classify_outside_rule = rule;
+                            self.save_prefs();
+                        }
+                    });
 
                     ui.separator();
                     ui.label(egui::RichText::new("Buffer").strong());
@@ -2653,13 +2660,13 @@ impl NPXplorerApp {
                     let status = st.status.clone();
                     let has_req = st.request.is_some();
                     let req_cc = st.request.as_ref().and_then(|r| {
-                        if let RequestKind::Full { center_sample, .. } = &r.kind {
-                            Some((*center_sample, r.cfg.clone()))
+                        if let RequestKind::Full { center_sample, half_window } = &r.kind {
+                            Some((*center_sample, *half_window, r.cfg.clone()))
                         } else { None }
                     });
                     let act_cc = st.active_request.as_ref().and_then(|r| {
-                        if let RequestKind::Full { center_sample, .. } = &r.kind {
-                            Some((*center_sample, r.cfg.clone()))
+                        if let RequestKind::Full { center_sample, half_window } = &r.kind {
+                            Some((*center_sample, *half_window, r.cfg.clone()))
                         } else { None }
                     });
 
@@ -2685,11 +2692,15 @@ impl NPXplorerApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(50));
                 }
 
-                // compute vmax from current UI settings — valid whenever cfg matches,
+                // colour range from current UI settings — valid whenever cfg matches,
                 // regardless of exact time coverage (percentile table covers whatever's
-                // currently in the buffer)
+                // currently in the buffer). With peak pooling the %ile is taken from the
+                // pooled values on screen instead: pooled extremes sit well above the raw
+                // samples' percentiles, so a raw-sample range would saturate the map.
                 let vmax = if matches_cfg {
-                    if self.color_mode == ColorMode::Percentile {
+                    if self.color_mode == ColorMode::Percentile && self.peak_pooling {
+                        0.0 // unused: ColorScale::ViewPercentile below
+                    } else if self.color_mode == ColorMode::Percentile {
                         // need percentile table — quick lock just for the lookup
                         let (lock, _) = &*self.worker_state;
                         let st = lock.lock().unwrap();
@@ -2701,10 +2712,6 @@ impl NPXplorerApp {
                         self.color_uv.max(1.0)
                     }
                 } else { 250.0 };
-
-                if matches_view {
-                    self.waiting_since = None;
-                }
 
                 // Rebuild whenever we have a cfg-matching buffer, rendering whatever time
                 // overlap exists and letting build_heatmap_into background-fill the rest —
@@ -2725,7 +2732,7 @@ impl NPXplorerApp {
                         if let (Some(data_arc), Some(display_rows)) = (&buf_data, &buf_display_rows) {
                             let stride = buf_n_samp;
 
-                            let (first_row, last_row) = self.visible_row_range(display_rows);
+                            let (first_row, last_row) = all_rows(display_rows);
 
                             // spike projection over whatever time overlap currently exists
                             // between the view and the buffer (may be partial or none)
@@ -2813,17 +2820,26 @@ impl NPXplorerApp {
                                 self.proj_cfg = Some(self.preproc_cfg.clone());
                             }
 
+                            let scale = if self.color_mode == ColorMode::Percentile && self.peak_pooling {
+                                crate::render::ColorScale::ViewPercentile(self.color_pct)
+                            } else {
+                                crate::render::ColorScale::Fixed(vmax)
+                            };
                             build_heatmap_into(
                                 &mut self.pixel_buf,
                                 data_arc,
                                 display_rows,
-                                first_row, last_row,
                                 stride, buf_first, buf_n_samp, view_first, view_n,
-                                pw, ph, vmax,
+                                pw, ph, scale, self.peak_pooling,
                                 &self.colormap_choice,
                             );
                             let img = egui::ColorImage::from_rgba_unmultiplied([pw, ph], &self.pixel_buf);
-                            self.heatmap_texture = Some(ctx.load_texture("heatmap", img, TextureOptions::NEAREST));
+                            // update the existing GPU texture in place while the size is
+                            // unchanged (every scroll frame) instead of allocating a new one
+                            match &mut self.heatmap_texture {
+                                Some(tex) if !size_changed => tex.set(img, TextureOptions::NEAREST),
+                                _ => self.heatmap_texture = Some(ctx.load_texture("heatmap", img, TextureOptions::NEAREST)),
+                            }
                             self.last_rendered_first = view_first;
                             self.last_rendered_n = view_n;
                             self.last_rendered_cfg = buf_cfg;
@@ -2836,21 +2852,28 @@ impl NPXplorerApp {
                 // request new background computation if needed (uses snapshot for checks, locks only for writes)
                 let mut requested_new = false;
                 if !matches_view || !matches_cfg || self.pending_cfg_recompute {
-                    let already_requested = {
-                        let req_match = req_center_cfg.as_ref().map_or(false, |(c, cfg)| *c == center && *cfg == self.preproc_cfg);
-                        let act_match = act_center_cfg.as_ref().map_or(false, |(c, cfg)| *c == center && *cfg == self.preproc_cfg);
-                        req_match || act_match
+                    // a queued or running full recompute is good enough if it has the
+                    // current config and buffer size and its window covers the view plus
+                    // the extension margin — re-requesting on every scroll frame would
+                    // cancel it each time and nothing would ever finish
+                    let fs = self.meta.sample_rate;
+                    let margin = (self.extension_margin_s * fs) as usize;
+                    let need_lo = view_first.saturating_sub(margin);
+                    let need_hi = (view_first + view_n + margin).min(self.meta.n_samples);
+                    let adequate = |c: usize, hw: usize, cfg: &PreprocConfig| {
+                        *cfg == self.preproc_cfg
+                            && hw == self.worker_half_window
+                            && c.saturating_sub(hw) <= need_lo
+                            && (c + hw).min(self.meta.n_samples) >= need_hi
                     };
+                    let already_requested = req_center_cfg.as_ref().map_or(false, |(c, hw, cfg)| adequate(*c, *hw, cfg))
+                        || act_center_cfg.as_ref().map_or(false, |(c, hw, cfg)| adequate(*c, *hw, cfg));
 
                     if !already_requested {
                         file_log!("UI: Requesting recompute. matches_view={}, matches_cfg={}, pending_cfg={}, center={}", matches_view, matches_cfg, self.pending_cfg_recompute, center);
                         file_log!("UI: buf first={}, n={}, view_first={}, view_n={}", buf_first, buf_n_samp, view_first, view_n);
                         self.request_recompute();
-                        self.last_requested_center = center;
                         requested_new = true;
-                    }
-                    if !matches_view && self.waiting_since.is_none() {
-                        self.waiting_since = Some(Instant::now());
                     }
                 }
 
@@ -2947,8 +2970,8 @@ impl NPXplorerApp {
                         }
                     }
 
-                    if let Some(display_rows) = &buf_display_rows {
-                        let (first_row, last_row) = self.visible_row_range(display_rows);
+                    if let Some(display_rows) = buf_display_rows.as_ref().filter(|r| !r.is_empty()) {
+                        let (first_row, last_row) = all_rows(display_rows);
                         let n_rows = last_row.saturating_sub(first_row) + 1;
 
                         // handle clicks
@@ -3200,8 +3223,8 @@ impl NPXplorerApp {
                     });
 
                     if let Some(pos) = hover_pos {
-                        if let Some(display_rows) = &buf_display_rows {
-                            let (first_row, last_row) = self.visible_row_range(display_rows);
+                        if let Some(display_rows) = buf_display_rows.as_ref().filter(|r| !r.is_empty()) {
+                            let (first_row, last_row) = all_rows(display_rows);
                             let n_rows = last_row.saturating_sub(first_row) + 1;
 
                             let frac_y = ((pos.y - resp.rect.top()) / resp.rect.height()).clamp(0.0, 1.0);

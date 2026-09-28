@@ -26,7 +26,8 @@ Channels are named as in the recording's metadata (e.g. `AP12` for SpikeGLX, `CH
 - **Window**: length of the displayed time window in seconds.
 - **Jump to (s)**: go to a time.
 - Click the **navigation bar** at the bottom to jump anywhere. The solid marker shows the displayed window, the shaded area the part that is already preprocessed.
-- **Channels First/Last**: show only a range of channels.
+
+The heatmap always shows every channel that is not removed (see **Removing channels**). The status bar lists anything the recording's metadata did not provide (e.g. an unknown probe type, whose gain and electrode positions are then assumed), so you know when µV values or depths are nominal.
 
 ### Selecting channels
 
@@ -37,20 +38,25 @@ Channels are named as in the recording's metadata (e.g. `AP12` for SpikeGLX, `CH
 
 **Remove channels…** in the top bar excludes channels from the display and from all processing. Enter channel IDs or ranges separated by commas (e.g. `AP3,AP17,AP40-AP50`) and press **Apply** or Enter; a bare number (`17`, `40-50`) matches the channels whose ID ends in that number. **Load from file…** reads the list from a `.csv`/`.txt`/`.tsv`/`.dat` file, using a layout file like the PSTH one (see below): `channel_remove_layout.csv` next to the list file, or the default in `config/`. **Reset** clears the list.
 
+When a recording is opened, the list starts with the probe's reference sites, which carry no neural signal (e.g. channel 191 on NP 1.0): those SpikeGLX marks as unused in its geometry map, and those Open Ephys lists without a position. **Reset** includes them again.
+
 ### Preprocessing
 
 The second toolbar row sets the preprocessing applied to the display:
 
 - **DC**: remove each channel's mean.
-- **Phase Shift**: correct the sampling delay between channels.
-- **300 Hz HP**: highpass filter (always on with Destripe).
-- **Spatial**: **Off**, **Global CMR** (subtract the median of all channels), **Local CMR** (median of nearby channels), or **Destripe** (IBL-style).
+- **Phase Shift**: correct the sampling delay between channels. Channels sharing an ADC are digitised one after another within each sample period; the delay of every channel is taken from the recording's `~muxTbl` (SpikeGLX) or from the probe type, and removed with a windowed-sinc fractional-delay filter on each raw channel before any averaging.
+- **300 Hz HP**: zero-phase highpass filter (always on with Destripe).
+- **Spatial**: **Off**, **Global CMR** (subtract the median of all channels of the shank), **Local CMR** (median of nearby channels), or **Destripe** (IBL-style). Destripe's spatial filter runs along physical depth over each stretch of neighbouring electrodes — it never mixes channels across a gap in the layout (drawn as a dotted line) or across shanks, whatever the display order.
 - **Avg adjacent chans**: average channels at the same depth into one row.
+
+Voltages are scaled per channel from the metadata: SpikeGLX gains from `~imroTbl` (or `imChan0apGain`, or the fixed gain of the probe type), Open Ephys `bit_volts`.
 
 ### Color scale
 
 - **%ile**: the color range follows a percentile of the displayed voltages; **±µV**: a fixed range. **Alt + scroll** adjusts either.
 - **Colormap** (Preferences): Ice-Fire, Yellow-Magenta, Red-Blue, Orange-Blue, Vanimo, Greyscale, Cool-Warm.
+- **Peak pooling** (Preferences, on by default): when a pixel column covers many samples (long windows), it shows the sample with the largest magnitude instead of the mean, so spikes keep their amplitude at any window length. In **%ile** mode the colour range then follows the values on screen. Turn it off for a smoother, mean-based picture (better for LFP).
 
 ### Firing rate overlay
 
@@ -65,7 +71,7 @@ In Preferences:
 
 ### Channel classification
 
-**Channel Classification** in the top bar marks dead (magenta), noisy (red) and out-of-brain (green) channels with a colored stripe. A progress bar with **Abort** shows while it runs. The box in the heatmap's top-right corner shows the legend; its **Chan classification overlay** button shows or hides the stripes. **Chunks to sample** in Preferences sets how many snippets of the recording are used (more is more reliable but slower).
+**Channel Classification** in the top bar marks dead (magenta), noisy (red) and out-of-brain (green) channels with a colored stripe. Each shank is classified on its own with the channels in depth order; removed channels are skipped. **Outside of brain** (Preferences) chooses how the brain surface is found: **Adaptive** (default; IBL's adaptive mode, finds weaker surfaces, e.g. in LFP data) or **Fixed threshold** (IBL's default, stricter). A progress bar with **Abort** shows while it runs. The box in the heatmap's top-right corner shows the legend; its **Chan classification overlay** button shows or hides the stripes. **Chunks to sample** in Preferences sets how many snippets of the recording are used (more is more reliable but slower).
 
 ### Atlas registration
 
@@ -95,9 +101,9 @@ The coordinates and dragged borders are saved in `<recording>.npx_atlas.toml` ne
 
 ### PSTH (peri-stimulus average)
 
-Click **PSTH** and pick a file with stimulus onset times in seconds (`.csv`, `.txt`, `.tsv`, `.dat`). The window shows the average signal around the stimuli, using the main window's preprocessing: traces of selected channels, the mean over the channel range, and a heatmap.
+Click **PSTH** and pick a file with stimulus onset times in seconds (`.csv`, `.txt`, `.tsv`, `.dat`). The window shows the average signal around the stimuli for all channels that are not removed, using the main window's preprocessing: traces of selected channels, the mean over all channels, and a heatmap.
 
-Set **Channels**, **Stim time (s)** (which stimuli to include), **Window (ms)** (e.g. −50 to 200) and the color scale, then press **Apply settings**. A progress bar with **Abort** shows while it computes. **Left-click / right-click** the heatmap to plot up to two channels; **Deselect** clears them. **Export PNG…** saves the plots.
+Set **Stim time (s)** (which stimuli to include), **Window (ms)** (e.g. −50 to 200) and the color scale, then press **Apply settings**. A progress bar with **Abort** shows while it computes. **Left-click / right-click** the heatmap to plot up to two channels; **Deselect** clears them. **Export PNG…** saves the plots.
 
 The stimulus file is read according to a layout file. Its lines mirror the stim file: lines without an `o` are header rows to skip, and the first line with an `o` marks the column(s) holding the onset times (`x` = ignore). For example
 
@@ -126,3 +132,4 @@ cargo build --release
 
 - `.cbin` files are slower to navigate, since they are decompressed on the fly.
 - Open Ephys: only the first probe of a `settings.xml` processor is used; multi-shank probes and multi-experiment/multi-recording sessions are untested.
+- SpikeGLX recordings older than 20230202 have no `~snsGeomMap`; electrode positions are then rebuilt from `~snsShankMap` and the probe type's pitch. Unknown probe types fall back to a nominal single column at 20 µm and a warning in the status bar.

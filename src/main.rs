@@ -36,8 +36,11 @@ mod data;
 mod geometry;
 mod mtscomp;
 mod preprocess;
+mod probe;
 mod psth;
 mod render;
+#[cfg(test)]
+mod realdata_tests;
 mod worker;
 
 use clap::Parser;

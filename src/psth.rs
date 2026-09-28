@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering, AtomicUsize};
 
 use crate::data::{DisplayRow, Meta, RawData};
 use crate::preprocess::{Filters, PreprocConfig, preprocess};
-use crate::worker::{average_depth_rows, compute_thread_count};
+use crate::worker::compute_thread_count;
 
 // ---------------------------------------------------------------------------
 // Encoding-robust text reading
@@ -179,15 +179,13 @@ pub fn resolve_layout(stim_path: &Path, default_layout_path: &Path) -> Result<St
 
 #[derive(Clone, Debug)]
 pub struct PsthParams {
-    pub ch_first: usize,
-    pub ch_last: usize,
     pub start_ms: f64,
     pub end_ms: f64,
 }
 
 pub struct PsthResult {
-    /// selected display rows (Data + Gap/Boundary), Data rows remapped so `data_idx`
-    /// is 0-based within this subset and indexes `data`
+    /// the display rows (Data + Gap/Boundary) the PSTH was computed for; Data rows'
+    /// `data_idx` indexes `data`
     pub display_rows: Vec<DisplayRow>,
     pub n_win: usize,  // number of time samples per row
     pub data: Vec<f32>, // n_rows * n_win, row-major (µV, averaged over stimuli)
@@ -243,42 +241,10 @@ pub fn compute_psth(
     // sides; 0.15 s is comfortably longer than either transient
     let pad = (0.15 * fs).round() as i64;
 
-    let display_rows_full = Arc::new(meta.build_display_rows(cfg.avg_depths, &cfg.removed_channels, cfg.channel_order, cfg.shank_order));
-    let data_rows: Vec<usize> = display_rows_full
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| matches!(r, DisplayRow::Data { .. }))
-        .map(|(i, _)| i)
-        .collect();
-    let n_data_rows_full = data_rows.len();
-
-    // display-row index range covering the selected channels (same rule as the main view)
-    let (first_disp, last_disp) = select_display_range(&display_rows_full, params.ch_first, params.ch_last);
-
-    // map to the contiguous data_idx range within the full buffer, and build the
-    // selected display-row subset with remapped data_idx
-    let mut sel_display_rows = Vec::new();
-    let mut sel_data_idxs = Vec::new(); // full-buffer data_idx for each selected Data row
-    for row in &display_rows_full[first_disp..=last_disp] {
-        match row {
-            DisplayRow::Data { data_idx, channels, first_ch, x_um, y_um, shank } => {
-                let new_idx = sel_data_idxs.len();
-                sel_data_idxs.push(*data_idx);
-                sel_display_rows.push(DisplayRow::Data {
-                    data_idx: new_idx,
-                    channels: channels.clone(),
-                    first_ch: *first_ch,
-                    x_um: *x_um,
-                    y_um: *y_um,
-                    shank: *shank,
-                });
-            }
-            other => sel_display_rows.push(other.clone()),
-        }
-    }
-    let n_rows = sel_data_idxs.len();
+    let display_rows = Arc::new(meta.build_display_rows(cfg.avg_depths, &cfg.removed_channels, cfg.channel_order, cfg.shank_order));
+    let n_rows = display_rows.iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
     if n_rows == 0 {
-        bail!("the selected channel range contains no channels.");
+        bail!("no channels left to average (all channels are removed).");
     }
 
     // stimuli whose full padded window fits inside the recording
@@ -316,13 +282,12 @@ pub fn compute_psth(
                     }
                     let read_first = (onset + w_start - pad) as usize;
                     let read_n = n_win + 2 * pad as usize;
-                    let raw_chunk = raw.read_chunk_uv(read_first, read_n, meta);
-                    let mut data = average_depth_rows(&raw_chunk, read_n, &display_rows_full);
-                    preprocess(&mut data, read_n, cfg, &filt, cancel, &display_rows_full);
-                    debug_assert_eq!(data.len(), n_data_rows_full * read_n);
-                    // extract the aligned [pad .. pad+n_win] segment for the selected rows
-                    for (r, &full_idx) in sel_data_idxs.iter().enumerate() {
-                        let src = full_idx * read_n + pad as usize;
+                    let mut data = raw.read_rows(read_first, read_n, meta, &display_rows, cfg.phase_shift);
+                    preprocess(&mut data, read_n, cfg, &filt, cancel, &display_rows, None);
+                    debug_assert_eq!(data.len(), n_rows * read_n);
+                    // extract the aligned [pad .. pad+n_win] segment of every row
+                    for r in 0..n_rows {
+                        let src = r * read_n + pad as usize;
                         let dst = r * n_win;
                         let src_row = &data[src..src + n_win];
                         let dst_row = &mut acc[dst..dst + n_win];
@@ -369,7 +334,7 @@ pub fn compute_psth(
     abs_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     Ok(PsthResult {
-        display_rows: sel_display_rows,
+        display_rows: (*display_rows).clone(),
         n_win,
         data,
         avg_trace,
@@ -379,29 +344,6 @@ pub fn compute_psth(
         n_skipped,
         abs_sorted,
     })
-}
-
-/// display-row index range (inclusive) covering channels [ch_first, ch_last],
-/// mirroring `NPXplorerApp::visible_row_range`.
-fn select_display_range(display_rows: &[DisplayRow], ch_first: usize, ch_last: usize) -> (usize, usize) {
-    let mut first_idx = 0usize;
-    let mut last_idx = display_rows.len().saturating_sub(1);
-    let mut found_first = false;
-    for (i, row) in display_rows.iter().enumerate() {
-        if let DisplayRow::Data { first_ch, .. } = row {
-            if !found_first && *first_ch >= ch_first {
-                first_idx = i;
-                found_first = true;
-            }
-            if *first_ch <= ch_last {
-                last_idx = i;
-            }
-        }
-    }
-    if last_idx < first_idx {
-        last_idx = first_idx;
-    }
-    (first_idx, last_idx)
 }
 
 // ---------------------------------------------------------------------------
