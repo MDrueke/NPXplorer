@@ -115,7 +115,7 @@ pub struct Preferences {
     #[serde(default)]
     pub classify_outside_rule: crate::channel_classify::OutsideRule,
     /// heatmap: show each pixel column's extreme sample instead of its mean
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub peak_pooling: bool,
     /// total size (s) of the buffer loaded on initial load / full recompute; also the
     /// steady-state cap that incremental extension growth settles back to
@@ -533,7 +533,7 @@ impl NPXplorerApp {
         let mut recent_files: Vec<PathBuf> = Vec::new();
         let mut n_classify_chunks = default_n_classify_chunks();
         let mut classify_outside_rule = crate::channel_classify::OutsideRule::default();
-        let mut peak_pooling = true;
+        let mut peak_pooling = false;
         let mut atlas_dir = None;
         let mut bregma_lambda_mm = default_bregma_lambda_mm();
 
@@ -1455,39 +1455,9 @@ impl NPXplorerApp {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.scope(|ui| {
-                    zero_item_gap(ui);
-                    if ui.button("Preferences").clicked() {
-                        self.show_preferences = !self.show_preferences;
-                    }
-                    ui.add(egui::Separator::default().vertical().spacing(1.0));
-                    if ui.button("Remove channels…").clicked() {
-                        self.show_remove_channels = !self.show_remove_channels;
-                    }
-                    ui.add(egui::Separator::default().vertical().spacing(1.0));
-                    if ui
-                        .add_enabled(
-                            !self.classifying,
-                            egui::Button::new("Channel Classification"),
-                        )
-                        .clicked()
-                    {
-                        self.dispatch_classify(ui.ctx());
-                    }
-                    ui.add(egui::Separator::default().vertical().spacing(1.0));
-                    if ui.button("Atlas Registration").clicked() {
-                        self.atlas.open = !self.atlas.open;
-                    }
-                    ui.add(egui::Separator::default().vertical().spacing(1.0));
-                    if ui.button("PSTH").clicked() {
-                        self.psth.open = true;
-                        if self.psth.pick_rx.is_none() {
-                            self.psth.pick_rx = Some(spawn_stim_picker(
-                                self.bin_path.parent().map(|p| p.to_path_buf()),
-                            ));
-                        }
-                    }
-                });
+                if ui.button("Preferences").clicked() {
+                    self.show_preferences = !self.show_preferences;
+                }
             });
         });
     }
@@ -1562,25 +1532,58 @@ impl NPXplorerApp {
                 self.heatmap_texture = None;
                 self.pending_cfg_recompute = true;
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // right-to-left: the field goes first so the label ends up left of it
+                let resp = ui.add(egui::TextEdit::singleline(&mut self.jump_str).desired_width(70.0));
+                ui.label("Jump to (s):");
+                if resp.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if let Ok(t) = self.jump_str.trim().parse::<f64>() {
+                        let max_t =
+                            self.meta.n_samples as f64 / self.meta.sample_rate - self.view_dur_s;
+                        self.view_start_s = t.clamp(0.0, max_t.max(0.0));
+                    }
+                    self.jump_str = format!("{:.3}", self.view_start_s);
+                }
+                // keep jump field synced when not being edited
+                if !resp.has_focus() {
+                    self.jump_str = format!("{:.3}", self.view_start_s);
+                }
+            });
         });
     }
 
     fn draw_channel_controls(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.label("Jump to (s):");
-            let resp = ui.add(egui::TextEdit::singleline(&mut self.jump_str).desired_width(70.0));
-            if resp.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if let Ok(t) = self.jump_str.trim().parse::<f64>() {
-                    let max_t =
-                        self.meta.n_samples as f64 / self.meta.sample_rate - self.view_dur_s;
-                    self.view_start_s = t.clamp(0.0, max_t.max(0.0));
+            ui.scope(|ui| {
+                zero_item_gap(ui);
+                if ui.button("PSTH").clicked() {
+                    self.psth.open = true;
+                    if self.psth.pick_rx.is_none() {
+                        self.psth.pick_rx = Some(spawn_stim_picker(
+                            self.bin_path.parent().map(|p| p.to_path_buf()),
+                        ));
+                    }
                 }
-                self.jump_str = format!("{:.3}", self.view_start_s);
-            }
-            // keep jump field synced when not being edited
-            if !resp.has_focus() {
-                self.jump_str = format!("{:.3}", self.view_start_s);
-            }
+                ui.add(egui::Separator::default().vertical().spacing(1.0));
+                if ui.button("Atlas Registration").clicked() {
+                    self.atlas.open = !self.atlas.open;
+                }
+                ui.add(egui::Separator::default().vertical().spacing(1.0));
+                if ui
+                    .add_enabled(
+                        !self.classifying,
+                        egui::Button::new("Channel Classification"),
+                    )
+                    .clicked()
+                {
+                    self.dispatch_classify(ui.ctx());
+                }
+                ui.add(egui::Separator::default().vertical().spacing(1.0));
+                if ui.button("Remove channels…").clicked() {
+                    self.show_remove_channels = !self.show_remove_channels;
+                }
+            });
 
             let display_rows_arc = {
                 let (lock, _) = &*self.worker_state;
@@ -2295,7 +2298,48 @@ impl NPXplorerApp {
         );
     }
 
+    /// Esc closes the topmost open tool window (PSTH, Atlas Registration, Preferences,
+    /// ...), one per press. It is left alone while a text field, combo box or the
+    /// channel context menu has it, and progress windows (with Abort) are never closed.
+    fn close_top_window_on_escape(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            || ctx.wants_keyboard_input()
+            || ctx.memory(|m| m.any_popup_open())
+            || self.context_menu_channel.is_some()
+        {
+            return;
+        }
+        // area ids are the window titles (see egui::Window::new)
+        let open: Vec<(egui::Id, u8)> = [
+            (self.psth.open, "Peri-Stimulus Time Histogram", 0),
+            (self.atlas.open, "Atlas Registration", 1),
+            (self.show_remove_channels, "Remove channels", 2),
+            (self.show_preferences, "Preferences", 3),
+            (self.classify_error.is_some(), "Channel Classification failed", 4),
+        ]
+        .into_iter()
+        .filter(|(is_open, ..)| *is_open)
+        .map(|(_, title, which)| (egui::Id::new(title), which))
+        .collect();
+        if open.is_empty() {
+            return;
+        }
+        // back-to-front stacking order; a window not in it yet counts as the bottom one
+        let depth = |id: egui::Id| {
+            ctx.memory(|m| m.layer_ids().position(|l| l.id == id))
+        };
+        let (_, which) = open.into_iter().max_by_key(|(id, _)| depth(*id)).unwrap();
+        match which {
+            0 => self.psth.open = false,
+            1 => self.atlas.open = false,
+            2 => self.show_remove_channels = false,
+            3 => self.show_preferences = false,
+            _ => self.classify_error = None,
+        }
+    }
+
     pub fn update(&mut self, ctx: &egui::Context) {
+        self.close_top_window_on_escape(ctx);
         self.poll_and_maybe_dispatch_psth(ctx);
         self.draw_psth_window(ctx);
         self.poll_remove_channels_picker(ctx);
@@ -3159,20 +3203,25 @@ impl NPXplorerApp {
                         );
 
                         // classification legend / overlay-toggle box, pinned to the
-                        // heatmap's top-right corner — only shown once a classification
-                        // has actually been run this session. Laid out inside the heatmap
-                        // panel itself (not a floating Area), so every window the user
-                        // opens stays on top of it.
+                        // heatmap's bottom-right corner just above the scale bar — only
+                        // shown once a classification has actually been run this session.
+                        // Laid out inside the heatmap panel itself (not a floating Area),
+                        // so every window the user opens stays on top of it.
                         if self.channel_labels.is_some() {
-                            let box_region = egui::Rect::from_min_max(
-                                egui::pos2(resp.rect.left(), resp.rect.top() + 8.0),
-                                egui::pos2(resp.rect.right() - 8.0, resp.rect.bottom()),
-                            );
+                            // anchored by its bottom-right corner; the scale bar's top
+                            // edge sits 30 px above the heatmap bottom. The box's size is
+                            // only known after layout, so last frame's size places it and
+                            // a size change (legend shown/hidden) re-runs the layout pass.
+                            let size_id = egui::Id::new("classify_box_size");
+                            let prev_size: egui::Vec2 =
+                                ctx.data(|d| d.get_temp(size_id)).unwrap_or_default();
+                            let anchor = egui::pos2(resp.rect.right() - 8.0, resp.rect.bottom() - 38.0);
                             let mut box_ui = ui.new_child(
                                 egui::UiBuilder::new()
-                                    .max_rect(box_region)
-                                    .layout(egui::Layout::top_down(egui::Align::Max)),
+                                    .max_rect(egui::Rect::from_min_max(anchor - prev_size, anchor))
+                                    .layout(egui::Layout::top_down(egui::Align::Min)),
                             );
+                            box_ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                             box_ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
                             let bg = egui::Color32::from_rgba_unmultiplied(
                                 crate::render::C_ZERO[0],
@@ -3180,13 +3229,11 @@ impl NPXplorerApp {
                                 crate::render::C_ZERO[2],
                                 77,
                             );
-                            egui::Frame::new()
+                            let box_size = egui::Frame::new()
                                 .fill(bg)
                                 .corner_radius(8.0)
                                 .inner_margin(8.0)
                                 .show(&mut box_ui, |ui| {
-                                    // vertical() sizes to its content (with_layout would take
-                                    // the full heatmap width)
                                     ui.vertical(|ui| {
                                         if self.show_classification_overlay {
                                             let legend_row = |ui: &mut Ui, label: u8, text: &str| {
@@ -3204,12 +3251,17 @@ impl NPXplorerApp {
                                             legend_row(ui, 3, "Out of brain");
                                             ui.add_space(4.0);
                                         }
-                                        ui.toggle_value(
-                                            &mut self.show_classification_overlay,
-                                            "Chan classification overlay",
-                                        );
+                                        let label = if self.show_classification_overlay { "Hide" } else { "Show" };
+                                        ui.toggle_value(&mut self.show_classification_overlay, label);
                                     });
-                                });
+                                })
+                                .response
+                                .rect
+                                .size();
+                            if (box_size - prev_size).length() > 0.5 {
+                                ctx.data_mut(|d| d.insert_temp(size_id, box_size));
+                                ctx.request_discard("classification box resized");
+                            }
                         }
                     }
 

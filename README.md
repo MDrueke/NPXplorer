@@ -24,8 +24,9 @@ Channels are named as in the recording's metadata (e.g. `AP12` for SpikeGLX, `CH
 - **Scroll wheel**: move forward/backward in time (step size set by **Fine**/**Coarse** in the top bar).
 - **Arrow keys** or **A/D**: jump half a window.
 - **Window**: length of the displayed time window in seconds.
-- **Jump to (s)**: go to a time.
+- **Jump to (s)** (right end of the second toolbar row): go to a time.
 - Click the **navigation bar** at the bottom to jump anywhere. The solid marker shows the displayed window, the shaded area the part that is already preprocessed.
+- **Esc**: closes the topmost open window (PSTH, Atlas Registration, Preferences, …), one per press.
 
 The heatmap always shows every channel that is not removed (see **Removing channels**). The status bar lists anything the recording's metadata did not provide (e.g. an unknown probe type, whose gain and electrode positions are then assumed), so you know when µV values or depths are nominal.
 
@@ -36,7 +37,7 @@ The heatmap always shows every channel that is not removed (see **Removing chann
 
 ### Removing channels
 
-**Remove channels…** in the top bar excludes channels from the display and from all processing. Enter channel IDs or ranges separated by commas (e.g. `AP3,AP17,AP40-AP50`) and press **Apply** or Enter; a bare number (`17`, `40-50`) matches the channels whose ID ends in that number. **Load from file…** reads the list from a `.csv`/`.txt`/`.tsv`/`.dat` file, using a layout file like the PSTH one (see below): `channel_remove_layout.csv` next to the list file, or the default in `config/`. **Reset** clears the list.
+**Remove channels…** in the third toolbar row excludes channels from the display and from all processing. Enter channel IDs or ranges separated by commas (e.g. `AP3,AP17,AP40-AP50`) and press **Apply** or Enter; a bare number (`17`, `40-50`) matches the channels whose ID ends in that number. **Load from file…** reads the list from a `.csv`/`.txt`/`.tsv`/`.dat` file, using a layout file like the PSTH one (see below): `channel_remove_layout.csv` next to the list file, or the default in `config/`. **Reset** clears the list.
 
 When a recording is opened, the list starts with the probe's reference sites, which carry no neural signal (e.g. channel 191 on NP 1.0): those SpikeGLX marks as unused in its geometry map, and those Open Ephys lists without a position. **Reset** includes them again.
 
@@ -56,7 +57,7 @@ Voltages are scaled per channel from the metadata: SpikeGLX gains from `~imroTbl
 
 - **%ile**: the color range follows a percentile of the displayed voltages; **±µV**: a fixed range. **Alt + scroll** adjusts either.
 - **Colormap** (Preferences): Ice-Fire, Yellow-Magenta, Red-Blue, Orange-Blue, Vanimo, Greyscale, Cool-Warm.
-- **Peak pooling** (Preferences, on by default): when a pixel column covers many samples (long windows), it shows the sample with the largest magnitude instead of the mean, so spikes keep their amplitude at any window length. In **%ile** mode the colour range then follows the values on screen. Turn it off for a smoother, mean-based picture (better for LFP).
+- **Peak pooling** (Preferences, off by default): when a pixel column covers many samples (long windows), it shows the sample with the largest magnitude instead of the mean, so spikes keep their amplitude at any window length. In **%ile** mode the colour range then follows the values on screen. Off gives a smoother, mean-based picture (better for LFP).
 
 ### Firing rate overlay
 
@@ -71,13 +72,13 @@ In Preferences:
 
 ### Channel classification
 
-**Channel Classification** in the top bar marks dead (magenta), noisy (red) and out-of-brain (green) channels with a colored stripe. Each shank is classified on its own with the channels in depth order; removed channels are skipped. **Outside of brain** (Preferences) chooses how the brain surface is found: **Adaptive** (default; IBL's adaptive mode, finds weaker surfaces, e.g. in LFP data) or **Fixed threshold** (IBL's default, stricter). A progress bar with **Abort** shows while it runs. The box in the heatmap's top-right corner shows the legend; its **Chan classification overlay** button shows or hides the stripes. **Chunks to sample** in Preferences sets how many snippets of the recording are used (more is more reliable but slower).
+**Channel Classification** in the third toolbar row marks dead (magenta), noisy (red) and out-of-brain (green) channels with a colored stripe. Each shank is classified on its own with the channels in depth order; removed channels are skipped. **Outside of brain** (Preferences) chooses how the brain surface is found: **Adaptive** (default; IBL's adaptive mode, finds weaker surfaces, e.g. in LFP data) or **Fixed threshold** (IBL's default, stricter). A progress bar with **Abort** shows while it runs. The box in the heatmap's bottom-right corner, above the scale bar, shows the legend; its **Hide**/**Show** button hides or shows the stripes. **Chunks to sample** in Preferences sets how many snippets of the recording are used (more is more reliable but slower).
 
 ### Atlas registration
 
 Draws the borders between brain regions of the Allen mouse atlas (CCF) on the heatmap, from the probe's insertion coordinates. It uses the atlas files of the [Neuropixels Trajectory Explorer](https://github.com/petersaj/neuropixels_trajectory_explorer): a folder containing `annotation_volume_10um_by_index.npy` and `structure_tree_safe_2017.csv`.
 
-Click **Atlas Registration** in the top bar:
+Click **Atlas Registration** in the third toolbar row:
 
 1. Choose the atlas folder with **Browse…**, or paste its path.
 2. Enter the animal's bregma–lambda distance (default 4.1 mm).
