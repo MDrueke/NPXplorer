@@ -1,4 +1,4 @@
-# NPXplorer v0.6.0
+# NPXplorer v0.6.6
 
 A viewer for raw Neuropixels recordings. Shows the voltage of all channels as a heatmap laid out by the probe geometry.
 
@@ -26,7 +26,7 @@ Channels are named as in the recording's metadata (e.g. `AP12` for SpikeGLX, `CH
 - **Window**: length of the displayed time window in seconds.
 - **Jump to (s)** (right end of the second toolbar row): go to a time.
 - Click the **navigation bar** at the bottom to jump anywhere. The solid marker shows the displayed window, the shaded area the part that is already preprocessed.
-- **Esc**: closes the topmost open window (PSTH, Atlas Registration, Preferences, …), one per press.
+- **Esc**: closes the topmost open window (PSTH, TTL, Atlas Registration, Preferences, …), one per press.
 
 The heatmap always shows every channel that is not removed (see **Removing channels**). The status bar lists anything the recording's metadata did not provide (e.g. an unknown probe type, whose gain and electrode positions are then assumed), so you know when µV values or depths are nominal.
 
@@ -76,7 +76,12 @@ In Preferences:
 
 ### Atlas registration
 
-Draws the borders between brain regions of the Allen mouse atlas (CCF) on the heatmap, from the probe's insertion coordinates. It uses the atlas files of the [Neuropixels Trajectory Explorer](https://github.com/petersaj/neuropixels_trajectory_explorer): a folder containing `annotation_volume_10um_by_index.npy` and `structure_tree_safe_2017.csv`.
+Draws the borders between brain regions of the Allen mouse atlas (CCF 2017, 10 µm) on the heatmap, from the probe's insertion coordinates. The geometry follows the [Neuropixels Trajectory Explorer](https://github.com/petersaj/neuropixels_trajectory_explorer) (NTE), so the same inputs give the same regions. Two versions of the atlas are accepted, each as a folder:
+
+- **NTE atlas (recommended)**: `annotation_volume_10um_by_index.npy` and `structure_tree_safe_2017.csv`, from the NTE's [download](https://osf.io/fv7ed/) (see its [installation page](https://github.com/petersaj/neuropixels_trajectory_explorer/wiki/Installation)).
+- **Original Allen atlas**: `annotation_10.nrrd` from the [Allen Institute](https://download.alleninstitute.org/informatics-archive/current-release/mouse_ccf/annotation/ccf_2017/), plus the structure ontology saved as `query.csv` from the [Allen API](https://api.brain-map.org/api/v2/data/query.csv?criteria=model::Structure,rma::criteria,[ontology_id$eq1],rma::options[order$eq%27structures.graph_order%27][num_rows$eqall]). On the first load, the `.nrrd` is converted once into `annotation_10_npxplorer.npy` (2.4 GB) and `annotation_10_npxplorer_ids.txt` in the same folder. This takes a while and needs write access to the folder.
+
+The NTE atlas is the Allen annotation reformatted with a script from [allenCCF](https://github.com/cortex-lab/allenCCF/blob/master/setup_utils.m). It has the same voxels and borders, with each structure ID replaced by its row in the structure table. Both give the same regions. The NTE atlas is recommended because it is exactly the atlas the NTE itself uses, it loads immediately without a conversion or the extra 2.4 GB, and the two files come from one download. The original is useful if you already have it (e.g. from the Allen SDK) or prefer the files from the source.
 
 Click **Atlas Registration** in the third toolbar row:
 
@@ -104,7 +109,7 @@ The coordinates and dragged borders are saved in `<recording>.npx_atlas.toml` ne
 
 Click **PSTH** and pick a file with stimulus onset times in seconds (`.csv`, `.txt`, `.tsv`, `.dat`). The window shows the average signal around the stimuli for all channels that are not removed, using the main window's preprocessing: traces of selected channels, the mean over all channels, and a heatmap.
 
-Set **Stim time (s)** (which stimuli to include), **Window (ms)** (e.g. −50 to 200) and the color scale, then press **Apply settings**. A progress bar with **Abort** shows while it computes. **Left-click / right-click** the heatmap to plot up to two channels; **Deselect** clears them. **Export PNG…** saves the plots.
+Set **Stim time (s)** (which stimuli to include), **Window (ms)** (e.g. −50 to 200) and the color scale, then press **Apply/Compute**. A progress bar with **Abort** shows while it computes. **Alt + scroll** over the window adjusts the color scale. The traces are scaled to fit when computed and then zoom along with the color scale. Without a spatial filter, the raw windows are averaged first and the average is preprocessed once (identical result, since every step is then linear), which is much faster. **Left-click / right-click** the heatmap to plot up to two channels; **Deselect** clears them. **Export PNG…** saves the plots.
 
 The stimulus file is read according to a layout file. Its lines mirror the stim file: lines without an `o` are header rows to skip, and the first line with an `o` marks the column(s) holding the onset times (`x` = ignore). For example
 
@@ -113,7 +118,21 @@ header
 o,x,x
 ```
 
-skips one header row and reads the first column. A `stims_file_layout.csv` next to the stim file is used if present, otherwise the default in `config/`. Lines starting with `#` are comments.
+skips one header row and reads the first column. Lines starting with `#` are comments. The layout is shown in the **File format** field of the PSTH and TTL windows, filled from `stims_file_layout.csv` next to the recording if present, otherwise from the default in `config/`. Edits are saved as `stims_file_layout.csv` next to the recording when the stimuli are loaded (PSTH: **Apply/Compute**) and are then used by both windows; the default in `config/` is never changed. **Reset to default** restores the default and deletes the file next to the recording.
+
+### TTL
+
+Shades the stimuli on the heatmap and the waveform view, in the color of the firing rate overlay.
+
+Click **TTL** in the third toolbar row, then pick the stimulus file with **Browse…** or paste its path and press **Load** (or Enter). The file is read with the same layout as the PSTH (see above). In addition, `f` marks the column(s) holding the offset times, e.g. `o,f,x`. Without an `f` column, each area is **Duration (ms)** long.
+
+- **Opacity**: of the shaded areas (default 10%).
+- **Show overlay**: hides or shows the shading. It stays on after the window is closed.
+- **Emphasize on/offset**: draws a thin line at each onset and offset.
+
+While the shading is shown, the legend box in the heatmap's bottom-right corner lists it as **TTL**.
+
+The stimulus file last loaded in the TTL or PSTH window is saved in `<recording>.npx_stim.toml` next to the data file (shared by the AP and LF files), together with the TTL settings and the PSTH's **Stim time** and **Window**. When the recording is opened again, both windows start with that file filled in.
 
 ## Configuration
 

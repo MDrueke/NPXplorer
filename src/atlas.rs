@@ -2,11 +2,14 @@
 // from the probe's insertion coordinates. The geometry (CCF -> bregma transform,
 // brain-surface entry, probe rotation) is a port of the MATLAB Neuropixels Trajectory
 // Explorer (petersaj/neuropixels_trajectory_explorer, `neuropixels_trajectory_explorer.m`),
-// so the same inputs give the same regions as NTE. Reads NTE's atlas files:
-// `annotation_volume_10um_by_index.npy` (memory-mapped) + `structure_tree_safe_2017.csv`.
+// so the same inputs give the same regions as NTE. Reads NTE's atlas files
+// (`annotation_volume_10um_by_index.npy`, memory-mapped, + `structure_tree_safe_2017.csv`)
+// or Allen's original `annotation_10.nrrd` + ontology CSV, which is converted once into
+// a memory-mappable cache next to it.
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -14,6 +17,16 @@ use crate::data::Meta;
 
 pub const ANNOTATION_FILE: &str = "annotation_volume_10um_by_index.npy";
 pub const STRUCTURE_TREE_FILE: &str = "structure_tree_safe_2017.csv";
+/// Allen's original 10 µm CCF 2017 annotation (gzip, uint32 structure ids).
+pub const NRRD_FILE: &str = "annotation_10.nrrd";
+/// Allen's ontology CSV as downloaded from the Allen API.
+pub const ALLEN_TREE_FILE: &str = "query.csv";
+/// Cache of `annotation_10.nrrd`: u16 labels, 0 = outside the brain, k = k-th id in
+/// `NRRD_CACHE_IDS_FILE`.
+const NRRD_CACHE_FILE: &str = "annotation_10_npxplorer.npy";
+const NRRD_CACHE_IDS_FILE: &str = "annotation_10_npxplorer_ids.txt";
+/// (AP, DV, ML) voxels of the 10 µm CCF.
+const CCF_10UM_SHAPE: [usize; 3] = [1320, 800, 1140];
 
 /// Average stereotaxic bregma-lambda distance (mm) the CCF corresponds to (NTE's value).
 pub const REFERENCE_BREGMA_LAMBDA_MM: f64 = 4.1;
@@ -157,8 +170,8 @@ impl VolumeData {
     }
 }
 
-/// u16 annotation volume indexed [AP][DV][ML] (NTE's layout), holding 1-based row
-/// numbers into the structure tree; 1 (root) and 0 mean outside the brain.
+/// u16 annotation volume indexed [AP][DV][ML] (NTE's layout). What the labels mean
+/// depends on the file; `Atlas::value_to_row` maps them to structure-tree rows.
 pub struct AnnotationVolume {
     data: VolumeData,
     offset: usize,
@@ -285,29 +298,80 @@ pub struct Atlas {
     pub dir: PathBuf,
     pub volume: AnnotationVolume,
     pub tree: StructureTree,
+    /// structure-tree row per volume label, `None` = outside the brain
+    value_to_row: Vec<Option<usize>>,
+}
+
+/// NTE's volume holds 1-based tree rows; 1 (root) and 0 are outside the brain.
+fn nte_value_map(n_rows: usize) -> Vec<Option<usize>> {
+    (0..=n_rows).map(|v| (v >= 2).then(|| v - 1)).collect()
 }
 
 impl Atlas {
     pub fn load(dir: &Path, cancel: &AtomicBool, progress: &AtomicUsize) -> Result<Option<Self>> {
-        let tree_path = dir.join(STRUCTURE_TREE_FILE);
-        let vol_path = dir.join(ANNOTATION_FILE);
-        let missing: Vec<&str> = [(STRUCTURE_TREE_FILE, &tree_path), (ANNOTATION_FILE, &vol_path)]
-            .iter()
-            .filter(|(_, p)| !p.is_file())
-            .map(|(n, _)| *n)
-            .collect();
-        if !missing.is_empty() {
-            bail!("atlas file(s) not found in {}: {}", dir.display(), missing.join(", "));
+        let nte_tree = dir.join(STRUCTURE_TREE_FILE);
+        let nte_vol = dir.join(ANNOTATION_FILE);
+        let nrrd = dir.join(NRRD_FILE);
+        let allen_tree = [nte_tree.clone(), dir.join(ALLEN_TREE_FILE)].into_iter().find(|p| p.is_file());
+        // NTE's volume only fits NTE's tree (its labels are row numbers)
+        let nte = nte_vol.is_file() && nte_tree.is_file();
+        if !nte && !(nrrd.is_file() && allen_tree.is_some()) {
+            bail!(
+                "no complete atlas found in {}: expected {ANNOTATION_FILE} + {STRUCTURE_TREE_FILE} \
+                 (Neuropixels Trajectory Explorer), or {NRRD_FILE} + {ALLEN_TREE_FILE} (Allen)",
+                dir.display()
+            );
         }
+        let tree_path = if nte { nte_tree } else { allen_tree.unwrap() };
         let text = crate::psth::read_text_file(&tree_path)?;
         let tree = StructureTree::parse(&text).with_context(|| format!("reading {}", tree_path.display()))?;
         progress.store(PROGRESS_TOTAL / 10, Ordering::Relaxed);
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        let volume = AnnotationVolume::open(&vol_path)?;
+
+        let (volume, value_to_row) = if nte {
+            (AnnotationVolume::open(&nte_vol)?, nte_value_map(tree.rows.len()))
+        } else {
+            let cache = dir.join(NRRD_CACHE_FILE);
+            let ids_path = dir.join(NRRD_CACHE_IDS_FILE);
+            let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            let fresh = ids_path.is_file() && matches!((mtime(&cache), mtime(&nrrd)), (Some(c), Some(n)) if c >= n);
+            if !fresh && !convert_nrrd(&nrrd, &cache, &ids_path, cancel, progress)? {
+                return Ok(None);
+            }
+            let ids: Vec<u32> = std::fs::read_to_string(&ids_path)
+                .with_context(|| format!("reading {}", ids_path.display()))?
+                .split_whitespace()
+                .map(|t| t.parse::<u32>().with_context(|| format!("bad id '{t}' in {}", ids_path.display())))
+                .collect::<Result<_>>()?;
+            let missing: Vec<String> = ids
+                .iter()
+                .filter(|&&id| tree.row_of_id(id).is_none())
+                .map(|id| id.to_string())
+                .collect();
+            if !missing.is_empty() {
+                bail!(
+                    "{NRRD_FILE} contains structure id(s) not listed in {}: {}. Use the ontology \
+                     CSV that matches the 2017 annotation.",
+                    tree_path.display(),
+                    missing.join(", ")
+                );
+            }
+            // root counts as outside the brain, as in NTE's volume
+            let mut map = vec![None];
+            map.extend(ids.iter().map(|&id| tree.row_of_id(id).filter(|&r| tree.rows[r].parent.is_some())));
+            (AnnotationVolume::open(&cache)?, map)
+        };
+        if volume.shape != CCF_10UM_SHAPE {
+            bail!(
+                "annotation volume has shape {:?}, expected the 10 µm CCF {:?}",
+                volume.shape,
+                CCF_10UM_SHAPE
+            );
+        }
         progress.store(PROGRESS_TOTAL * 3 / 10, Ordering::Relaxed);
-        Ok(Some(Self { dir: dir.to_path_buf(), volume, tree }))
+        Ok(Some(Self { dir: dir.to_path_buf(), volume, tree, value_to_row }))
     }
 
     /// Structure-tree row at a bregma-relative point, `None` outside the brain.
@@ -319,11 +383,137 @@ impl Atlas {
         };
         let (ml, ap, dv) = (idx(c[0])?, idx(c[1])?, idx(c[2])?);
         let v = self.volume.get(ap, dv, ml)? as usize;
-        if v <= 1 || v > self.tree.rows.len() {
-            return None;
-        }
-        Some(v - 1)
+        self.value_to_row.get(v).copied().flatten()
     }
+}
+
+/// Convert Allen's `annotation_10.nrrd` (uint32 structure ids, AP varying fastest) into
+/// a Fortran-order u16 .npy at `cache` holding 1-based indices into the id list written
+/// to `ids_path` (0 = outside the brain). Streams, so memory use stays small. Returns
+/// `false` if cancelled.
+fn convert_nrrd(nrrd: &Path, cache: &Path, ids_path: &Path, cancel: &AtomicBool, progress: &AtomicUsize) -> Result<bool> {
+    let file = std::fs::File::open(nrrd).with_context(|| format!("opening {}", nrrd.display()))?;
+    let mut rd = BufReader::new(file);
+
+    // header: "key: value" lines up to the first blank line
+    let mut line = String::new();
+    rd.read_line(&mut line)?;
+    if !line.starts_with("NRRD") {
+        bail!("{} is not a NRRD file", nrrd.display());
+    }
+    let (mut typ, mut sizes, mut encoding, mut endian) = (String::new(), Vec::new(), String::from("raw"), String::from("little"));
+    loop {
+        line.clear();
+        if rd.read_line(&mut line)? == 0 {
+            bail!("{}: header has no end", nrrd.display());
+        }
+        let l = line.trim_end();
+        if l.is_empty() {
+            break;
+        }
+        if l.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = l.split_once(':') else { continue };
+        let v = v.trim().to_string();
+        match k.trim() {
+            "type" => typ = v,
+            "sizes" => sizes = v.split_whitespace().filter_map(|t| t.parse::<usize>().ok()).collect(),
+            "encoding" => encoding = v,
+            "endian" => endian = v,
+            "data file" | "datafile" => bail!("{}: detached NRRD data files are not supported", nrrd.display()),
+            _ => {}
+        }
+    }
+    if !matches!(typ.as_str(), "unsigned int" | "uint" | "uint32" | "uint32_t") || endian != "little" {
+        bail!("{}: expected little-endian unsigned int data, found '{typ}' ({endian})", nrrd.display());
+    }
+    if sizes != CCF_10UM_SHAPE {
+        bail!("{}: sizes {sizes:?}, expected the 10 µm annotation {:?}", nrrd.display(), CCF_10UM_SHAPE);
+    }
+    let mut data: Box<dyn Read> = match encoding.as_str() {
+        "gzip" | "gz" => Box::new(flate2::read::MultiGzDecoder::new(rd)),
+        "raw" => Box::new(rd),
+        e => bail!("{}: unsupported NRRD encoding '{e}'", nrrd.display()),
+    };
+
+    let part = cache.with_extension("npy.part");
+    let result = (|| -> Result<bool> {
+        let mut out = BufWriter::new(
+            std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?,
+        );
+        out.write_all(&npy_header_u16(CCF_10UM_SHAPE))?;
+
+        let n: usize = CCF_10UM_SHAPE.iter().product();
+        let mut index_of: HashMap<u32, u16> = HashMap::new();
+        let mut ids: Vec<u32> = Vec::new();
+        let (mut last_id, mut last_idx) = (0u32, 0u16);
+        let mut buf = vec![0u8; 4 << 20];
+        let mut out_buf: Vec<u8> = Vec::with_capacity(buf.len() / 2);
+        let mut done = 0usize;
+        while done < n {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            let m = (n - done).min(buf.len() / 4);
+            data.read_exact(&mut buf[..4 * m])
+                .with_context(|| format!("{}: data ends early", nrrd.display()))?;
+            out_buf.clear();
+            for c in buf[..4 * m].chunks_exact(4) {
+                let id = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                // neighbouring voxels mostly share a label, so skip the hash lookup
+                if id != last_id {
+                    last_idx = if id == 0 {
+                        0
+                    } else {
+                        match index_of.get(&id) {
+                            Some(&i) => i,
+                            None => {
+                                if ids.len() >= u16::MAX as usize {
+                                    bail!("{}: too many distinct structure ids", nrrd.display());
+                                }
+                                ids.push(id);
+                                index_of.insert(id, ids.len() as u16);
+                                ids.len() as u16
+                            }
+                        }
+                    };
+                    last_id = id;
+                }
+                out_buf.extend_from_slice(&last_idx.to_le_bytes());
+            }
+            out.write_all(&out_buf)?;
+            done += m;
+            progress.store(PROGRESS_TOTAL / 10 + PROGRESS_TOTAL / 5 * done / n, Ordering::Relaxed);
+        }
+        out.flush()?;
+        let ids_text: String = ids.iter().map(|id| format!("{id}\n")).collect();
+        std::fs::write(ids_path, ids_text).with_context(|| format!("writing {}", ids_path.display()))?;
+        std::fs::rename(&part, cache).with_context(|| format!("writing {}", cache.display()))?;
+        Ok(true)
+    })();
+    if !matches!(result, Ok(true)) {
+        let _ = std::fs::remove_file(&part);
+    }
+    result
+}
+
+/// .npy v1.0 header for a Fortran-order little-endian u16 array.
+fn npy_header_u16(shape: [usize; 3]) -> Vec<u8> {
+    let dict = format!(
+        "{{'descr': '<u2', 'fortran_order': True, 'shape': ({}, {}, {}), }}",
+        shape[0], shape[1], shape[2]
+    );
+    let mut h = dict.into_bytes();
+    // pad so the data starts on a 64-byte boundary, header ends with a newline
+    while (10 + h.len() + 1) % 64 != 0 {
+        h.push(b' ');
+    }
+    h.push(b'\n');
+    let mut out = b"\x93NUMPY\x01\x00".to_vec();
+    out.extend_from_slice(&(h.len() as u16).to_le_bytes());
+    out.extend_from_slice(&h);
+    out
 }
 
 /// NTE's CCF -> bregma transform: bregma-relative [ML, AP, DV] in mm (AP + anterior,
@@ -518,13 +708,19 @@ struct SidecarFile {
 /// Sidecar file next to the recording holding its insertion coordinates. The AP and
 /// LF files of one SpikeGLX recording share it (".ap"/".lf" is stripped).
 pub fn sidecar_path(bin_path: &Path) -> PathBuf {
+    recording_sidecar(bin_path, ".npx_atlas.toml")
+}
+
+/// `<recording><suffix>` next to the data file; the AP and LF files of a SpikeGLX
+/// recording share it.
+pub fn recording_sidecar(bin_path: &Path, suffix: &str) -> PathBuf {
     let stem = bin_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let base = stem
         .strip_suffix(".ap")
         .or_else(|| stem.strip_suffix(".lf"))
         .unwrap_or(&stem)
         .to_string();
-    bin_path.with_file_name(format!("{base}.npx_atlas.toml"))
+    bin_path.with_file_name(format!("{base}{suffix}"))
 }
 
 pub fn load_sidecar(bin_path: &Path) -> Option<(Insertion, Vec<RegionEdit>)> {
@@ -935,6 +1131,7 @@ id,atlas_id,name,acronym,st_level,ontology_id,hemisphere_id,weight,parent_struct
                 synthetic: Some(f),
             },
             tree: StructureTree::parse(TREE_CSV).unwrap(),
+            value_to_row: nte_value_map(5),
         }
     }
 

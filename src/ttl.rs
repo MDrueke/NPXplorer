@@ -1,0 +1,328 @@
+// TTL window: loads stimulus on/offset times and shades them on the heatmap and
+// the waveform view. The stim-file format is the one the PSTH uses (see psth.rs).
+
+use egui::{Color32, Ui};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
+
+use crate::app::ColorMapChoice;
+use crate::psth::{self, StimLayout};
+
+const FORMAT_HELP: &str = "One line per line of the stimulus file (lines starting with # are ignored). \
+Lines without 'o' are header rows to skip. The first line with 'o' marks the onset column(s), \
+'f' the offset column(s) and 'x' columns to ignore.\n\n\
+Edits are saved as stims_file_layout.csv next to the recording when the file is loaded \
+(PSTH: Apply/Compute) and used by both PSTH and TTL. The default in config/ is not changed.";
+
+const DURATION_HELP: &str = "Width of each shaded area. Only used when the file format marks \
+no offset column: offset columns ('f') take precedence.";
+
+/// Recording-specific stimulus settings in `<recording>.npx_stim.toml` next to the data
+/// file (like the atlas sidecar), restored in the TTL and PSTH windows on opening.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+pub struct StimSidecar {
+    /// stimulus file last loaded in the TTL or PSTH window
+    pub stim_file: Option<PathBuf>,
+    pub ttl: TtlSettings,
+    pub psth: PsthSettings,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
+#[serde(default)]
+pub struct TtlSettings {
+    pub duration_ms: f64,
+    pub opacity_pct: f32,
+    pub emphasize_edges: bool,
+}
+
+impl Default for TtlSettings {
+    fn default() -> Self {
+        Self { duration_ms: 100.0, opacity_pct: 10.0, emphasize_edges: false }
+    }
+}
+
+/// `None` = the PSTH window's default
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct PsthSettings {
+    pub start_ms: Option<f64>,
+    pub end_ms: Option<f64>,
+    pub stim_t_start: Option<f64>,
+    pub stim_t_end: Option<f64>,
+}
+
+fn sidecar_path(bin_path: &Path) -> PathBuf {
+    crate::atlas::recording_sidecar(bin_path, ".npx_stim.toml")
+}
+
+pub fn load_sidecar(bin_path: &Path) -> StimSidecar {
+    std::fs::read_to_string(sidecar_path(bin_path))
+        .ok()
+        .and_then(|t| toml::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_sidecar(bin_path: &Path, sc: &StimSidecar) -> anyhow::Result<()> {
+    let path = sidecar_path(bin_path);
+    std::fs::write(&path, toml::to_string_pretty(sc)?)
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))
+}
+
+pub struct TtlState {
+    pub open: bool,
+    path_text: String,
+    pick_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
+    duration_ms: f64,
+    /// opacity of the shaded areas, %
+    opacity_pct: f32,
+    show_overlay: bool,
+    emphasize_edges: bool,
+    onsets: Vec<f64>,
+    /// offsets from 'f' columns, same order as `onsets`
+    offsets: Option<Vec<f64>>,
+    error: Option<String>,
+}
+
+impl TtlState {
+    pub fn new(settings: &TtlSettings, stim_file: Option<&Path>) -> Self {
+        Self {
+            open: false,
+            path_text: stim_file.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            pick_rx: None,
+            duration_ms: settings.duration_ms,
+            opacity_pct: settings.opacity_pct,
+            show_overlay: true,
+            emphasize_edges: settings.emphasize_edges,
+            onsets: Vec::new(),
+            offsets: None,
+            error: None,
+        }
+    }
+
+    pub fn settings(&self) -> TtlSettings {
+        TtlSettings {
+            duration_ms: self.duration_ms,
+            opacity_pct: self.opacity_pct,
+            emphasize_edges: self.emphasize_edges,
+        }
+    }
+
+    /// Whether the shading is drawn (and so listed in the heatmap legend).
+    pub fn overlay_visible(&self) -> bool {
+        self.show_overlay && !self.onsets.is_empty()
+    }
+
+    /// Returns whether the file was loaded.
+    fn load(&mut self, layout_text: &str, bin_path: &Path) -> bool {
+        let path = PathBuf::from(self.path_text.trim());
+        let res = (|| -> anyhow::Result<(Vec<f64>, Option<Vec<f64>>)> {
+            let layout = StimLayout::parse(layout_text)?;
+            psth::save_layout_text(bin_path, layout_text)?;
+            let onsets = psth::load_stim_times(&path, &layout)?;
+            let offsets = psth::load_stim_offsets(&path, &layout)?;
+            if let Some(off) = &offsets {
+                if let Some(i) = (0..onsets.len()).find(|&i| off[i] < onsets[i]) {
+                    anyhow::bail!(
+                        "stimulus {} ends before it starts (onset {} s, offset {} s). \
+                         Check the 'o' and 'f' columns in the file format.",
+                        i + 1,
+                        onsets[i],
+                        off[i]
+                    );
+                }
+            }
+            Ok((onsets, offsets))
+        })();
+        match res {
+            Ok((onsets, offsets)) => {
+                self.onsets = onsets;
+                self.offsets = offsets;
+                self.show_overlay = true;
+                self.error = None;
+                true
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
+                false
+            }
+        }
+    }
+
+    /// Returns true when something that belongs in the stimulus sidecar changed; a
+    /// successfully loaded file is stored in `stim_file`.
+    pub fn draw_window(
+        &mut self,
+        ctx: &egui::Context,
+        layout_text: &mut String,
+        bin_path: &Path,
+        stim_file: &mut Option<PathBuf>,
+    ) -> bool {
+        if !self.open {
+            return false;
+        }
+        let before = self.settings();
+        let mut loaded = false;
+        if let Some(rx) = &self.pick_rx {
+            match rx.try_recv() {
+                Ok(picked) => {
+                    self.pick_rx = None;
+                    if let Some(p) = picked {
+                        self.path_text = p.to_string_lossy().into_owned();
+                        loaded |= self.load(layout_text, bin_path);
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.pick_rx = None,
+            }
+        }
+
+        let mut open = self.open;
+        egui::Window::new("TTL")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Stimulus file").strong());
+                let mut load = false;
+                ui.horizontal(|ui| {
+                    ui.label("File:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.path_text)
+                            .desired_width(280.0)
+                            .hint_text("path to the stimulus-times file"),
+                    );
+                    load |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("Browse…").clicked() && self.pick_rx.is_none() {
+                        let typed = Path::new(self.path_text.trim()).parent().filter(|d| d.is_dir());
+                        let dir = typed.or(bin_path.parent()).map(Path::to_path_buf);
+                        self.pick_rx = Some(crate::app::spawn_stim_picker(dir));
+                    }
+                    load |= ui
+                        .add_enabled(!self.path_text.trim().is_empty(), egui::Button::new("Load"))
+                        .clicked();
+                });
+
+                ui.add_space(4.0);
+                if let Some(e) = format_editor(ui, layout_text, bin_path) {
+                    self.error = Some(e);
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let from_file = self.offsets.is_some();
+                    ui.add_enabled_ui(!from_file, |ui| {
+                        ui.label("Duration (ms):")
+                            .on_hover_text(DURATION_HELP)
+                            .on_disabled_hover_text(DURATION_HELP);
+                        ui.add(
+                            egui::DragValue::new(&mut self.duration_ms)
+                                .speed(1.0)
+                                .range(0.0..=1.0e6),
+                        )
+                        .on_hover_text(DURATION_HELP)
+                        .on_disabled_hover_text(DURATION_HELP);
+                    });
+                    if from_file {
+                        ui.label(egui::RichText::new("(offsets from file)").color(Color32::GRAY));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Opacity:");
+                    ui.add(egui::Slider::new(&mut self.opacity_pct, 0.0..=100.0).suffix("%"));
+                });
+                ui.checkbox(&mut self.show_overlay, "Show overlay");
+                ui.checkbox(&mut self.emphasize_edges, "Emphasize on/offset");
+
+                if load {
+                    loaded |= self.load(layout_text, bin_path);
+                }
+                if let Some(err) = &self.error {
+                    ui.colored_label(Color32::from_rgb(0xff, 0x66, 0x66), err);
+                } else if !self.onsets.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(Color32::from_rgb(0x55, 0xdd, 0x77), "Loaded");
+                        ui.label(format!("{} stimuli", self.onsets.len()));
+                    });
+                }
+            });
+        self.open = open;
+        if loaded {
+            *stim_file = Some(PathBuf::from(self.path_text.trim()));
+        }
+        loaded || self.settings() != before
+    }
+
+    /// Shade every stimulus overlapping the view in `rect` (x axis = the displayed
+    /// time window), with optional full-opacity lines at on- and offsets.
+    pub fn draw_overlay(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        view_start_s: f64,
+        view_dur_s: f64,
+        cmap: &ColorMapChoice,
+    ) {
+        if !self.overlay_visible() || view_dur_s <= 0.0 {
+            return;
+        }
+        let [r, g, b] = crate::render::colormap_accent(cmap);
+        let alpha = (self.opacity_pct / 100.0 * 255.0).round() as u8;
+        let fill = Color32::from_rgba_unmultiplied(r, g, b, alpha);
+        let edge = egui::Stroke::new(1.0_f32, Color32::from_rgb(r, g, b));
+        let view_end_s = view_start_s + view_dur_s;
+        let to_x = |t: f64| rect.left() + ((t - view_start_s) / view_dur_s) as f32 * rect.width();
+        let dur_s = self.duration_ms / 1000.0;
+
+        for (i, &on) in self.onsets.iter().enumerate() {
+            let off = self.offsets.as_ref().map_or(on + dur_s, |o| o[i]);
+            if off < view_start_s || on > view_end_s {
+                continue;
+            }
+            let x0 = to_x(on).max(rect.left());
+            // at least 1 px, so short stimuli stay visible in long windows
+            let x1 = to_x(off).min(rect.right()).max(x0 + 1.0);
+            painter.rect_filled(
+                egui::Rect::from_x_y_ranges(x0..=x1, rect.y_range()),
+                0.0,
+                fill,
+            );
+            if self.emphasize_edges {
+                for t in [on, off] {
+                    if (view_start_s..=view_end_s).contains(&t) {
+                        let x = to_x(t);
+                        painter.line_segment(
+                            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                            edge,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Multi-line editor for the stim-file format, shared by the PSTH and TTL windows.
+/// "Reset to default" restores the default text and removes the recording's own
+/// format file. Returns an error message if that removal failed.
+pub fn format_editor(ui: &mut Ui, text: &mut String, bin_path: &Path) -> Option<String> {
+    let mut err = None;
+    ui.horizontal(|ui| {
+        ui.label("File format:").on_hover_text(FORMAT_HELP);
+        if ui.button("Reset to default").clicked() {
+            *text = psth::default_layout_text();
+            err = psth::save_layout_text(bin_path, text).err().map(|e| e.to_string());
+        }
+    });
+    ui.add(
+        egui::TextEdit::multiline(text)
+            .code_editor()
+            .desired_rows(5)
+            .desired_width(f32::INFINITY),
+    );
+    err
+}

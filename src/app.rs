@@ -7,9 +7,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::data::{open_data, ChannelOrder, DisplayRow, Meta, RawData, ShankOrder};
 use crate::preprocess::{Filters, PreprocConfig, SpatialFilter};
-use crate::psth::{
-    compute_psth, default_layout_path, load_stim_times, resolve_layout, PsthParams, PsthResult,
-};
+use crate::psth::{compute_psth, load_stim_times, PsthParams, PsthResult, StimLayout};
 use crate::render::{build_heatmap_into, build_psth_heatmap_into};
 use crate::worker::{
     compute_half_window, request_shutdown, spawn_worker, RequestKind, SharedCancel,
@@ -180,7 +178,7 @@ impl Preferences {
 struct PsthState {
     open: bool,
     stim_path: Option<PathBuf>,
-    // staged settings (only committed to a recompute when "Apply settings" is pressed)
+    // staged settings (only committed to a recompute when "Apply/Compute" is pressed)
     start_ms: f64,
     end_ms: f64,
     start_ms_str: String,
@@ -207,6 +205,9 @@ struct PsthState {
     progress_total: Arc<AtomicUsize>,
     computing: bool,
     apply_requested: bool,
+    /// color-scale max when the result arrived: the trace plots are autoscaled at that
+    /// value and zoom with later color-scale changes
+    trace_vmax_ref: f32,
 
     result: Option<Arc<PsthResult>>,
     error: Option<String>,
@@ -251,6 +252,7 @@ impl PsthState {
             progress_total: Arc::new(AtomicUsize::new(0)),
             computing: false,
             apply_requested: false,
+            trace_vmax_ref: 1.0,
             result: None,
             error: None,
             n_used: 0,
@@ -267,9 +269,36 @@ impl PsthState {
     }
 }
 
+impl PsthState {
+    /// Fill in the file and settings saved for this recording.
+    fn restore(&mut self, sc: &crate::ttl::StimSidecar) {
+        self.stim_path = sc.stim_file.clone().filter(|p| p.is_file());
+        let s = &sc.psth;
+        if let (Some(a), Some(b)) = (s.start_ms, s.end_ms) {
+            (self.start_ms, self.end_ms) = (a, b);
+            self.start_ms_str = format!("{a}");
+            self.end_ms_str = format!("{b}");
+        }
+        if let (Some(a), Some(b)) = (s.stim_t_start, s.stim_t_end) {
+            self.stim_t_start = a.clamp(0.0, self.total_s);
+            self.stim_t_end = b.clamp(0.0, self.total_s);
+            self.stim_t_start_str = format!("{:.3}", self.stim_t_start);
+            self.stim_t_end_str = format!("{:.3}", self.stim_t_end);
+        }
+    }
+
+    /// Color-scale max of the heatmap (µV).
+    fn vmax(&self, result: &PsthResult) -> f32 {
+        match self.color_mode {
+            ColorMode::Percentile => result.vmax_percentile(self.color_pct),
+            ColorMode::Voltage => self.color_uv.max(1e-6),
+        }
+    }
+}
+
 /// Spawn the native picker for a stimulus-times file on a background thread (same
 /// rationale as the main file picker: never block the egui event loop).
-fn spawn_stim_picker(dir: Option<PathBuf>) -> mpsc::Receiver<Option<PathBuf>> {
+pub(crate) fn spawn_stim_picker(dir: Option<PathBuf>) -> mpsc::Receiver<Option<PathBuf>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut dlg = rfd::FileDialog::new()
@@ -495,6 +524,12 @@ pub struct NPXplorerApp {
 
     psth: PsthState,
     atlas: crate::atlas_ui::AtlasUi,
+    ttl: crate::ttl::TtlState,
+    /// stim-file format text shared by the PSTH and TTL windows
+    stim_layout_text: String,
+    /// stimulus file last loaded in the TTL or PSTH window (saved per recording)
+    stim_file: Option<PathBuf>,
+    stim_sidecar_dirty: bool,
 }
 
 impl NPXplorerApp {
@@ -623,6 +658,9 @@ impl NPXplorerApp {
         let bin_path_for_atlas = bin_path.clone();
         let meta_for_atlas = Arc::clone(&meta);
         let psth_total_s = meta.n_samples as f64 / meta.sample_rate;
+        let stim_sidecar = crate::ttl::load_sidecar(&bin_path);
+        let mut psth = PsthState::new(psth_total_s);
+        psth.restore(&stim_sidecar);
         let remove_channels_text =
             crate::channel_remove::format_channel_list(&preproc_cfg.removed_channels, &meta.channel_ids);
         let app = Self {
@@ -694,8 +732,12 @@ impl NPXplorerApp {
             proj_threshold: 0.0,
             proj_sigma: 0.0,
             proj_cfg: None,
-            psth: PsthState::new(psth_total_s),
+            psth,
             atlas: crate::atlas_ui::AtlasUi::new(&bin_path_for_atlas, &meta_for_atlas, atlas_dir, bregma_lambda_mm),
+            ttl: crate::ttl::TtlState::new(&stim_sidecar.ttl, stim_sidecar.stim_file.as_deref()),
+            stim_layout_text: crate::psth::layout_text(&bin_path_for_atlas),
+            stim_file: stim_sidecar.stim_file.clone(),
+            stim_sidecar_dirty: false,
         };
         app.save_prefs();
         Ok(app)
@@ -1070,6 +1112,7 @@ impl NPXplorerApp {
                 crate::render::C_ZERO[2],
             ),
         );
+        self.ttl.draw_overlay(&painter, rect, self.view_start_s, self.view_dur_s, &self.colormap_choice);
 
         let row_data: Option<(Arc<Vec<f32>>, usize)> = if matches_cfg {
             buf_display_rows
@@ -1187,7 +1230,7 @@ impl NPXplorerApp {
     // -----------------------------------------------------------------------
 
     /// Poll the PSTH picker/compute/export channels and dispatch a computation only
-    /// when the user has pressed "Apply settings" (or just picked a file).
+    /// when the user has pressed "Apply/Compute".
     fn poll_and_maybe_dispatch_psth(&mut self, ctx: &egui::Context) {
         // stimulus-file picker
         if let Some(rx) = &self.psth.pick_rx {
@@ -1197,7 +1240,9 @@ impl NPXplorerApp {
                     if let Some(path) = picked {
                         self.psth.stim_path = Some(path);
                         self.psth.open = true;
-                        self.psth.apply_requested = true; // auto-compute on first load
+                        // the old plots belong to the previous file; compute on Apply/Compute
+                        self.psth.result = None;
+                        self.psth.error = None;
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -1215,6 +1260,7 @@ impl NPXplorerApp {
                     self.psth.computing = false;
                     match res {
                         Ok(r) => {
+                            self.psth.trace_vmax_ref = self.psth.vmax(&r);
                             self.psth.n_used = r.n_used;
                             self.psth.n_skipped = r.n_skipped;
                             self.psth.result = Some(Arc::new(r));
@@ -1252,6 +1298,18 @@ impl NPXplorerApp {
             Some(p) => p.clone(),
             None => return,
         };
+        let layout = match StimLayout::parse(&self.stim_layout_text).and_then(|l| {
+            crate::psth::save_layout_text(&self.bin_path, &self.stim_layout_text)?;
+            Ok(l)
+        }) {
+            Ok(l) => l,
+            Err(e) => {
+                self.psth.error = Some(e.to_string());
+                return;
+            }
+        };
+        self.stim_file = Some(stim_path.clone());
+        self.stim_sidecar_dirty = true;
 
         // cancel any in-flight compute and install a fresh cancel flag
         self.psth.cancel.store(true, Ordering::Relaxed);
@@ -1275,13 +1333,10 @@ impl NPXplorerApp {
             end_ms: self.psth.end_ms,
         };
         let (t_start, t_end) = (self.psth.stim_t_start, self.psth.stim_t_end);
-        let default_layout = default_layout_path();
         let ctx = ctx.clone();
 
         std::thread::spawn(move || {
             let res = (|| -> Result<PsthResult, String> {
-                let layout =
-                    resolve_layout(&stim_path, &default_layout).map_err(|e| e.to_string())?;
                 let all = load_stim_times(&stim_path, &layout).map_err(|e| e.to_string())?;
                 let times: Vec<f64> = all
                     .into_iter()
@@ -1566,6 +1621,10 @@ impl NPXplorerApp {
                     }
                 }
                 ui.add(egui::Separator::default().vertical().spacing(1.0));
+                if ui.button("TTL").clicked() {
+                    self.ttl.open = !self.ttl.open;
+                }
+                ui.add(egui::Separator::default().vertical().spacing(1.0));
                 if ui.button("Atlas Registration").clicked() {
                     self.atlas.open = !self.atlas.open;
                 }
@@ -1794,7 +1853,7 @@ impl NPXplorerApp {
         let mut open = self.psth.open;
         let result = self.psth.result.clone();
 
-        egui::Window::new(
+        let win_resp = egui::Window::new(
             egui::RichText::new("Peri-Stimulus Time Histogram").color(egui::Color32::WHITE),
         )
         .open(&mut open)
@@ -1841,6 +1900,10 @@ impl NPXplorerApp {
                     }
                 });
             });
+
+            if let Some(e) = crate::ttl::format_editor(ui, &mut self.stim_layout_text, &self.bin_path) {
+                self.psth.error = Some(e);
+            }
 
             ui.horizontal(|ui| {
                 // stimulus time-range selector (seconds)
@@ -1901,7 +1964,7 @@ impl NPXplorerApp {
                 // Apply: commit the staged settings and recompute
                 let apply = ui.add_enabled(
                     self.psth.stim_path.is_some() && !self.psth.computing,
-                    egui::Button::new(egui::RichText::new("Apply settings").color(c_zero))
+                    egui::Button::new(egui::RichText::new("Apply/Compute").color(c_zero))
                         .fill(accent_50),
                 );
                 if apply.clicked() {
@@ -1992,9 +2055,36 @@ impl NPXplorerApp {
             if let Some(result) = &result {
                 self.draw_psth_plots(ui, result, &cmap, accent, c_zero);
             } else if !self.psth.computing && self.psth.error.is_none() {
-                ui.label("Pick a stimulus-times file to compute the PSTH.");
+                if self.psth.stim_path.is_some() {
+                    ui.label("Press Apply/Compute to compute the PSTH.");
+                } else {
+                    ui.label("Pick a stimulus-times file to compute the PSTH.");
+                }
             }
         });
+
+        // Alt+scroll over the window adjusts the color scale, like on the main heatmap
+        let hovered = win_resp.is_some_and(|r| r.response.contains_pointer());
+        if hovered && ctx.input(|i| i.modifiers.alt) {
+            let ticks: f32 = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::MouseWheel { delta, .. } => Some(delta.y.signum()),
+                        _ => None,
+                    })
+                    .sum()
+            });
+            if ticks != 0.0 {
+                if self.psth.color_mode == ColorMode::Percentile {
+                    self.psth.color_pct = (self.psth.color_pct - ticks * 0.1).clamp(95.0, 100.0);
+                } else {
+                    // multiplicative, so the step suits both 2 µV and 200 µV
+                    self.psth.color_uv = (self.psth.color_uv * 1.1f32.powf(-ticks)).clamp(1.0, 200.0);
+                }
+                self.psth.tex_dirty = true;
+            }
+        }
 
         self.psth.open = open;
     }
@@ -2075,10 +2165,9 @@ impl NPXplorerApp {
         // heatmap texture (rebuilt on color/size change)
         let pw = heat_rect.width().round() as usize;
         let ph = heat_rect.height().round() as usize;
-        let vmax = match self.psth.color_mode {
-            ColorMode::Percentile => result.vmax_percentile(self.psth.color_pct),
-            ColorMode::Voltage => self.psth.color_uv.max(1e-6),
-        };
+        let vmax = self.psth.vmax(result);
+        // traces zoom with the color scale; out-of-range parts are clipped to their plot
+        let zoom = self.psth.trace_vmax_ref / vmax;
         let size_changed = self.psth.last_tex_size != Some([pw, ph]);
         if self.psth.tex_dirty || size_changed || self.psth.texture.is_none() {
             build_psth_heatmap_into(&mut self.psth.pixel_buf, result, pw, ph, vmax, self.peak_pooling, cmap);
@@ -2166,6 +2255,7 @@ impl NPXplorerApp {
                 sel_max = sel_max.max(s.iter().fold(0.0f32, |m, &v| m.max(v.abs())));
             }
         }
+        sel_max /= zoom;
         let sel_mid = sel_rect.center().y;
         let sel_half = sel_rect.height() * 0.5 - 2.0;
         painter.line_segment(
@@ -2183,7 +2273,9 @@ impl NPXplorerApp {
                         egui::pos2(x_of_i(&sel_rect, i), sel_mid - (s[i] / sel_max) * sel_half)
                     })
                     .collect();
-                painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, *color)));
+                painter
+                    .with_clip_rect(sel_rect)
+                    .add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, *color)));
             }
         }
 
@@ -2193,7 +2285,8 @@ impl NPXplorerApp {
             .avg_trace
             .iter()
             .fold(0.0f32, |m, &v| m.max(v.abs()))
-            .max(1e-6);
+            .max(1e-6)
+            / zoom;
         let avg_mid = avg_rect.center().y;
         let avg_half = avg_rect.height() * 0.5 - 2.0;
         painter.line_segment(
@@ -2211,7 +2304,9 @@ impl NPXplorerApp {
                 )
             })
             .collect();
-        painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, accent)));
+        painter
+            .with_clip_rect(avg_rect)
+            .add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, accent)));
 
         // onset marker at t = 0 across all three plots
         if start_ms < 0.0 && end_ms > 0.0 {
@@ -2315,7 +2410,8 @@ impl NPXplorerApp {
             (self.atlas.open, "Atlas Registration", 1),
             (self.show_remove_channels, "Remove channels", 2),
             (self.show_preferences, "Preferences", 3),
-            (self.classify_error.is_some(), "Channel Classification failed", 4),
+            (self.ttl.open, "TTL", 4),
+            (self.classify_error.is_some(), "Channel Classification failed", 5),
         ]
         .into_iter()
         .filter(|(is_open, ..)| *is_open)
@@ -2334,6 +2430,7 @@ impl NPXplorerApp {
             1 => self.atlas.open = false,
             2 => self.show_remove_channels = false,
             3 => self.show_preferences = false,
+            4 => self.ttl.open = false,
             _ => self.classify_error = None,
         }
     }
@@ -2350,6 +2447,24 @@ impl NPXplorerApp {
         self.atlas.poll(ctx);
         self.atlas.draw_window(ctx, &self.meta, &self.bin_path, &self.colormap_choice);
         self.atlas.draw_progress_window(ctx);
+        if self.ttl.draw_window(ctx, &mut self.stim_layout_text, &self.bin_path, &mut self.stim_file) {
+            self.stim_sidecar_dirty = true;
+        }
+        // written once the mouse is released, so slider drags don't write every frame
+        if self.stim_sidecar_dirty && !ctx.input(|i| i.pointer.any_down()) {
+            self.stim_sidecar_dirty = false;
+            let sc = crate::ttl::StimSidecar {
+                stim_file: self.stim_file.clone(),
+                ttl: self.ttl.settings(),
+                psth: crate::ttl::PsthSettings {
+                    start_ms: Some(self.psth.start_ms),
+                    end_ms: Some(self.psth.end_ms),
+                    stim_t_start: Some(self.psth.stim_t_start),
+                    stim_t_end: Some(self.psth.stim_t_end),
+                },
+            };
+            let _ = crate::ttl::save_sidecar(&self.bin_path, &sc);
+        }
         if self.atlas.take_prefs_dirty() {
             self.save_prefs();
         }
@@ -2991,6 +3106,7 @@ impl NPXplorerApp {
                         .fit_to_exact_size(avail)
                         .sense(egui::Sense::click());
                     let resp = ui.add(img_widget);
+                    self.ttl.draw_overlay(&ui.painter_at(resp.rect), resp.rect, self.view_start_s, self.view_dur_s, &self.colormap_choice);
 
                     // click detection — channel selection now requires Alt (plain
                     // left-click is a no-op; plain right-click opens the context menu)
@@ -3202,12 +3318,12 @@ impl NPXplorerApp {
                             &self.colormap_choice,
                         );
 
-                        // classification legend / overlay-toggle box, pinned to the
-                        // heatmap's bottom-right corner just above the scale bar — only
-                        // shown once a classification has actually been run this session.
-                        // Laid out inside the heatmap panel itself (not a floating Area),
-                        // so every window the user opens stays on top of it.
-                        if self.channel_labels.is_some() {
+                        // legend box (TTL + classification with its overlay toggle), pinned
+                        // to the heatmap's bottom-right corner just above the scale bar —
+                        // shown while the TTL overlay is on or once a classification has
+                        // been run this session. Laid out inside the heatmap panel itself
+                        // (not a floating Area), so every window the user opens stays on top of it.
+                        if self.channel_labels.is_some() || self.ttl.overlay_visible() {
                             // anchored by its bottom-right corner; the scale bar's top
                             // edge sits 30 px above the heatmap bottom. The box's size is
                             // only known after layout, so last frame's size places it and
@@ -3235,24 +3351,32 @@ impl NPXplorerApp {
                                 .inner_margin(8.0)
                                 .show(&mut box_ui, |ui| {
                                     ui.vertical(|ui| {
-                                        if self.show_classification_overlay {
-                                            let legend_row = |ui: &mut Ui, label: u8, text: &str| {
-                                                ui.horizontal(|ui| {
-                                                    let (rect, _) = ui.allocate_exact_size(
-                                                        egui::vec2(12.0, 12.0),
-                                                        egui::Sense::hover(),
-                                                    );
-                                                    ui.painter().rect_filled(rect, 2.0, classification_color(label, 255));
-                                                    ui.label(text);
-                                                });
-                                            };
-                                            legend_row(ui, 1, "Dead");
-                                            legend_row(ui, 2, "Noisy");
-                                            legend_row(ui, 3, "Out of brain");
-                                            ui.add_space(4.0);
+                                        let legend_row = |ui: &mut Ui, color: egui::Color32, text: &str| {
+                                            ui.horizontal(|ui| {
+                                                let (rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(12.0, 12.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().rect_filled(rect, 2.0, color);
+                                                ui.label(text);
+                                            });
+                                        };
+                                        if self.ttl.overlay_visible() {
+                                            let [r, g, b] = crate::render::colormap_accent(&self.colormap_choice);
+                                            legend_row(ui, egui::Color32::from_rgb(r, g, b), "TTL");
                                         }
-                                        let label = if self.show_classification_overlay { "Hide" } else { "Show" };
-                                        ui.toggle_value(&mut self.show_classification_overlay, label);
+                                        if self.channel_labels.is_some() {
+                                            if self.show_classification_overlay {
+                                                legend_row(ui, classification_color(1, 255), "Dead");
+                                                legend_row(ui, classification_color(2, 255), "Noisy");
+                                                legend_row(ui, classification_color(3, 255), "Out of brain");
+                                            }
+                                            if self.show_classification_overlay || self.ttl.overlay_visible() {
+                                                ui.add_space(4.0);
+                                            }
+                                            let label = if self.show_classification_overlay { "Hide" } else { "Show" };
+                                            ui.toggle_value(&mut self.show_classification_overlay, label);
+                                        }
                                     });
                                 })
                                 .response

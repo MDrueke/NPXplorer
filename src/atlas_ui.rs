@@ -412,7 +412,7 @@ impl AtlasUi {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.dir_text)
                     .desired_width(300.0)
-                    .hint_text("folder with the Allen CCF .npy files"),
+                    .hint_text("folder with the atlas files"),
             );
             if resp.lost_focus() {
                 self.prefs_dirty = true;
@@ -423,9 +423,11 @@ impl AtlasUi {
         });
         ui.label(
             egui::RichText::new(format!(
-                "needs {} and {}",
+                "needs {} + {} (NTE) or {} + {} (Allen)",
                 atlas::ANNOTATION_FILE,
-                atlas::STRUCTURE_TREE_FILE
+                atlas::STRUCTURE_TREE_FILE,
+                atlas::NRRD_FILE,
+                atlas::ALLEN_TREE_FILE
             ))
             .small()
             .color(Color32::GRAY),

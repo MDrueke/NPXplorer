@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering, AtomicUsize};
 
 use crate::data::{DisplayRow, Meta, RawData};
-use crate::preprocess::{Filters, PreprocConfig, preprocess};
+use crate::preprocess::{Filters, PreprocConfig, SpatialFilter, preprocess};
 use crate::worker::compute_thread_count;
 
 // ---------------------------------------------------------------------------
@@ -59,15 +59,17 @@ fn split_fields(line: &str) -> Vec<&str> {
 // Layout file
 // ---------------------------------------------------------------------------
 
-/// Describes where stimulus onset times live in a stimulus file.
+/// Describes where stimulus onset (and optionally offset) times live in a stimulus file.
 /// Determined by a layout file whose lines mirror the stim file's structure:
 /// leading lines with no `o` token are header rows to skip; the first line that
-/// contains one or more `o` tokens marks which column(s) hold the onset times.
+/// contains one or more `o` tokens marks which column(s) hold the onset times, and
+/// `f` tokens on that line the offset times (paired with the onsets in order).
 /// Trailing `x` markers beyond the actual number of columns are ignored.
 #[derive(Clone, Debug)]
 pub struct StimLayout {
     pub n_header_rows: usize,
     pub onset_cols: Vec<usize>,
+    pub offset_cols: Vec<usize>,
 }
 
 impl StimLayout {
@@ -79,18 +81,30 @@ impl StimLayout {
                 continue; // ignore blank lines and comments in the layout
             }
             let tokens = split_fields(trimmed);
-            let onset_cols: Vec<usize> = tokens
-                .iter()
-                .enumerate()
-                .filter(|(_, t)| t.trim().eq_ignore_ascii_case("o"))
-                .map(|(i, _)| i)
-                .collect();
+            let cols_marked = |m: &str| -> Vec<usize> {
+                tokens
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.trim().eq_ignore_ascii_case(m))
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            let onset_cols = cols_marked("o");
             if onset_cols.is_empty() {
                 // a header / ignored line
                 n_header_rows += 1;
-            } else {
-                return Ok(StimLayout { n_header_rows, onset_cols });
+                continue;
             }
+            let offset_cols = cols_marked("f");
+            if !offset_cols.is_empty() && offset_cols.len() != onset_cols.len() {
+                bail!(
+                    "the layout marks {} onset column(s) ('o') but {} offset column(s) ('f'). \
+                     Mark one offset column per onset column, or none.",
+                    onset_cols.len(),
+                    offset_cols.len()
+                );
+            }
+            return Ok(StimLayout { n_header_rows, onset_cols, offset_cols });
         }
         bail!(
             "the layout file contains no 'o' marker, so it does not say which column \
@@ -107,36 +121,49 @@ impl StimLayout {
 /// the onset column and skip header rows. Errors describe exactly how the layout
 /// disagrees with the file rather than panicking.
 pub fn load_stim_times(stim_path: &Path, layout: &StimLayout) -> Result<Vec<f64>> {
+    load_columns(stim_path, layout.n_header_rows, &layout.onset_cols, "onset")
+}
+
+/// Read stimulus offset times (seconds) from the `f` columns, in the same order as
+/// the onsets from `load_stim_times`. `None` if the layout marks no offset column.
+pub fn load_stim_offsets(stim_path: &Path, layout: &StimLayout) -> Result<Option<Vec<f64>>> {
+    if layout.offset_cols.is_empty() {
+        return Ok(None);
+    }
+    load_columns(stim_path, layout.n_header_rows, &layout.offset_cols, "offset").map(Some)
+}
+
+fn load_columns(stim_path: &Path, n_header_rows: usize, cols: &[usize], what: &str) -> Result<Vec<f64>> {
     let text = read_text_file(stim_path)?;
     let stim_name = stim_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
 
-    let onset_col = *layout.onset_cols.iter().max().unwrap_or(&0);
+    let max_col = *cols.iter().max().unwrap_or(&0);
     let mut times = Vec::new();
 
     // human-facing row numbers count every line so they match a text editor
-    for (line_no, line) in text.lines().enumerate().skip(layout.n_header_rows) {
+    for (line_no, line) in text.lines().enumerate().skip(n_header_rows) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue; // tolerate blank/trailing lines in the data
         }
         let fields = split_fields(trimmed);
-        if onset_col >= fields.len() {
+        if max_col >= fields.len() {
             bail!(
                 "layout does not match '{stim_name}': the layout marks column {} as the \
-                 stimulus onset time, but row {} has only {} column(s). Check the number of \
-                 header rows and the onset column in the layout file.",
-                onset_col + 1,
+                 stimulus {what} time, but row {} has only {} column(s). Check the number of \
+                 header rows and the {what} column in the layout file.",
+                max_col + 1,
                 line_no + 1,
                 fields.len()
             );
         }
-        for &c in &layout.onset_cols {
+        for &c in cols {
             let tok = fields[c];
             match tok.parse::<f64>() {
                 Ok(v) => times.push(v),
                 Err(_) => bail!(
                     "could not read a number from '{stim_name}': the value '{tok}' in row {}, \
-                     column {} is not a valid stimulus onset time. The layout may mark the wrong \
+                     column {} is not a valid stimulus {what} time. The layout may mark the wrong \
                      column, or the header-row count may be off.",
                     line_no + 1,
                     c + 1
@@ -148,29 +175,42 @@ pub fn load_stim_times(stim_path: &Path, layout: &StimLayout) -> Result<Vec<f64>
     if times.is_empty() {
         bail!(
             "no stimulus times were found in '{stim_name}' after skipping {} header row(s).",
-            layout.n_header_rows
+            n_header_rows
         );
     }
     Ok(times)
 }
 
-/// Resolve the layout for a chosen stim file: a `stims_file_layout.csv` sitting next
-/// to the stim file takes precedence, otherwise fall back to the default in `config/`.
-pub fn resolve_layout(stim_path: &Path, default_layout_path: &Path) -> Result<StimLayout> {
-    let sidecar = stim_path
-        .parent()
-        .map(|d| d.join("stims_file_layout.csv"))
-        .filter(|p| p.is_file());
-    let layout_path = sidecar.as_deref().unwrap_or(default_layout_path);
-    if !layout_path.is_file() {
-        bail!(
-            "no layout file found: expected 'stims_file_layout.csv' next to the stimulus file \
-             or a default at {}.",
-            default_layout_path.display()
-        );
+/// The layout file next to the raw data. It is written when the format is edited in
+/// the PSTH or TTL window and takes precedence over the default in `config/`.
+pub fn layout_sidecar_path(bin_path: &Path) -> PathBuf {
+    bin_path.with_file_name("stims_file_layout.csv")
+}
+
+/// Text of the default layout file in `config/` (the built-in default if it is missing).
+pub fn default_layout_text() -> String {
+    read_text_file(&default_layout_path()).unwrap_or_else(|_| DEFAULT_LAYOUT.to_string())
+}
+
+/// Layout text for a recording: the file next to the raw data if present, else the default.
+pub fn layout_text(bin_path: &Path) -> String {
+    read_text_file(&layout_sidecar_path(bin_path)).unwrap_or_else(|_| default_layout_text())
+}
+
+/// Store the layout text next to the raw data. Text equal to the default removes that
+/// file instead, so the recording follows the default again.
+pub fn save_layout_text(bin_path: &Path, text: &str) -> Result<()> {
+    let path = layout_sidecar_path(bin_path);
+    let norm = |s: &str| s.replace("\r\n", "\n").trim_end().to_string();
+    if norm(text) == norm(&default_layout_text()) {
+        if path.is_file() {
+            std::fs::remove_file(&path)
+                .map_err(|e| anyhow::anyhow!("could not remove {}: {e}", path.display()))?;
+        }
+        return Ok(());
     }
-    let text = read_text_file(layout_path)?;
-    StimLayout::parse(&text)
+    std::fs::write(&path, text)
+        .map_err(|e| anyhow::anyhow!("could not save the stim file format to {}: {e}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +253,8 @@ impl PsthResult {
 /// Compute the peri-stimulus average of the preprocessed signal. For each stimulus,
 /// a window (plus filter-settle padding) is read from disk, depth-averaged and
 /// preprocessed exactly as the main view, then the aligned segment is accumulated.
+/// Without a spatial filter every step is linear, so the raw windows are averaged
+/// first and the average is preprocessed once, which gives the same result.
 /// Stimuli whose full padded window falls outside the recording are skipped.
 /// `progress_total` is set to the number of stimuli used once known, and `progress`
 /// counts them as they are processed.
@@ -237,9 +279,21 @@ pub fn compute_psth(
     if n_win == 0 {
         bail!("PSTH window is too short to contain a single sample at {} Hz.", fs);
     }
-    // zero-phase (filtfilt) highpass and the destripe AGC need settle margin on both
-    // sides; 0.15 s is comfortably longer than either transient
-    let pad = (0.15 * fs).round() as i64;
+    // settle margin on both sides, as long as the enabled filters need: the 300 Hz
+    // highpass decays below 1e-4 within ~10 ms, destripe's AGC also averages over
+    // ±0.05 s (destripe always includes the highpass). DC removal without the highpass
+    // keeps 0.15 s, as its baseline is the mean of the read chunk; with the highpass the
+    // DC step has no effect (the filter removes any constant exactly).
+    let pad_s = if cfg.spatial_filter == SpatialFilter::Destripe {
+        0.08
+    } else if cfg.highpass {
+        0.02
+    } else if cfg.dc_removal {
+        0.15
+    } else {
+        0.0
+    };
+    let pad = (pad_s * fs).round() as i64;
 
     let display_rows = Arc::new(meta.build_display_rows(cfg.avg_depths, &cfg.removed_channels, cfg.channel_order, cfg.shank_order));
     let n_rows = display_rows.iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
@@ -265,42 +319,50 @@ pub fn compute_psth(
     progress_total.store(n_used, Ordering::Relaxed);
 
     let filt = Filters::new(cfg);
+    let n_threads = compute_thread_count();
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(compute_thread_count())
+        .num_threads(n_threads)
         .build()
         .map_err(|e| anyhow::anyhow!("thread pool: {e}"))?;
+
+    let pad = pad as usize;
+    let read_n = n_win + 2 * pad;
+    // median CMR and destripe's AGC are not linear, so they need per-stimulus preprocessing
+    let linear = cfg.spatial_filter == SpatialFilter::Off;
+    // linear: accumulate the whole padded window; otherwise only the aligned segment
+    let (seg_off, seg_n) = if linear { (0, read_n) } else { (pad, n_win) };
+    let acc_len = n_rows * seg_n;
+    // one accumulator per chunk of stimuli, so memory stays bounded by the thread count
+    let chunk = n_used.div_ceil(n_threads).max(1);
 
     let sum = pool.install(|| {
         use rayon::prelude::*;
         valid
-            .par_iter()
-            .fold(
-                || vec![0.0f64; n_rows * n_win],
-                |mut acc, &onset| {
+            .par_chunks(chunk)
+            .map(|onsets| {
+                let mut acc = vec![0.0f64; acc_len];
+                for &onset in onsets {
                     if cancel.load(Ordering::Relaxed) {
-                        return acc;
+                        break;
                     }
-                    let read_first = (onset + w_start - pad) as usize;
-                    let read_n = n_win + 2 * pad as usize;
+                    let read_first = (onset + w_start) as usize - pad;
                     let mut data = raw.read_rows(read_first, read_n, meta, &display_rows, cfg.phase_shift);
-                    preprocess(&mut data, read_n, cfg, &filt, cancel, &display_rows, None);
+                    if !linear {
+                        preprocess(&mut data, read_n, cfg, &filt, cancel, &display_rows, None);
+                    }
                     debug_assert_eq!(data.len(), n_rows * read_n);
-                    // extract the aligned [pad .. pad+n_win] segment of every row
                     for r in 0..n_rows {
-                        let src = r * read_n + pad as usize;
-                        let dst = r * n_win;
-                        let src_row = &data[src..src + n_win];
-                        let dst_row = &mut acc[dst..dst + n_win];
-                        for t in 0..n_win {
-                            dst_row[t] += src_row[t] as f64;
+                        let src = &data[r * read_n + seg_off..r * read_n + seg_off + seg_n];
+                        for (d, &v) in acc[r * seg_n..(r + 1) * seg_n].iter_mut().zip(src) {
+                            *d += v as f64;
                         }
                     }
                     progress.fetch_add(1, Ordering::Relaxed);
-                    acc
-                },
-            )
+                }
+                acc
+            })
             .reduce(
-                || vec![0.0f64; n_rows * n_win],
+                || vec![0.0f64; acc_len],
                 |mut a, b| {
                     for (x, y) in a.iter_mut().zip(b.iter()) {
                         *x += *y;
@@ -315,7 +377,15 @@ pub fn compute_psth(
     }
 
     let inv = 1.0 / n_used as f64;
-    let data: Vec<f32> = sum.iter().map(|&s| (s * inv) as f32).collect();
+    let mut mean: Vec<f32> = sum.iter().map(|&s| (s * inv) as f32).collect();
+    let data: Vec<f32> = if linear {
+        preprocess(&mut mean, read_n, cfg, &filt, cancel, &display_rows, None);
+        (0..n_rows)
+            .flat_map(|r| mean[r * read_n + pad..r * read_n + pad + n_win].iter().copied())
+            .collect()
+    } else {
+        mean
+    };
 
     // average across rows at each time sample
     let mut avg_trace = vec![0.0f32; n_win];
@@ -369,8 +439,8 @@ const DEFAULT_LAYOUT: &str = "\
 # Lines here mirror the structure of that file, one line each (comment lines
 # like this one are ignored and don't count). Lines with no 'o' are header
 # rows in the stimulus file, to be skipped. The first line containing 'o'
-# marks which comma-separated column(s) hold the onset times (in seconds);
-# 'x' marks a column to ignore.
+# marks which comma-separated column(s) hold the onset times (in seconds),
+# 'f' the offset times (optional, used by TTL); 'x' marks a column to ignore.
 header
 o
 ";
