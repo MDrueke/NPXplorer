@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version and check tag
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $v"; exit 1
+          fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu, x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Install mingw
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      # linking against glibc 2.28 makes the binary run on all distros with glibc >= 2.28
+      - name: Build Linux
+        run: cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.28
+
+      - name: Build Windows
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Rename binaries
+        run: |
+          mkdir dist
+          cp target/x86_64-unknown-linux-gnu/release/NPXplorer "dist/NPXplorer_v${VERSION}_Linux"
+          cp target/x86_64-pc-windows-gnu/release/NPXplorer.exe "dist/NPXplorer_v${VERSION}_Win.exe"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
