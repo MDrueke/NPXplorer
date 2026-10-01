@@ -31,7 +31,8 @@ Channels are named as in the recording's metadata (e.g. `AP12` for SpikeGLX, `CH
 - **Scroll wheel**: move in time (step size set by **Fine**/**Coarse**).
 - **Arrow keys** or **A/D**: jump half a window.
 - **Navigation bar** (bottom): click to jump. The solid marker shows the displayed window, the shaded area the part that is already preprocessed.
-- **Esc**: closes the topmost open window, one per press.
+- **Left-drag** on the heatmap: draw a rectangle to zoom into its channels and time range (the readout at the bottom left shows both while dragging). You can zoom again inside the zoomed view.
+- **Esc**: closes the topmost open window, one per press; with no window open, it leaves the zoom and returns to the full view and the previous time window.
 
 ### Selecting channels
 
@@ -75,7 +76,7 @@ Draws the borders between brain regions of the Allen mouse atlas (CCF 2017, 10 �
 - **Depth**: from the brain surface to the tip, along the probe; the tip offset is the distance from the tip to the first electrode row (default 195 µm).
 - **Bregma–lambda distance** (default 4.1 mm) scales the atlas to the animal.
 
-Hover a region label for its full name; the hovered channel's region also appears in the readout at the bottom left. With channels ordered by ID, borders and labels are hidden. To match the borders to the data:
+Hover a region label for its full name; the hovered channel's region also appears in the readout at the bottom left. With channels ordered by ID, borders and labels are hidden. Regions with fewer channels than set in **Skip drawing regions with less than … channels** (default 4; 0 draws all) are not drawn on their own: their channels are split between the neighboring regions. The readout and **Save** still use the exact regions. To match the borders to the data:
 
 - **Alt + drag** any border to move all borders together (changes the depth).
 - **Drag** a single border to move just that one (it stops at its neighbors). Dragged borders are kept when the depth changes, and only **Reset borders** undoes them.

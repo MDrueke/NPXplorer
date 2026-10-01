@@ -55,6 +55,9 @@ fn default_spike_smoothing_sigma() -> f32 {
 fn default_n_classify_chunks() -> usize {
     crate::channel_classify::DEFAULT_N_CLASSIFY_CHUNKS
 }
+fn default_atlas_min_region_channels() -> usize {
+    4
+}
 fn default_bregma_lambda_mm() -> f64 {
     crate::atlas::REFERENCE_BREGMA_LAMBDA_MM
 }
@@ -138,6 +141,9 @@ pub struct Preferences {
     /// last-used bregma-lambda distance; a recording's atlas sidecar overrides it
     #[serde(default = "default_bregma_lambda_mm")]
     pub bregma_lambda_mm: f64,
+    /// atlas overlay: regions with fewer channels are not drawn on their own
+    #[serde(default = "default_atlas_min_region_channels")]
+    pub atlas_min_region_channels: usize,
 }
 
 impl Preferences {
@@ -342,10 +348,73 @@ fn spawn_png_saver(dir: Option<PathBuf>, default_name: String) -> mpsc::Receiver
     rx
 }
 
-/// Index range (inclusive) of all display rows — the heatmap always shows every
-/// row that is not removed.
+/// Index range (inclusive) of all display rows.
 fn all_rows(display_rows: &[DisplayRow]) -> (usize, usize) {
     (0, display_rows.len().saturating_sub(1))
+}
+
+/// Rectangle zoom (left-drag on the heatmap): a channel range plus the time view from
+/// before the first zoom, which Esc restores.
+struct Zoom {
+    /// channels of the bottom and top rows; stored as channels rather than row indices
+    /// because the rows are rebuilt when channels are removed or averaged
+    ch_bottom: usize,
+    ch_top: usize,
+    prev_start_s: f64,
+    prev_dur_s: f64,
+}
+
+/// Index range (inclusive) of the display rows on screen: the zoomed channel range, or
+/// all rows when not zoomed (or when a zoom channel no longer has a row).
+fn view_rows(display_rows: &[DisplayRow], zoom: Option<&Zoom>) -> (usize, usize) {
+    let row_of = |ch: usize| {
+        display_rows.iter().position(|r| {
+            matches!(r, DisplayRow::Data { channels, .. } if channels.contains(&ch))
+        })
+    };
+    match zoom.map(|z| (row_of(z.ch_bottom), row_of(z.ch_top))) {
+        Some((Some(lo), Some(hi))) if lo <= hi => (lo, hi),
+        _ => all_rows(display_rows),
+    }
+}
+
+/// Smallest drag (px, in each direction) that zooms; anything less stays a click.
+const ZOOM_MIN_DRAG_PX: f32 = 4.0;
+
+/// Channels of the bottom and top data rows inside the screen-space selection `sel` on
+/// a heatmap drawn in `rect` with rows `first_row..=last_row`; at least two rows when
+/// the heatmap has them. None if the selection holds no data row.
+fn zoom_selection(
+    display_rows: &[DisplayRow],
+    first_row: usize,
+    last_row: usize,
+    rect: egui::Rect,
+    sel: egui::Rect,
+) -> Option<(usize, usize)> {
+    let n_rows = last_row - first_row + 1;
+    let row_at = |y: f32| {
+        let frac = ((y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+        last_row.saturating_sub((frac as f64 * n_rows as f64) as usize).clamp(first_row, last_row)
+    };
+    let data_rows: Vec<(usize, usize)> = (first_row..=last_row)
+        .filter_map(|r| match &display_rows[r] {
+            DisplayRow::Data { first_ch, .. } => Some((r, *first_ch)),
+            _ => None,
+        })
+        .collect();
+    let (lo, hi) = (row_at(sel.bottom()), row_at(sel.top()));
+    let inside: Vec<usize> = (0..data_rows.len())
+        .filter(|&i| (lo..=hi).contains(&data_rows[i].0))
+        .collect();
+    let (mut b, mut t) = (*inside.first()?, *inside.last()?);
+    if b == t {
+        if t + 1 < data_rows.len() {
+            t += 1;
+        } else if b > 0 {
+            b -= 1;
+        }
+    }
+    Some((data_rows[b].1, data_rows[t].1))
 }
 
 /// Channel IDs of the first and last data rows (bottom and top of the heatmap).
@@ -507,6 +576,12 @@ pub struct NPXplorerApp {
     last_rendered_n: usize,
     last_rendered_size: Option<[usize; 2]>,
     last_rendered_buf: Option<(usize, usize)>,
+    last_rendered_rows: Option<(usize, usize)>,
+
+    // rectangle zoom
+    zoom: Option<Zoom>,
+    /// screen position where the current zoom drag started
+    zoom_drag_start: Option<egui::Pos2>,
 
     // UI state
     pending_cfg_recompute: bool,
@@ -521,6 +596,7 @@ pub struct NPXplorerApp {
     proj_threshold: f32,
     proj_sigma: f32,
     proj_cfg: Option<PreprocConfig>,
+    proj_rows: Option<(usize, usize)>,
 
     psth: PsthState,
     atlas: crate::atlas_ui::AtlasUi,
@@ -571,6 +647,7 @@ impl NPXplorerApp {
         let mut peak_pooling = false;
         let mut atlas_dir = None;
         let mut bregma_lambda_mm = default_bregma_lambda_mm();
+        let mut atlas_min_region_channels = default_atlas_min_region_channels();
 
         if let Some(p) = prefs {
             preproc_cfg = p.preproc_cfg;
@@ -594,6 +671,7 @@ impl NPXplorerApp {
             peak_pooling = p.peak_pooling;
             atlas_dir = p.atlas_dir;
             bregma_lambda_mm = p.bregma_lambda_mm;
+            atlas_min_region_channels = p.atlas_min_region_channels;
         }
 
         // reference sites carry no neural signal: start with them removed (listed in
@@ -722,6 +800,9 @@ impl NPXplorerApp {
             last_rendered_n: 0,
             last_rendered_size: None,
             last_rendered_buf: None,
+            last_rendered_rows: None,
+            zoom: None,
+            zoom_drag_start: None,
             pending_cfg_recompute: false,
             file_dialog_request: false,
             open_recent_request: None,
@@ -732,8 +813,15 @@ impl NPXplorerApp {
             proj_threshold: 0.0,
             proj_sigma: 0.0,
             proj_cfg: None,
+            proj_rows: None,
             psth,
-            atlas: crate::atlas_ui::AtlasUi::new(&bin_path_for_atlas, &meta_for_atlas, atlas_dir, bregma_lambda_mm),
+            atlas: crate::atlas_ui::AtlasUi::new(
+                &bin_path_for_atlas,
+                &meta_for_atlas,
+                atlas_dir,
+                bregma_lambda_mm,
+                atlas_min_region_channels,
+            ),
             ttl: crate::ttl::TtlState::new(&stim_sidecar.ttl, stim_sidecar.stim_file.as_deref()),
             stim_layout_text: crate::psth::layout_text(&bin_path_for_atlas),
             stim_file: stim_sidecar.stim_file.clone(),
@@ -761,7 +849,8 @@ impl NPXplorerApp {
             .map(|p| p.to_string_lossy().to_string());
         let prefs = Preferences {
             preproc_cfg: self.preproc_cfg.clone(),
-            view_dur_s: self.view_dur_s,
+            // a zoomed window length is not a sensible default for the next session
+            view_dur_s: self.zoom.as_ref().map_or(self.view_dur_s, |z| z.prev_dur_s),
             color_mode: self.color_mode.clone(),
             color_pct: self.color_pct,
             color_uv: self.color_uv,
@@ -785,6 +874,7 @@ impl NPXplorerApp {
                 .collect(),
             atlas_dir: self.atlas.atlas_dir(),
             bregma_lambda_mm: self.atlas.bregma_lambda_mm(),
+            atlas_min_region_channels: self.atlas.min_region_channels(),
         };
         prefs.save();
     }
@@ -2394,7 +2484,7 @@ impl NPXplorerApp {
     }
 
     /// Esc closes the topmost open tool window (PSTH, Atlas Registration, Preferences,
-    /// ...), one per press. It is left alone while a text field, combo box or the
+    /// ...), one per press; with no window open it returns from the rectangle zoom. It is left alone while a text field, combo box or the
     /// channel context menu has it, and progress windows (with Abort) are never closed.
     fn close_top_window_on_escape(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.key_pressed(egui::Key::Escape))
@@ -2418,6 +2508,13 @@ impl NPXplorerApp {
         .map(|(_, title, which)| (egui::Id::new(title), which))
         .collect();
         if open.is_empty() {
+            // no window left to close: Esc leaves the rectangle zoom
+            if let Some(z) = self.zoom.take() {
+                self.view_start_s = z.prev_start_s;
+                self.view_dur_s = z.prev_dur_s;
+                self.window_dur_str = format!("{:.3}", self.view_dur_s);
+                self.heatmap_texture = None;
+            }
             return;
         }
         // back-to-front stacking order; a window not in it yet counts as the bottom one
@@ -2876,6 +2973,7 @@ impl NPXplorerApp {
                 // overlap exists and letting build_heatmap_into background-fill the rest —
                 // keeps the view live instead of freezing on a stale frame while extension
                 // or a full recompute catches up.
+                let rows_now = buf_display_rows.as_ref().map(|r| view_rows(r, self.zoom.as_ref()));
                 if matches_cfg {
                     let pos_changed = self.last_rendered_first != view_first;
                     let cfg_changed = self.last_rendered_cfg.as_ref() != Some(&self.preproc_cfg);
@@ -2885,13 +2983,13 @@ impl NPXplorerApp {
                     let need_rebuild = self.heatmap_texture.is_none()
                         || pos_changed || view_n != self.last_rendered_n
                         || size_changed || buf_changed
-                        || cfg_changed;
+                        || cfg_changed || rows_now != self.last_rendered_rows;
 
                     if need_rebuild && view_n > 0 {
                         if let (Some(data_arc), Some(display_rows)) = (&buf_data, &buf_display_rows) {
                             let stride = buf_n_samp;
 
-                            let (first_row, last_row) = all_rows(display_rows);
+                            let (first_row, last_row) = view_rows(display_rows, self.zoom.as_ref());
 
                             // spike projection over whatever time overlap currently exists
                             // between the view and the buffer (may be partial or none)
@@ -2911,6 +3009,7 @@ impl NPXplorerApp {
                                 || self.proj_threshold != self.spike_threshold
                                 || self.proj_sigma != self.spike_smoothing_sigma
                                 || self.proj_cfg.as_ref() != Some(&self.preproc_cfg)
+                                || self.proj_rows != Some((first_row, last_row))
                                 || buf_changed;
 
                             if proj_stale && self.show_firing_rate_overlay {
@@ -2977,6 +3076,7 @@ impl NPXplorerApp {
                                 self.proj_threshold = self.spike_threshold;
                                 self.proj_sigma = self.spike_smoothing_sigma;
                                 self.proj_cfg = Some(self.preproc_cfg.clone());
+                                self.proj_rows = Some((first_row, last_row));
                             }
 
                             let scale = if self.color_mode == ColorMode::Percentile && self.peak_pooling {
@@ -2984,10 +3084,15 @@ impl NPXplorerApp {
                             } else {
                                 crate::render::ColorScale::Fixed(vmax)
                             };
+                            let shown_rows = if display_rows.is_empty() {
+                                &display_rows[..]
+                            } else {
+                                &display_rows[first_row..=last_row]
+                            };
                             build_heatmap_into(
                                 &mut self.pixel_buf,
                                 data_arc,
-                                display_rows,
+                                shown_rows,
                                 stride, buf_first, buf_n_samp, view_first, view_n,
                                 pw, ph, scale, self.peak_pooling,
                                 &self.colormap_choice,
@@ -3004,6 +3109,7 @@ impl NPXplorerApp {
                             self.last_rendered_cfg = buf_cfg;
                             self.last_rendered_size = Some([pw, ph]);
                             self.last_rendered_buf = Some((buf_first, buf_n_samp));
+                            self.last_rendered_rows = Some((first_row, last_row));
                         }
                     }
                 }
@@ -3104,7 +3210,7 @@ impl NPXplorerApp {
                 if let Some(tex) = &self.heatmap_texture {
                     let img_widget = egui::Image::new(tex)
                         .fit_to_exact_size(avail)
-                        .sense(egui::Sense::click());
+                        .sense(egui::Sense::click_and_drag());
                     let resp = ui.add(img_widget);
                     self.ttl.draw_overlay(&ui.painter_at(resp.rect), resp.rect, self.view_start_s, self.view_dur_s, &self.colormap_choice);
 
@@ -3131,8 +3237,49 @@ impl NPXplorerApp {
                     }
 
                     if let Some(display_rows) = buf_display_rows.as_ref().filter(|r| !r.is_empty()) {
-                        let (first_row, last_row) = all_rows(display_rows);
+                        let (first_row, last_row) = view_rows(display_rows, self.zoom.as_ref());
                         let n_rows = last_row.saturating_sub(first_row) + 1;
+
+                        // rectangle zoom: plain left-drag (Alt+drag is left to the atlas
+                        // borders). Atlas border grab zones sit on top of the heatmap, so a
+                        // drag starting on a border never reaches here.
+                        if resp.drag_started_by(egui::PointerButton::Primary) && !alt_held {
+                            self.zoom_drag_start = ctx.input(|i| i.pointer.press_origin());
+                        }
+                        if let Some(start) = self.zoom_drag_start {
+                            let end = ctx.input(|i| i.pointer.interact_pos()).unwrap_or(start);
+                            let sel = egui::Rect::from_two_pos(start, end).intersect(resp.rect);
+                            if resp.drag_stopped() || !ctx.input(|i| i.pointer.primary_down()) {
+                                self.zoom_drag_start = None;
+                                let chans = zoom_selection(display_rows, first_row, last_row, resp.rect, sel);
+                                if sel.width() >= ZOOM_MIN_DRAG_PX && sel.height() >= ZOOM_MIN_DRAG_PX {
+                                    if let Some((ch_bottom, ch_top)) = chans {
+                                        let w = resp.rect.width() as f64;
+                                        let t0 = self.view_start_s + (sel.left() - resp.rect.left()) as f64 / w * self.view_dur_s;
+                                        let t1 = self.view_start_s + (sel.right() - resp.rect.left()) as f64 / w * self.view_dur_s;
+                                        // nested zooms keep the view from before the first one
+                                        let (prev_start_s, prev_dur_s) = self
+                                            .zoom
+                                            .as_ref()
+                                            .map_or((self.view_start_s, self.view_dur_s), |z| (z.prev_start_s, z.prev_dur_s));
+                                        let total_s = self.meta.n_samples as f64 / self.meta.sample_rate;
+                                        self.view_dur_s = (t1 - t0).max(0.01);
+                                        self.view_start_s = t0.clamp(0.0, (total_s - self.view_dur_s).max(0.0));
+                                        self.window_dur_str = format!("{:.3}", self.view_dur_s);
+                                        self.zoom = Some(Zoom { ch_bottom, ch_top, prev_start_s, prev_dur_s });
+                                        ctx.request_repaint();
+                                    }
+                                }
+                            } else {
+                                ui.painter().rect_filled(sel, 0.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 3));
+                                ui.painter().rect_stroke(
+                                    sel,
+                                    0.0,
+                                    egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                        }
 
                         // handle clicks
                         if let Some(pos) = click_pos {
@@ -3400,7 +3547,7 @@ impl NPXplorerApp {
 
                     if let Some(pos) = hover_pos {
                         if let Some(display_rows) = buf_display_rows.as_ref().filter(|r| !r.is_empty()) {
-                            let (first_row, last_row) = all_rows(display_rows);
+                            let (first_row, last_row) = view_rows(display_rows, self.zoom.as_ref());
                             let n_rows = last_row.saturating_sub(first_row) + 1;
 
                             let frac_y = ((pos.y - resp.rect.top()) / resp.rect.height()).clamp(0.0, 1.0);
@@ -3438,7 +3585,19 @@ impl NPXplorerApp {
                             } else { None };
 
                             let volt_str = voltage_uv.map(|v| format!("  {:.1} µV", v)).unwrap_or_default();
-                            let label = format!("{}t = {:.4} s{}", ch_str, t, volt_str);
+                            let mut label = format!("{}t = {:.4} s{}", ch_str, t, volt_str);
+                            // while dragging a zoom rectangle: the channel and time ranges it covers
+                            if let Some(start) = self.zoom_drag_start {
+                                let sel = egui::Rect::from_two_pos(start, pos).intersect(resp.rect);
+                                let t_at = |x: f32| {
+                                    self.view_start_s
+                                        + ((x - resp.rect.left()) / resp.rect.width()) as f64 * self.view_dur_s
+                                };
+                                let chans = zoom_selection(display_rows, first_row, last_row, resp.rect, sel)
+                                    .map(|(b, t)| format!("{}–{}  ", self.meta.channel_id(b), self.meta.channel_id(t)))
+                                    .unwrap_or_default();
+                                label = format!("{chans}t = {:.4}–{:.4} s", t_at(sel.left()), t_at(sel.right()));
+                            }
 
                             let font_id = egui::FontId::proportional(12.0);
                             let galley = ui.painter().layout_no_wrap(label, font_id.clone(), egui::Color32::from_rgba_unmultiplied(220, 220, 220, 200));
@@ -3469,6 +3628,25 @@ impl NPXplorerApp {
                         egui::FontId::proportional(14.0),
                         fg_color,
                     );
+
+                    // zoom notice, top left: solid text on a semi-transparent box, both
+                    // switching with the colormap (dark box / white text, or the reverse
+                    // on Cool-Warm's light background)
+                    if self.zoom.is_some() {
+                        let [br, bg, bb] = crate::render::atlas_label_bg(&self.colormap_choice);
+                        let galley = ui.painter().layout_no_wrap(
+                            "Esc to close zoom".to_string(),
+                            egui::FontId::proportional(13.0),
+                            fg_color,
+                        );
+                        let text_pos = resp.rect.left_top() + egui::vec2(10.0, 10.0);
+                        ui.painter().rect_filled(
+                            galley.rect.translate(text_pos.to_vec2()).expand2(egui::vec2(6.0, 4.0)),
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(br, bg, bb, 160),
+                        );
+                        ui.painter().galley(text_pos, galley, fg_color);
+                    }
                 }
 
                 } // end else (heatmap view)

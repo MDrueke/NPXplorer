@@ -52,6 +52,9 @@ pub struct AtlasUi {
     ins: Insertion,
     show_overlay: bool,
     table_shank: usize,
+    /// regions with fewer channels are not drawn on their own (global preference)
+    min_region_channels: usize,
+    min_region_channels_text: String,
 
     atlas: Option<Arc<Atlas>>,
     registration: Option<Arc<Registration>>,
@@ -106,10 +109,81 @@ fn label_bg(cmap: &ColorMapChoice) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, LABEL_BG_ALPHA)
 }
 
+/// Consecutive data rows of one shank drawn as one region on the heatmap.
+struct Span {
+    shank: u32,
+    region: Option<usize>,
+    /// display-row indices of the span's data rows, ascending (bottom to top)
+    rows: Vec<usize>,
+}
+
+/// Raw channels in a span's rows (averaged rows hold several).
+fn span_channels(span: &Span, display_rows: &[DisplayRow]) -> usize {
+    span.rows
+        .iter()
+        .map(|&r| match &display_rows[r] {
+            DisplayRow::Data { channels, .. } => channels.len(),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Fold every span with fewer than `min_channels` channels into its neighbours on the
+/// same shank, smallest first: its lower half joins the span below and its upper half
+/// the span above (so the border lands mid-region), or all three merge when both
+/// neighbours are the same region. A span alone on its shank is kept.
+fn fold_small_spans(spans: &mut Vec<Span>, display_rows: &[DisplayRow], min_channels: usize) {
+    loop {
+        let same_shank = |spans: &[Span], i: usize, j: usize| spans[i].shank == spans[j].shank;
+        let candidate = (0..spans.len())
+            .filter(|&i| {
+                (i > 0 && same_shank(spans, i, i - 1)) || (i + 1 < spans.len() && same_shank(spans, i, i + 1))
+            })
+            .map(|i| (i, span_channels(&spans[i], display_rows)))
+            .filter(|&(_, n)| n < min_channels)
+            .min_by_key(|&(_, n)| n);
+        let Some((i, _)) = candidate else { return };
+        let below = (i > 0 && same_shank(spans, i, i - 1)).then(|| i - 1);
+        let above = (i + 1 < spans.len() && same_shank(spans, i, i + 1)).then_some(i + 1);
+        let small = spans.remove(i);
+        match (below, above) {
+            (Some(b), Some(_)) if spans[b].region == spans[i].region => {
+                // neighbours now at b and i (= b + 1)
+                let upper = spans.remove(i);
+                spans[b].rows.extend(small.rows);
+                spans[b].rows.extend(upper.rows);
+            }
+            (Some(b), Some(_)) => {
+                // odd middle row goes to the larger neighbour
+                let n = small.rows.len();
+                let to_below = n / 2
+                    + usize::from(
+                        n % 2 == 1
+                            && span_channels(&spans[b], display_rows) >= span_channels(&spans[i], display_rows),
+                    );
+                spans[b].rows.extend_from_slice(&small.rows[..to_below]);
+                spans[i].rows.splice(0..0, small.rows[to_below..].iter().copied());
+            }
+            (Some(b), None) => spans[b].rows.extend(small.rows),
+            (None, Some(_)) => {
+                spans[i].rows.splice(0..0, small.rows);
+            }
+            (None, None) => unreachable!("candidates have a neighbour on their shank"),
+        }
+    }
+}
+
 impl AtlasUi {
-    /// `atlas_dir`/`bregma_lambda_mm` come from the global preferences; a sidecar file
-    /// next to the recording, if present, prefills the insertion (its BL distance wins).
-    pub fn new(bin_path: &Path, meta: &Arc<Meta>, atlas_dir: Option<String>, bregma_lambda_mm: f64) -> Self {
+    /// `atlas_dir`/`bregma_lambda_mm`/`min_region_channels` come from the global
+    /// preferences; a sidecar file next to the recording, if present, prefills the
+    /// insertion (its BL distance wins).
+    pub fn new(
+        bin_path: &Path,
+        meta: &Arc<Meta>,
+        atlas_dir: Option<String>,
+        bregma_lambda_mm: f64,
+        min_region_channels: usize,
+    ) -> Self {
         let (ins, edits) = atlas::load_sidecar(bin_path)
             .unwrap_or((Insertion { bregma_lambda_mm, ..Default::default() }, Vec::new()));
         Self {
@@ -119,6 +193,8 @@ impl AtlasUi {
             ins,
             show_overlay: false,
             table_shank: 0,
+            min_region_channels,
+            min_region_channels_text: min_region_channels.to_string(),
             atlas: None,
             registration: None,
             channel_regions: Vec::new(),
@@ -144,6 +220,10 @@ impl AtlasUi {
 
     pub fn bregma_lambda_mm(&self) -> f64 {
         self.ins.bregma_lambda_mm
+    }
+
+    pub fn min_region_channels(&self) -> usize {
+        self.min_region_channels
     }
 
     /// true once after a preference-backed value changed; the app then saves prefs
@@ -559,6 +639,27 @@ impl AtlasUi {
                 self.sidecar_dirty = true;
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("Skip drawing regions with less than");
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.min_region_channels_text).desired_width(30.0));
+            ui.label("channels");
+            if resp.changed() {
+                if let Ok(n) = self.min_region_channels_text.trim().parse::<usize>() {
+                    if n != self.min_region_channels {
+                        self.min_region_channels = n;
+                        self.prefs_dirty = true;
+                    }
+                }
+            }
+            if resp.lost_focus() {
+                self.min_region_channels_text = self.min_region_channels.to_string();
+            }
+        })
+        .response
+        .on_hover_text(
+            "thinner regions are split between their neighbours on the heatmap \
+             (0 or 1 draws every region); the hover readout and Save keep the exact regions",
+        );
 
         ui.horizontal(|ui| {
             if ui.add_enabled(!busy, egui::Button::new("Apply")).clicked() {
@@ -690,16 +791,13 @@ impl AtlasUi {
         let row_top = |r: usize| rect.top() + (last_row - r) as f32 * row_h;
         let row_bottom = |r: usize| row_top(r) + row_h;
 
-        // spans of consecutive data rows (gap rows don't interrupt) with one region
-        struct Span {
-            shank: u32,
-            region: Option<usize>,
-            /// display-row indices of the span's data rows, ascending (bottom to top)
-            rows: Vec<usize>,
-        }
+        // spans of consecutive data rows (gap rows don't interrupt) with one region,
+        // built over all rows so a region partly outside a zoomed view still counts
+        // all its channels; small regions are then folded into their neighbours, and
+        // the spans clipped to the rows on screen
         let mut spans: Vec<Span> = Vec::new();
-        for r in first_row..=last_row.min(display_rows.len().saturating_sub(1)) {
-            if let DisplayRow::Data { first_ch, shank, .. } = &display_rows[r] {
+        for (r, row) in display_rows.iter().enumerate() {
+            if let DisplayRow::Data { first_ch, shank, .. } = row {
                 let region = self.channel_regions.get(*first_ch).copied().flatten();
                 match spans.last_mut() {
                     Some(s) if s.shank == *shank && s.region == region => s.rows.push(r),
@@ -707,6 +805,11 @@ impl AtlasUi {
                 }
             }
         }
+        fold_small_spans(&mut spans, display_rows, self.min_region_channels);
+        for s in &mut spans {
+            s.rows.retain(|r| (first_row..=last_row).contains(r));
+        }
+        spans.retain(|s| !s.rows.is_empty());
 
         // probe position (y_um) of the data row on `shank` closest to screen height `py`
         let y_um_at = |py: f32, shank: u32| -> Option<f32> {
@@ -836,5 +939,52 @@ impl AtlasUi {
         if let Some((rows, region)) = reassign {
             self.record_edit(display_rows, &rows, region);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// one single-channel data row per entry, all on shank 0
+    fn setup(regions: &[usize]) -> (Vec<DisplayRow>, Vec<Span>) {
+        let rows: Vec<DisplayRow> = (0..regions.len())
+            .map(|i| DisplayRow::Data { data_idx: i, channels: vec![i], first_ch: i, x_um: 0.0, y_um: i as f32, shank: 0 })
+            .collect();
+        let mut spans: Vec<Span> = Vec::new();
+        for (r, &region) in regions.iter().enumerate() {
+            match spans.last_mut() {
+                Some(s) if s.region == Some(region) => s.rows.push(r),
+                _ => spans.push(Span { shank: 0, region: Some(region), rows: vec![r] }),
+            }
+        }
+        (rows, spans)
+    }
+
+    fn summary(spans: &[Span]) -> Vec<(usize, Vec<usize>)> {
+        spans.iter().map(|s| (s.region.unwrap(), s.rows.clone())).collect()
+    }
+
+    #[test]
+    fn thin_region_is_split_between_neighbours() {
+        let (rows, mut spans) = setup(&[1, 1, 1, 1, 2, 2, 3, 3, 3, 3]);
+        fold_small_spans(&mut spans, &rows, 4);
+        assert_eq!(summary(&spans), vec![(1, vec![0, 1, 2, 3, 4]), (3, vec![5, 6, 7, 8, 9])]);
+    }
+
+    #[test]
+    fn thin_region_between_same_regions_merges_them() {
+        let (rows, mut spans) = setup(&[1, 1, 1, 1, 2, 1, 1, 1, 1]);
+        fold_small_spans(&mut spans, &rows, 4);
+        assert_eq!(summary(&spans), vec![(1, (0..9).collect())]);
+    }
+
+    #[test]
+    fn edge_region_joins_its_only_neighbour_and_threshold_off_keeps_all() {
+        let (rows, mut spans) = setup(&[1, 2, 2, 2, 2]);
+        fold_small_spans(&mut spans, &rows, 1);
+        assert_eq!(spans.len(), 2);
+        fold_small_spans(&mut spans, &rows, 4);
+        assert_eq!(summary(&spans), vec![(2, (0..5).collect())]);
     }
 }
