@@ -1,4 +1,4 @@
-# NPXplorer v0.6.6
+# NPXplorer v0.6.7
 
 A viewer for raw Neuropixels recordings. Shows the voltage of all channels as a heatmap laid out by the probe geometry.
 
