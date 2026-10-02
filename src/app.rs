@@ -22,6 +22,7 @@ pub enum ColorMode {
 
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ColorMapChoice {
+    SunFire,
     YellowMagenta,
     RedBlue,
     OrangeBlue,
@@ -368,9 +369,9 @@ struct Zoom {
 /// all rows when not zoomed (or when a zoom channel no longer has a row).
 fn view_rows(display_rows: &[DisplayRow], zoom: Option<&Zoom>) -> (usize, usize) {
     let row_of = |ch: usize| {
-        display_rows.iter().position(|r| {
-            matches!(r, DisplayRow::Data { channels, .. } if channels.contains(&ch))
-        })
+        display_rows
+            .iter()
+            .position(|r| matches!(r, DisplayRow::Data { channels, .. } if channels.contains(&ch)))
     };
     match zoom.map(|z| (row_of(z.ch_bottom), row_of(z.ch_top))) {
         Some((Some(lo), Some(hi))) if lo <= hi => (lo, hi),
@@ -394,7 +395,9 @@ fn zoom_selection(
     let n_rows = last_row - first_row + 1;
     let row_at = |y: f32| {
         let frac = ((y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-        last_row.saturating_sub((frac as f64 * n_rows as f64) as usize).clamp(first_row, last_row)
+        last_row
+            .saturating_sub((frac as f64 * n_rows as f64) as usize)
+            .clamp(first_row, last_row)
     };
     let data_rows: Vec<(usize, usize)> = (first_row..=last_row)
         .filter_map(|r| match &display_rows[r] {
@@ -739,8 +742,10 @@ impl NPXplorerApp {
         let stim_sidecar = crate::ttl::load_sidecar(&bin_path);
         let mut psth = PsthState::new(psth_total_s);
         psth.restore(&stim_sidecar);
-        let remove_channels_text =
-            crate::channel_remove::format_channel_list(&preproc_cfg.removed_channels, &meta.channel_ids);
+        let remove_channels_text = crate::channel_remove::format_channel_list(
+            &preproc_cfg.removed_channels,
+            &meta.channel_ids,
+        );
         let app = Self {
             bin_path,
             meta,
@@ -841,7 +846,6 @@ impl Drop for NPXplorerApp {
 }
 
 impl NPXplorerApp {
-
     pub fn save_prefs(&self) {
         let last_dir = self
             .bin_path
@@ -911,7 +915,9 @@ impl NPXplorerApp {
     // -----------------------------------------------------------------------
 
     fn apply_removed_channels(&mut self, set: BTreeSet<usize>) {
-        let n_left = (0..self.meta.n_ap_chans).filter(|c| !set.contains(c)).count();
+        let n_left = (0..self.meta.n_ap_chans)
+            .filter(|c| !set.contains(c))
+            .count();
         if n_left == 0 {
             self.remove_channels_error =
                 Some("this would remove every channel — at least one must stay".to_string());
@@ -924,7 +930,10 @@ impl NPXplorerApp {
 
     /// Parse `remove_channels_text` and apply it, or set an error message on failure.
     fn apply_remove_channels_text(&mut self) {
-        match crate::channel_remove::parse_channel_list(&self.remove_channels_text, &self.meta.channel_ids) {
+        match crate::channel_remove::parse_channel_list(
+            &self.remove_channels_text,
+            &self.meta.channel_ids,
+        ) {
             Ok(set) => {
                 self.remove_channels_error = None;
                 self.apply_removed_channels(set);
@@ -960,7 +969,10 @@ impl NPXplorerApp {
                         match result {
                             Ok(set) => {
                                 self.remove_channels_text =
-                                    crate::channel_remove::format_channel_list(&set, &self.meta.channel_ids);
+                                    crate::channel_remove::format_channel_list(
+                                        &set,
+                                        &self.meta.channel_ids,
+                                    );
                                 self.remove_channels_error = None;
                                 self.apply_removed_channels(set);
                             }
@@ -1004,7 +1016,9 @@ impl NPXplorerApp {
                     if ui.button("Apply").clicked() {
                         self.apply_remove_channels_text();
                     }
-                    if ui.button("Load from file…").clicked() && self.remove_channels_pick_rx.is_none() {
+                    if ui.button("Load from file…").clicked()
+                        && self.remove_channels_pick_rx.is_none()
+                    {
                         self.remove_channels_pick_rx = Some(spawn_channel_list_picker(
                             self.bin_path.parent().map(|p| p.to_path_buf()),
                         ));
@@ -1053,7 +1067,13 @@ impl NPXplorerApp {
 
         std::thread::spawn(move || {
             let res = crate::channel_classify::classify_recording(
-                &raw, &meta, &removed, n_chunks, outside_rule, &cancel, &progress,
+                &raw,
+                &meta,
+                &removed,
+                n_chunks,
+                outside_rule,
+                &cancel,
+                &progress,
             )
             .ok_or_else(|| "cancelled".to_string());
             let _ = tx.send(res);
@@ -1202,7 +1222,13 @@ impl NPXplorerApp {
                 crate::render::C_ZERO[2],
             ),
         );
-        self.ttl.draw_overlay(&painter, rect, self.view_start_s, self.view_dur_s, &self.colormap_choice);
+        self.ttl.draw_overlay(
+            &painter,
+            rect,
+            self.view_start_s,
+            self.view_dur_s,
+            &self.colormap_choice,
+        );
 
         let row_data: Option<(Arc<Vec<f32>>, usize)> = if matches_cfg {
             buf_display_rows
@@ -1273,7 +1299,10 @@ impl NPXplorerApp {
                         painter.text(
                             egui::pos2(rect.left() + 6.0, rect.top() + 4.0),
                             egui::Align2::LEFT_TOP,
-                            format!("{}  ·  ±{half_range:.0} µV (Alt+scroll to rescale)", self.meta.channel_id(ch - 1)),
+                            format!(
+                                "{}  ·  ±{half_range:.0} µV (Alt+scroll to rescale)",
+                                self.meta.channel_id(ch - 1)
+                            ),
                             egui::FontId::proportional(13.0),
                             egui::Color32::from_gray(200),
                         );
@@ -1438,8 +1467,17 @@ impl NPXplorerApp {
                         t_start, t_end
                     ));
                 }
-                compute_psth(&raw, &meta, &cfg, &times, &params, &cancel, &progress, &progress_total)
-                    .map_err(|e| e.to_string())
+                compute_psth(
+                    &raw,
+                    &meta,
+                    &cfg,
+                    &times,
+                    &params,
+                    &cancel,
+                    &progress,
+                    &progress_total,
+                )
+                .map_err(|e| e.to_string())
             })();
             let _ = tx.send(res);
             ctx.request_repaint();
@@ -1680,7 +1718,8 @@ impl NPXplorerApp {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // right-to-left: the field goes first so the label ends up left of it
-                let resp = ui.add(egui::TextEdit::singleline(&mut self.jump_str).desired_width(70.0));
+                let resp =
+                    ui.add(egui::TextEdit::singleline(&mut self.jump_str).desired_width(70.0));
                 ui.label("Jump to (s):");
                 if resp.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     if let Ok(t) = self.jump_str.trim().parse::<f64>() {
@@ -1785,8 +1824,11 @@ impl NPXplorerApp {
                             self.selected_channel_2 = None;
                         }
                         ui.label(
-                            egui::RichText::new(format!("Selected Channel 2: {}", self.meta.channel_id(ch2 - 1)))
-                                .color(egui::Color32::from_rgb(0xff, 0xb6, 0x17)),
+                            egui::RichText::new(format!(
+                                "Selected Channel 2: {}",
+                                self.meta.channel_id(ch2 - 1)
+                            ))
+                            .color(egui::Color32::from_rgb(0xff, 0xb6, 0x17)),
                         );
                     }
                 }
@@ -1991,7 +2033,9 @@ impl NPXplorerApp {
                 });
             });
 
-            if let Some(e) = crate::ttl::format_editor(ui, &mut self.stim_layout_text, &self.bin_path) {
+            if let Some(e) =
+                crate::ttl::format_editor(ui, &mut self.stim_layout_text, &self.bin_path)
+            {
                 self.psth.error = Some(e);
             }
 
@@ -2126,10 +2170,16 @@ impl NPXplorerApp {
                     ui.label(base);
                     ui.label("·  left-click / right-click the heatmap to plot a channel:");
                     if let Some(c) = self.psth.sel_ch1 {
-                        ui.colored_label(egui::Color32::from_rgb(255, 255, 255), self.meta.channel_id(c - 1));
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 255, 255),
+                            self.meta.channel_id(c - 1),
+                        );
                     }
                     if let Some(c) = self.psth.sel_ch2 {
-                        ui.colored_label(egui::Color32::from_rgb(255, 182, 23), self.meta.channel_id(c - 1));
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 182, 23),
+                            self.meta.channel_id(c - 1),
+                        );
                     }
                     if (self.psth.sel_ch1.is_some() || self.psth.sel_ch2.is_some())
                         && ui.button("Deselect").clicked()
@@ -2170,7 +2220,8 @@ impl NPXplorerApp {
                     self.psth.color_pct = (self.psth.color_pct - ticks * 0.1).clamp(95.0, 100.0);
                 } else {
                     // multiplicative, so the step suits both 2 µV and 200 µV
-                    self.psth.color_uv = (self.psth.color_uv * 1.1f32.powf(-ticks)).clamp(1.0, 200.0);
+                    self.psth.color_uv =
+                        (self.psth.color_uv * 1.1f32.powf(-ticks)).clamp(1.0, 200.0);
                 }
                 self.psth.tex_dirty = true;
             }
@@ -2260,7 +2311,15 @@ impl NPXplorerApp {
         let zoom = self.psth.trace_vmax_ref / vmax;
         let size_changed = self.psth.last_tex_size != Some([pw, ph]);
         if self.psth.tex_dirty || size_changed || self.psth.texture.is_none() {
-            build_psth_heatmap_into(&mut self.psth.pixel_buf, result, pw, ph, vmax, self.peak_pooling, cmap);
+            build_psth_heatmap_into(
+                &mut self.psth.pixel_buf,
+                result,
+                pw,
+                ph,
+                vmax,
+                self.peak_pooling,
+                cmap,
+            );
             let img = egui::ColorImage::from_rgba_unmultiplied([pw, ph], &self.psth.pixel_buf);
             self.psth.texture = Some(ui.ctx().load_texture(
                 "psth_heatmap",
@@ -2501,7 +2560,11 @@ impl NPXplorerApp {
             (self.show_remove_channels, "Remove channels", 2),
             (self.show_preferences, "Preferences", 3),
             (self.ttl.open, "TTL", 4),
-            (self.classify_error.is_some(), "Channel Classification failed", 5),
+            (
+                self.classify_error.is_some(),
+                "Channel Classification failed",
+                5,
+            ),
         ]
         .into_iter()
         .filter(|(is_open, ..)| *is_open)
@@ -2518,9 +2581,7 @@ impl NPXplorerApp {
             return;
         }
         // back-to-front stacking order; a window not in it yet counts as the bottom one
-        let depth = |id: egui::Id| {
-            ctx.memory(|m| m.layer_ids().position(|l| l.id == id))
-        };
+        let depth = |id: egui::Id| ctx.memory(|m| m.layer_ids().position(|l| l.id == id));
         let (_, which) = open.into_iter().max_by_key(|(id, _)| depth(*id)).unwrap();
         match which {
             0 => self.psth.open = false,
@@ -2542,9 +2603,15 @@ impl NPXplorerApp {
         self.draw_classify_progress_window(ctx);
         self.draw_channel_context_menu(ctx);
         self.atlas.poll(ctx);
-        self.atlas.draw_window(ctx, &self.meta, &self.bin_path, &self.colormap_choice);
+        self.atlas
+            .draw_window(ctx, &self.meta, &self.bin_path, &self.colormap_choice);
         self.atlas.draw_progress_window(ctx);
-        if self.ttl.draw_window(ctx, &mut self.stim_layout_text, &self.bin_path, &mut self.stim_file) {
+        if self.ttl.draw_window(
+            ctx,
+            &mut self.stim_layout_text,
+            &self.bin_path,
+            &mut self.stim_file,
+        ) {
             self.stim_sidecar_dirty = true;
         }
         // written once the mouse is released, so slider drags don't write every frame
@@ -2585,6 +2652,7 @@ impl NPXplorerApp {
                         let mut cm = self.colormap_choice.clone();
                         egui::ComboBox::from_id_salt("cm_combo")
                             .selected_text(match cm {
+                                ColorMapChoice::SunFire => "SunFire",
                                 ColorMapChoice::YellowMagenta => "Yellow-Magenta",
                                 ColorMapChoice::RedBlue => "Red-Blue",
                                 ColorMapChoice::OrangeBlue => "Orange-Blue",
@@ -2594,6 +2662,7 @@ impl NPXplorerApp {
                                 ColorMapChoice::CoolWarm => "Cool-Warm",
                             })
                             .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut cm, ColorMapChoice::SunFire, "SunFire");
                                 ui.selectable_value(&mut cm, ColorMapChoice::YellowMagenta, "Yellow-Magenta");
                                 ui.selectable_value(&mut cm, ColorMapChoice::RedBlue, "Red-Blue");
                                 ui.selectable_value(&mut cm, ColorMapChoice::OrangeBlue, "Orange-Blue");
@@ -2822,15 +2891,19 @@ impl NPXplorerApp {
             .input(|i| i.pointer.hover_pos())
             .and_then(|p| ctx.layer_id_at(p))
             .is_some_and(|layer| layer.order != egui::Order::Background);
-        let ticks = if pointer_over_window { 0.0 } else { ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|e| match e {
-                    egui::Event::MouseWheel { delta, .. } => Some(delta.y.signum()),
-                    _ => None,
-                })
-                .sum::<f32>()
-        }) };
+        let ticks = if pointer_over_window {
+            0.0
+        } else {
+            ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::MouseWheel { delta, .. } => Some(delta.y.signum()),
+                        _ => None,
+                    })
+                    .sum::<f32>()
+            })
+        };
         if ticks != 0.0 && alt_held {
             // inverted relative to a plain sum of tick signs: scrolling up now
             // decreases the value (mirrors the "zoom out" feel of scroll-up elsewhere)
@@ -3367,6 +3440,7 @@ impl NPXplorerApp {
                             // per-map alpha is tuned for this overlay's many-triangle accumulation,
                             // so it stays separate from the shared RGB in render::colormap_accent
                             let overlay_alpha = match self.colormap_choice {
+                                ColorMapChoice::SunFire => 5,
                                 ColorMapChoice::YellowMagenta => 5,
                                 ColorMapChoice::RedBlue => 8,
                                 ColorMapChoice::OrangeBlue => 5,
