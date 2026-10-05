@@ -1,60 +1,7 @@
+use crate::colormap::ColorMapChoice;
 use crate::data::DisplayRow;
 
-pub const C_ZERO: [u8; 3] = [0x17, 0x1b, 0x21]; // #171b21 (was #262930 grey)
-
-/// Single representative accent color per colormap. This is the one place to edit
-/// when tuning colors that need to track the active colormap outside the heatmap
-/// itself — e.g. the nav bar's view/buffer markers and the spike projection overlay.
-pub fn colormap_accent(cmap: &crate::app::ColorMapChoice) -> [u8; 3] {
-    match cmap {
-        crate::app::ColorMapChoice::SunFire => [248, 230, 5],
-        crate::app::ColorMapChoice::YellowMagenta => [250, 234, 130],
-        crate::app::ColorMapChoice::RedBlue => [248, 5, 5],
-        crate::app::ColorMapChoice::OrangeBlue => [242, 171, 126],
-        crate::app::ColorMapChoice::IceFire => [57, 5, 248],
-        crate::app::ColorMapChoice::Vanimo => [202, 237, 166],
-        crate::app::ColorMapChoice::GreyScale => [255, 255, 255],
-        crate::app::ColorMapChoice::CoolWarm => [120, 150, 240],
-    }
-}
-
-/// Color of the atlas region borders, region labels on the heatmap and region names in
-/// the Atlas Registration table — one per colormap, picked to stand out against the map
-/// and against the other heatmap lines (white shank boundaries, grey channel gaps,
-/// white/orange selections). This is the one place to edit to change them.
-pub fn atlas_color(cmap: &crate::app::ColorMapChoice) -> [u8; 3] {
-    match cmap {
-        crate::app::ColorMapChoice::SunFire => [255, 255, 255],
-        crate::app::ColorMapChoice::YellowMagenta => [255, 255, 255],
-        crate::app::ColorMapChoice::RedBlue => [255, 255, 255],
-        crate::app::ColorMapChoice::OrangeBlue => [255, 255, 255],
-        crate::app::ColorMapChoice::IceFire => [255, 255, 255],
-        crate::app::ColorMapChoice::Vanimo => [255, 255, 255],
-        crate::app::ColorMapChoice::GreyScale => [255, 255, 255],
-        crate::app::ColorMapChoice::CoolWarm => [0, 0, 0],
-    }
-}
-
-/// Background of the boxes behind the region labels on the heatmap and behind the
-/// region names in the Atlas Registration table (drawn semi-transparent) — must
-/// contrast with `atlas_color`: dark for the light region colors, white for Cool-Warm's
-/// black ones.
-pub fn atlas_label_bg(cmap: &crate::app::ColorMapChoice) -> [u8; 3] {
-    match cmap {
-        crate::app::ColorMapChoice::CoolWarm => [255, 255, 255],
-        _ => C_ZERO,
-    }
-}
-
-/// Color of the markers drawn directly on top of the heatmap (shank boundaries,
-/// "shank N" labels, first selected channel, scale bar): white on the maps whose
-/// zero is the dark background, near-black on Cool-Warm, whose zero is light grey.
-pub fn heatmap_fg(cmap: &crate::app::ColorMapChoice) -> [u8; 3] {
-    match cmap {
-        crate::app::ColorMapChoice::CoolWarm => [25, 25, 25],
-        _ => [255, 255, 255],
-    }
-}
+pub use crate::colormap::C_ZERO;
 
 /// Opacity (0-255) of the nav bar's "preprocessed buffer extent" shading.
 /// 26 ≈ 10% — the one place to tune this.
@@ -64,231 +11,8 @@ pub const BUFFER_EXTENT_ALPHA: u8 = 10;
 pub const VIEW_MARKER_ALPHA: u8 = 180;
 
 #[inline]
-fn lerp_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
-    [
-        (a[0] as f32 + (b[0] as f32 - a[0] as f32) * t) as u8,
-        (a[1] as f32 + (b[1] as f32 - a[1] as f32) * t) as u8,
-        (a[2] as f32 + (b[2] as f32 - a[2] as f32) * t) as u8,
-    ]
-}
-
-#[inline]
-fn interpolate_stops(t: f32, stops: &[[u8; 3]]) -> [u8; 3] {
-    let n = stops.len() - 1;
-    let scaled_t = t * n as f32;
-    let idx = scaled_t.floor() as usize;
-    if idx >= n {
-        return stops[n];
-    }
-    let local_t = scaled_t - idx as f32;
-    lerp_rgb(stops[idx], stops[idx + 1], local_t)
-}
-
-#[inline]
-pub fn voltage_to_rgba(v: f32, vmax: f32, cmap: &crate::app::ColorMapChoice) -> [u8; 4] {
-    let t = (v / vmax).clamp(-1.0, 1.0); // -1..1
-
-    let [r, g, b] = match cmap {
-        crate::app::ColorMapChoice::SunFire => {
-            if t >= 0.0 {
-                interpolate_stops(
-                    t,
-                    &[
-                        C_ZERO,
-                        [0x40, 0x26, 0x26],
-                        [0x58, 0x1f, 0x1f],
-                        [0xb8, 0x24, 0x24],
-                        [0xdf, 0x04, 0x04],
-                    ],
-                )
-            } else {
-                interpolate_stops(
-                    -t,
-                    &[
-                        C_ZERO,
-                        [0x3e, 0x35, 0x28],
-                        [0x4d, 0x3d, 0x25],
-                        [0x56, 0x44, 0x22],
-                        [0x81, 0x61, 0x24],
-                        [0xd1, 0x9b, 0x20],
-                        [0xff, 0xbd, 0x00],
-                    ],
-                )
-            }
-        }
-        crate::app::ColorMapChoice::YellowMagenta => {
-            if t >= 0.0 {
-                interpolate_stops(
-                    t,
-                    &[
-                        C_ZERO,
-                        [0x44, 0x2a, 0x4a],
-                        [0x5d, 0x33, 0x66],
-                        [0x7b, 0x26, 0x8c],
-                        [0x93, 0x04, 0xb0],
-                    ],
-                )
-            } else {
-                interpolate_stops(
-                    -t,
-                    &[
-                        C_ZERO,
-                        [0x33, 0x31, 0x26],
-                        [0x3d, 0x39, 0x1f],
-                        [0x52, 0x4b, 0x1e],
-                        [0x75, 0x6a, 0x1e],
-                        [0xa3, 0x90, 0x12],
-                        [0xff, 0xdf, 0x12],
-                    ],
-                )
-            }
-        }
-        crate::app::ColorMapChoice::RedBlue => {
-            if t >= 0.0 {
-                interpolate_stops(
-                    t,
-                    &[
-                        C_ZERO,
-                        [0x2e, 0x30, 0x42],
-                        [0x25, 0x2c, 0x61],
-                        [0x24, 0x34, 0xb3],
-                        [0x2c, 0x43, 0xf5],
-                    ],
-                )
-            } else {
-                interpolate_stops(
-                    -t,
-                    &[
-                        C_ZERO,
-                        [0x40, 0x2c, 0x2b],
-                        [0x61, 0x2f, 0x2c],
-                        [0x9e, 0x32, 0x2b],
-                        [0xf5, 0x43, 0x36],
-                    ],
-                )
-            }
-        }
-        crate::app::ColorMapChoice::OrangeBlue => {
-            if t >= 0.0 {
-                interpolate_stops(
-                    t,
-                    &[
-                        C_ZERO,
-                        [0x29, 0x3b, 0x54],
-                        [0x31, 0x54, 0x85],
-                        [0x2d, 0x6f, 0xc4],
-                    ],
-                )
-            } else {
-                interpolate_stops(
-                    -t,
-                    &[
-                        C_ZERO,
-                        [0x4a, 0x29, 0x22],
-                        [0x75, 0x36, 0x28],
-                        [0xd1, 0x42, 0x21],
-                    ],
-                )
-            }
-        }
-        crate::app::ColorMapChoice::IceFire => {
-            if t >= 0.0 {
-                interpolate_stops(
-                    t,
-                    &[
-                        C_ZERO,
-                        [0x39, 0x32, 0x47],
-                        [0x39, 0x29, 0x5c],
-                        [0x46, 0x27, 0x8a],
-                        [0x20, 0x5f, 0x9e],
-                        [0x71, 0xb5, 0xbd],
-                        [0x93, 0xcf, 0xc9],
-                    ],
-                )
-            } else {
-                interpolate_stops(
-                    -t,
-                    &[
-                        C_ZERO,
-                        [0x40, 0x31, 0x30],
-                        [0x4d, 0x2f, 0x2d],
-                        [0x5e, 0x29, 0x25],
-                        [0x8a, 0x24, 0x1d],
-                        [0xba, 0x4f, 0x22],
-                        [0xd9, 0xa2, 0x73],
-                    ],
-                )
-            }
-        }
-        crate::app::ColorMapChoice::Vanimo => {
-            if t >= 0.0 {
-                interpolate_stops(
-                    t,
-                    &[
-                        C_ZERO,
-                        [0x2e, 0x36, 0x27],
-                        [0x3c, 0x52, 0x27],
-                        [0x56, 0x8a, 0x22],
-                        [0x8d, 0xed, 0x2d],
-                    ],
-                )
-            } else {
-                interpolate_stops(
-                    -t,
-                    &[
-                        C_ZERO,
-                        [0x43, 0x31, 0x47],
-                        [0x66, 0x35, 0x73],
-                        [0xb9, 0x4e, 0xd4],
-                    ],
-                )
-            }
-        }
-        crate::app::ColorMapChoice::GreyScale => {
-            if t >= 0.0 {
-                interpolate_stops(t, &[C_ZERO, [0x00, 0x00, 0x00]])
-            } else {
-                interpolate_stops(
-                    -t,
-                    &[
-                        C_ZERO,
-                        [0x30, 0x30, 0x30],
-                        [0x50, 0x50, 0x50],
-                        [0x60, 0x60, 0x60],
-                        [0xd0, 0xd0, 0xd0],
-                    ],
-                )
-            }
-        }
-        // matplotlib's "coolwarm" (Moreland) colors: blue - light grey - red. Oriented
-        // like the other maps, negative (spikes) in the warm color; unlike them, zero is
-        // light grey rather than the background
-        crate::app::ColorMapChoice::CoolWarm => {
-            if t >= 0.0 {
-                interpolate_stops(
-                    t,
-                    &[
-                        [0xdd, 0xdd, 0xdd],
-                        [0xb8, 0xd0, 0xf9],
-                        [0x8d, 0xb0, 0xfe],
-                        [0x62, 0x82, 0xea],
-                        [0x3b, 0x4c, 0xc0],
-                    ],
-                )
-            } else {
-                interpolate_stops(
-                    -t,
-                    &[
-                        [0xdd, 0xdd, 0xdd],
-                        [0xf5, 0xc4, 0xad],
-                        [0xf4, 0x9a, 0x7b],
-                        [0xde, 0x60, 0x4d],
-                        [0xb4, 0x04, 0x26],
-                    ],
-                )
-            }
-        }
-    };
+pub fn voltage_to_rgba(v: f32, vmax: f32, cmap: &ColorMapChoice) -> [u8; 4] {
+    let [r, g, b] = cmap.spec().color((v / vmax).clamp(-1.0, 1.0));
     [r, g, b, 255]
 }
 
@@ -415,7 +139,7 @@ fn abs_percentile(values: impl Iterator<Item = f32>, pct: f32) -> Option<f32> {
 }
 
 /// Colour a pixel row from pooled values (NaN = no data -> background).
-fn colour_row(row: &mut [u8], pooled: &[f32], vmax: f32, cmap: &crate::app::ColorMapChoice) {
+fn colour_row(row: &mut [u8], pooled: &[f32], vmax: f32, cmap: &ColorMapChoice) {
     for (px, &v) in row.chunks_exact_mut(4).zip(pooled) {
         let rgba = if v.is_nan() {
             [C_ZERO[0], C_ZERO[1], C_ZERO[2], 255]
@@ -457,7 +181,7 @@ pub fn build_heatmap_into(
     pixel_h: usize,
     scale: ColorScale,
     peak_pooling: bool,
-    cmap: &crate::app::ColorMapChoice,
+    cmap: &ColorMapChoice,
 ) -> f32 {
     use rayon::prelude::*;
     let total = pixel_w * pixel_h * 4;
@@ -517,7 +241,7 @@ pub fn build_heatmap_into(
         pixel_h,
         |disp_idx, row| match &display_rows[disp_idx] {
             DisplayRow::IntraShankGap => fill_gap(row),
-            DisplayRow::ShankBoundary => fill_solid(row, heatmap_fg(cmap)),
+            DisplayRow::ShankBoundary => fill_solid(row, cmap.spec().heatmap_fg),
             DisplayRow::Data { .. } => {
                 colour_row(row, pooled[disp_idx].as_deref().unwrap_or(&[]), vmax, cmap)
             }
@@ -536,7 +260,7 @@ pub fn build_psth_heatmap_into(
     pixel_h: usize,
     vmax: f32,
     peak_pooling: bool,
-    cmap: &crate::app::ColorMapChoice,
+    cmap: &ColorMapChoice,
 ) {
     out.resize(pixel_w * pixel_h * 4, 0);
     if pixel_w == 0 || pixel_h == 0 {
@@ -558,7 +282,7 @@ pub fn build_psth_heatmap_into(
         pixel_h,
         |disp_idx, row| match &display_rows[disp_idx] {
             DisplayRow::IntraShankGap => fill_gap(row),
-            DisplayRow::ShankBoundary => fill_solid(row, heatmap_fg(cmap)),
+            DisplayRow::ShankBoundary => fill_solid(row, cmap.spec().heatmap_fg),
             DisplayRow::Data { data_idx, .. } => {
                 let ch_data = &data[data_idx * n_win..(data_idx + 1) * n_win];
                 let pooled: Vec<f32> = (0..pixel_w)
@@ -573,9 +297,259 @@ pub fn build_psth_heatmap_into(
     );
 }
 
+// ---------------------------------------------------------------------------
+// Power spectrum heatmap
+// ---------------------------------------------------------------------------
+
+pub use crate::colormap::spectrum_color;
+
+/// Dynamic range (dB below the peak) mapped into the colour scale, dB scaling only.
+const SPECTRUM_DB_RANGE: f32 = 60.0;
+
+#[inline]
+fn spectrum_scaled(v: f32, scaling: crate::spectrum::SpectrumScaling) -> f32 {
+    match scaling {
+        crate::spectrum::SpectrumScaling::Linear => v,
+        crate::spectrum::SpectrumScaling::Db => 10.0 * v.max(1e-20).log10(),
+    }
+}
+
+/// Resolves a requested display frequency range (Hz) against the data's actual
+/// bins (first non-DC bin .. last bin): `None` shows the full band; `Some((lo, hi))`
+/// is clamped to it. Shared by the heatmap builder and its axis tick labels so both
+/// agree on exactly what's displayed.
+pub fn spectrum_freq_bounds(freqs: &[f32], range: Option<(f32, f32)>) -> (f32, f32) {
+    let n = freqs.len();
+    let data_lo = freqs.get(1).copied().unwrap_or(0.0).max(1e-6);
+    let data_hi = freqs.get(n.wrapping_sub(1)).copied().unwrap_or(data_lo * 2.0).max(data_lo * 1.0001);
+    let Some((a, b)) = range else {
+        return (data_lo, data_hi);
+    };
+    // order-independent; data_lo < data_hi, so these clamps can't panic
+    let lo = a.min(b).clamp(data_lo, data_hi);
+    let hi = a.max(b).clamp(data_lo, data_hi);
+    if hi > lo * 1.0001 {
+        return (lo, hi);
+    }
+    // zero-width request (e.g. both ends at Nyquist): the narrowest band at that end
+    let hi = (lo * 1.0001).min(data_hi);
+    (hi / 1.0001, hi)
+}
+
+/// Frequencies (Hz) to label on the spectrum panel's axis, ascending. The full band
+/// gets fixed anchors (those that fall inside it, if at least 3 do); otherwise up to 4
+/// round values spread evenly along the log axis.
+pub fn spectrum_ticks(f_lo: f32, f_hi: f32, restricted: bool) -> Vec<f32> {
+    let inside = |f: f32| f >= f_lo * 0.999 && f <= f_hi * 1.001;
+    if !restricted {
+        let anchors: Vec<f32> = [50.0, 250.0, 2000.0, 15000.0].into_iter().filter(|&f| inside(f)).collect();
+        // e.g. an LFP band (Nyquist ~1.25 kHz) holds only 50 and 250: too sparse
+        if anchors.len() >= 3 {
+            return anchors;
+        }
+    }
+    // round candidates per decade: 1-2-5 first, every multiple if that's too sparse
+    let candidates = |mults: &[f32]| -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut decade = 10f32.powi(f_lo.max(1.0).log10().floor() as i32);
+        while decade <= f_hi * 1.001 {
+            out.extend(mults.iter().map(|m| m * decade).filter(|&f| inside(f)));
+            decade *= 10.0;
+        }
+        out
+    };
+    let coarse = candidates(&[1.0, 2.0, 5.0]);
+    let fine = candidates(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+    let pick = if coarse.len() >= 3 {
+        coarse
+    } else if fine.len() >= 2 {
+        fine
+    } else {
+        // band too narrow for any of those: round linear steps
+        let raw = ((f_hi - f_lo) / 3.0).max(1e-6);
+        let mag = 10f32.powf(raw.log10().floor());
+        let m = [1.0, 2.0, 5.0, 10.0].into_iter().find(|&m| m * mag >= raw).unwrap_or(10.0);
+        let step = (m * mag).max(1.0);
+        let mut out = Vec::new();
+        let mut f = (f_lo / step).ceil() * step;
+        while f <= f_hi * 1.001 && out.len() < 4 {
+            out.push(f);
+            f += step;
+        }
+        return out;
+    };
+    if pick.len() <= 4 {
+        return pick;
+    }
+    // the candidate nearest (in log distance) to each of 4 evenly log-spaced targets
+    let (log_lo, log_hi) = (f_lo.ln(), f_hi.ln());
+    let mut out: Vec<f32> = Vec::new();
+    for i in 0..4 {
+        let target = log_lo + (log_hi - log_lo) * i as f32 / 3.0;
+        let best = pick
+            .iter()
+            .copied()
+            .min_by(|a, b| (a.ln() - target).abs().total_cmp(&(b.ln() - target).abs()))
+            .unwrap();
+        if out.last() != Some(&best) {
+            out.push(best);
+        }
+    }
+    out
+}
+
+/// "50", "250", "2k", "15k": thousands get a k suffix when they're whole.
+pub fn spectrum_tick_label(f: f32) -> String {
+    let r = f.round() as i64;
+    if r >= 1000 && r % 1000 == 0 {
+        format!("{}k", r / 1000)
+    } else {
+        r.to_string()
+    }
+}
+
+/// Render a per-channel power spectrum as an opaque heatmap: one row per channel
+/// (same row layout/order as the main heatmap), x = frequency on a log scale,
+/// colour = power. `freq_range` restricts the displayed band (see
+/// `spectrum_freq_bounds`); `None` shows the full band up to Nyquist.
+///
+/// `power[r]` is the full-bandwidth PSD of the `r`-th *data* row of the full
+/// (unzoomed) display-row list the spectrum was computed from. `shown_rows` may be a
+/// zoomed sub-slice of that same list; `row_offset` is how many data rows precede
+/// `shown_rows[0]` in the full list, so indexing into `power` still lines up.
+pub fn build_spectrum_heatmap_into(
+    out: &mut Vec<u8>,
+    power: &[Vec<f32>],
+    freqs: &[f32],
+    shown_rows: &[DisplayRow],
+    row_offset: usize,
+    pixel_w: usize,
+    pixel_h: usize,
+    scaling: crate::spectrum::SpectrumScaling,
+    normalization: crate::spectrum::SpectrumNormalization,
+    freq_range: Option<(f32, f32)>,
+) {
+    let total = pixel_w * pixel_h * 4;
+    out.resize(total, 0);
+    let n_rows = shown_rows.len();
+    if pixel_w == 0 || pixel_h == 0 || n_rows == 0 || freqs.len() < 2 {
+        return;
+    }
+    let n_bins = freqs.len();
+    let df = (freqs[1] - freqs[0]).max(1e-9);
+    let (f_min, f_max) = spectrum_freq_bounds(freqs, freq_range);
+    let log_min = f_min.ln();
+    let log_span = f_max.ln() - log_min;
+    let bin_lo = ((f_min / df).round() as usize).clamp(1, n_bins - 1);
+    let bin_hi = ((f_max / df).round() as usize).clamp(bin_lo, n_bins - 1);
+
+    // frequency bin shown by each pixel column (same for every row)
+    let col_bin: Vec<usize> = (0..pixel_w)
+        .map(|px| {
+            let frac = px as f32 / (pixel_w.max(2) - 1) as f32;
+            let f = (log_min + log_span * frac).exp();
+            ((f / df).round() as usize).clamp(1, n_bins - 1)
+        })
+        .collect();
+
+    // linear-power maximum of a row's bins, restricted to the displayed band
+    let row_max = |p: &[f32]| -> f32 {
+        p.get(bin_lo..=bin_hi)
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(0.0f32, f32::max)
+            .max(1e-12)
+    };
+
+    // position of each shown row among shown_rows' Data rows (for indexing into `power`)
+    let data_positions: Vec<Option<usize>> = {
+        let mut k = 0usize;
+        shown_rows
+            .iter()
+            .map(|r| match r {
+                DisplayRow::Data { .. } => {
+                    let idx = row_offset + k;
+                    k += 1;
+                    Some(idx)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    let global_max = if matches!(normalization, crate::spectrum::SpectrumNormalization::Global) {
+        data_positions
+            .iter()
+            .filter_map(|&i| i.and_then(|i| power.get(i)))
+            .map(|p| row_max(p))
+            .fold(1e-12f32, f32::max)
+    } else {
+        1.0
+    };
+
+    paint_rows(out, n_rows, pixel_w, pixel_h, |disp_idx, row| {
+        match &shown_rows[disp_idx] {
+            DisplayRow::IntraShankGap => fill_gap(row),
+            DisplayRow::ShankBoundary => fill_solid(row, [255, 255, 255]),
+            DisplayRow::Data { .. } => {
+                let Some(p) = data_positions[disp_idx].and_then(|i| power.get(i)) else {
+                    fill_solid(row, C_ZERO);
+                    return;
+                };
+                let rmax = match normalization {
+                    crate::spectrum::SpectrumNormalization::PerChannel => row_max(p),
+                    crate::spectrum::SpectrumNormalization::Global => global_max,
+                };
+                let max_scaled = spectrum_scaled(rmax, scaling);
+                for (px, &bin) in col_bin.iter().enumerate() {
+                    let v = spectrum_scaled(p[bin], scaling);
+                    let t = match scaling {
+                        crate::spectrum::SpectrumScaling::Linear => (v / max_scaled).clamp(0.0, 1.0),
+                        crate::spectrum::SpectrumScaling::Db => {
+                            ((v - (max_scaled - SPECTRUM_DB_RANGE)) / SPECTRUM_DB_RANGE).clamp(0.0, 1.0)
+                        }
+                    };
+                    let [r, g, b] = spectrum_color(t);
+                    let o = px * 4;
+                    row[o] = r;
+                    row[o + 1] = g;
+                    row[o + 2] = b;
+                    row[o + 3] = 255;
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spectrum_tick_choice() {
+        // full AP band: fixed anchors
+        assert_eq!(spectrum_ticks(29.3, 15000.0, false), vec![50.0, 250.0, 2000.0, 15000.0]);
+        // full LFP band: only the anchors inside it would be too few, so round values
+        let lfp = spectrum_ticks(2.4, 1250.0, false);
+        assert!(lfp.len() >= 3 && lfp.iter().all(|&f| (2.4..=1250.0).contains(&f)));
+        // restricted to 10..100
+        assert_eq!(spectrum_ticks(10.0, 100.0, true), vec![10.0, 20.0, 50.0, 100.0]);
+        // narrow restricted band still gets round, in-range ticks
+        let narrow = spectrum_ticks(300.0, 340.0, true);
+        assert!(narrow.len() >= 2 && narrow.iter().all(|&f| (300.0..=340.0).contains(&f) && f.fract() == 0.0));
+        assert_eq!(spectrum_tick_label(2000.0), "2k");
+        // band bounds never panic and always give lo < hi, whatever the request
+        let freqs: Vec<f32> = (0..=512).map(|k| k as f32 * 30000.0 / 1024.0).collect();
+        for req in [(15000.0, 15000.0), (20000.0, 30000.0), (500.0, 100.0), (0.0, 0.0), (29.3, 29.3)] {
+            let (lo, hi) = spectrum_freq_bounds(&freqs, Some(req));
+            assert!(lo < hi && lo >= freqs[1] && hi <= 15000.0, "{req:?} -> {lo} {hi}");
+        }
+        assert_eq!(spectrum_freq_bounds(&freqs, Some((500.0, 100.0))), (100.0, 500.0));
+        assert_eq!(spectrum_tick_label(250.0), "250");
+        assert_eq!(spectrum_tick_label(1250.0), "1250");
+    }
 
     #[test]
     fn peak_pooling_keeps_spike_amplitude() {

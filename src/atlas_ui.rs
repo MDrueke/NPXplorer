@@ -9,21 +9,22 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::app::ColorMapChoice;
+use crate::colormap::ColorMapChoice;
 use crate::atlas::{
     self, az_el_to_polar, polar_to_az_el, AngleConvention, Atlas, Insertion, RegionEdit,
     Registration, PROGRESS_TOTAL,
 };
 use crate::data::{ChannelOrder, DisplayRow, Meta};
+use crate::settings::AtlasSettings;
 
 /// Deepest selectable hierarchy level before an atlas has been loaded (the 2017
 /// structure tree goes down to about this depth).
 const FALLBACK_MAX_LEVEL: u32 = 10;
 /// Step of the depth ⏶/⏷ buttons (mm).
 const DEPTH_STEP_MM: f64 = 0.01;
-/// Opacity (0-255) of region border lines; 51 = 20%. The hovered/dragged line is
-/// drawn fully opaque.
-const BORDER_ALPHA: u8 = 30;
+/// Opacity (0-255) of the region border lines on the heatmap: 0 = invisible, 255 =
+/// opaque (20 ≈ 8 %). The hovered/dragged line is drawn fully opaque.
+const BORDER_ALPHA: u8 = 10;
 /// Half-height (px) of the grab zone around a border line.
 const BORDER_GRAB_PX: f32 = 4.0;
 /// How long the "saved to …" note stays next to the Save button.
@@ -50,9 +51,13 @@ pub struct AtlasUi {
     dir_text: String,
     pick_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
     ins: Insertion,
-    show_overlay: bool,
+    pub(crate) show_overlay: bool,
+    /// no hover highlight, tooltips or dragging on the overlay (while a screenshot is
+    /// taken)
+    pub(crate) no_hover: bool,
     table_shank: usize,
-    /// regions with fewer channels are not drawn on their own (global preference)
+    /// regions with fewer channels are not drawn on their own (saved per recording;
+    /// the last-used value is the default for new ones)
     min_region_channels: usize,
     min_region_channels_text: String,
 
@@ -75,8 +80,6 @@ pub struct AtlasUi {
     job_progress: Arc<AtomicUsize>,
     error: Option<String>,
 
-    /// insertion changed live (depth slider); written once the mouse is released
-    sidecar_dirty: bool,
     /// result of the last CSV save: (message, success, when)
     save_note: Option<(String, bool, Instant)>,
 
@@ -97,7 +100,7 @@ fn spawn_folder_picker(dir: Option<PathBuf>) -> mpsc::Receiver<Option<PathBuf>> 
 }
 
 fn color(cmap: &ColorMapChoice, alpha: u8) -> Color32 {
-    let [r, g, b] = crate::render::atlas_color(cmap);
+    let [r, g, b] = cmap.spec().atlas;
     Color32::from_rgba_unmultiplied(r, g, b, alpha)
 }
 
@@ -105,7 +108,7 @@ fn color(cmap: &ColorMapChoice, alpha: u8) -> Color32 {
 const LABEL_BG_ALPHA: u8 = 170;
 
 fn label_bg(cmap: &ColorMapChoice) -> Color32 {
-    let [r, g, b] = crate::render::atlas_label_bg(cmap);
+    let [r, g, b] = cmap.spec().label_bg;
     Color32::from_rgba_unmultiplied(r, g, b, LABEL_BG_ALPHA)
 }
 
@@ -137,7 +140,8 @@ fn fold_small_spans(spans: &mut Vec<Span>, display_rows: &[DisplayRow], min_chan
         let same_shank = |spans: &[Span], i: usize, j: usize| spans[i].shank == spans[j].shank;
         let candidate = (0..spans.len())
             .filter(|&i| {
-                (i > 0 && same_shank(spans, i, i - 1)) || (i + 1 < spans.len() && same_shank(spans, i, i + 1))
+                (i > 0 && same_shank(spans, i, i - 1))
+                    || (i + 1 < spans.len() && same_shank(spans, i, i + 1))
             })
             .map(|i| (i, span_channels(&spans[i], display_rows)))
             .filter(|&(_, n)| n < min_channels)
@@ -159,10 +163,13 @@ fn fold_small_spans(spans: &mut Vec<Span>, display_rows: &[DisplayRow], min_chan
                 let to_below = n / 2
                     + usize::from(
                         n % 2 == 1
-                            && span_channels(&spans[b], display_rows) >= span_channels(&spans[i], display_rows),
+                            && span_channels(&spans[b], display_rows)
+                                >= span_channels(&spans[i], display_rows),
                     );
                 spans[b].rows.extend_from_slice(&small.rows[..to_below]);
-                spans[i].rows.splice(0..0, small.rows[to_below..].iter().copied());
+                spans[i]
+                    .rows
+                    .splice(0..0, small.rows[to_below..].iter().copied());
             }
             (Some(b), None) => spans[b].rows.extend(small.rows),
             (None, Some(_)) => {
@@ -174,31 +181,29 @@ fn fold_small_spans(spans: &mut Vec<Span>, display_rows: &[DisplayRow], min_chan
 }
 
 impl AtlasUi {
-    /// `atlas_dir`/`bregma_lambda_mm`/`min_region_channels` come from the global
-    /// preferences; a sidecar file next to the recording, if present, prefills the
-    /// insertion (its BL distance wins).
+    /// `atlas_dir` comes from the global preferences, the rest from the recording's
+    /// settings (see settings.rs). Nothing is loaded here; see `register_on_open`.
     pub fn new(
-        bin_path: &Path,
         meta: &Arc<Meta>,
         atlas_dir: Option<String>,
-        bregma_lambda_mm: f64,
+        settings: AtlasSettings,
         min_region_channels: usize,
     ) -> Self {
-        let (ins, edits) = atlas::load_sidecar(bin_path)
-            .unwrap_or((Insertion { bregma_lambda_mm, ..Default::default() }, Vec::new()));
+        let min_region_channels = settings.min_region_channels.unwrap_or(min_region_channels);
         Self {
             open: false,
             dir_text: atlas_dir.unwrap_or_default(),
             pick_rx: None,
-            ins,
-            show_overlay: false,
+            ins: settings.insertion,
+            show_overlay: settings.show_overlay,
+            no_hover: false,
             table_shank: 0,
             min_region_channels,
             min_region_channels_text: min_region_channels.to_string(),
             atlas: None,
             registration: None,
             channel_regions: Vec::new(),
-            edits,
+            edits: settings.region_edits,
             depth_drag: None,
             registered_ins: None,
             meta: Arc::clone(meta),
@@ -207,9 +212,28 @@ impl AtlasUi {
             job_cancel: Arc::new(AtomicBool::new(false)),
             job_progress: Arc::new(AtomicUsize::new(0)),
             error: None,
-            sidecar_dirty: false,
             save_note: None,
             prefs_dirty: false,
+        }
+    }
+
+    /// What is saved with the recording.
+    pub fn settings(&self) -> AtlasSettings {
+        AtlasSettings {
+            show_overlay: self.show_overlay,
+            min_region_channels: Some(self.min_region_channels),
+            insertion: self.ins.clone(),
+            region_edits: self.edits.clone(),
+        }
+    }
+
+    /// The overlay was shown when the recording was last closed: load the atlas and
+    /// register again. Opens the window if that can't start (e.g. no atlas folder), so
+    /// the reason is visible.
+    pub fn register_on_open(&mut self, ctx: &egui::Context, meta: &Arc<Meta>) {
+        if self.show_overlay && !self.dispatch(ctx, meta) {
+            self.show_overlay = false;
+            self.open = true;
         }
     }
 
@@ -239,10 +263,18 @@ impl AtlasUi {
         self.show_overlay && self.registration.is_some()
     }
 
+    /// Whether a registration has been computed this session (regardless of
+    /// `show_overlay`) — gates showing the legend's Show/Hide Atlas toggle.
+    pub fn has_data(&self) -> bool {
+        self.registration.is_some()
+    }
+
     /// Recompute the per-channel regions: the atlas result at the chosen level, with
     /// the dragged-border edits applied at each channel's current depth in the brain.
     fn refresh_channel_regions(&mut self) {
-        let (Some(reg), Some(atlas), Some(ins)) = (&self.registration, &self.atlas, &self.registered_ins) else {
+        let (Some(reg), Some(atlas), Some(ins)) =
+            (&self.registration, &self.atlas, &self.registered_ins)
+        else {
             self.channel_regions = Vec::new();
             return;
         };
@@ -254,7 +286,10 @@ impl AtlasUi {
             .map(|(ch, &r)| {
                 let g = &self.meta.channel_geom[ch];
                 match atlas::edit_at(&self.edits, g.shank, atlas::brain_depth_um(ins, g.y_um)) {
-                    Some(e) => e.region.and_then(|id| atlas.tree.row_of_id(id)).map(|r| atlas.tree.at_level(r, level)),
+                    Some(e) => e
+                        .region
+                        .and_then(|id| atlas.tree.row_of_id(id))
+                        .map(|r| atlas.tree.at_level(r, level)),
                     None => r.map(|r| atlas.tree.at_level(r, level)),
                 }
             })
@@ -265,36 +300,40 @@ impl AtlasUi {
     /// the current level): stored as depth ranges in the brain, so the correction
     /// moves along with the atlas when the depth changes.
     fn record_edit(&mut self, display_rows: &[DisplayRow], rows: &[usize], region: Option<usize>) {
-        let (Some(reg), Some(atlas), Some(ins)) = (&self.registration, &self.atlas, &self.registered_ins) else {
+        let (Some(reg), Some(atlas), Some(ins)) =
+            (&self.registration, &self.atlas, &self.registered_ins)
+        else {
             return;
         };
         let region_id = region.map(|r| atlas.tree.rows[r].id);
         for &r in rows {
-            let DisplayRow::Data { channels, .. } = &display_rows[r] else { continue };
+            let DisplayRow::Data { channels, .. } = &display_rows[r] else {
+                continue;
+            };
             for &ch in channels {
                 let g = &self.meta.channel_geom[ch];
                 let d = atlas::brain_depth_um(ins, g.y_um);
                 let h = self.half_pitch.get(&g.shank).copied().unwrap_or(10.0);
                 // an edit back to what the atlas says just removes the correction
                 let base = reg.channel_regions[ch].map(|r| atlas.tree.at_level(r, self.ins.level));
-                let edit = RegionEdit { shank: g.shank, from_um: d - h, to_um: d + h, region: region_id };
+                let edit = RegionEdit {
+                    shank: g.shank,
+                    from_um: d - h,
+                    to_um: d + h,
+                    region: region_id,
+                };
                 atlas::upsert_edit(&mut self.edits, edit, base != region);
             }
         }
         self.refresh_channel_regions();
-        self.sidecar_dirty = true;
-    }
-
-    fn save_sidecar(&mut self, bin_path: &Path) {
-        self.sidecar_dirty = false;
-        if let Err(e) = atlas::save_sidecar(bin_path, &self.ins, &self.edits) {
-            self.error = Some(format!("{e:#}"));
-        }
     }
 
     fn region_names(&self, region: Option<usize>) -> (&str, &str) {
         match (region, &self.atlas) {
-            (Some(r), Some(atlas)) => (atlas.tree.rows[r].acronym.as_str(), atlas.tree.rows[r].name.as_str()),
+            (Some(r), Some(atlas)) => (
+                atlas.tree.rows[r].acronym.as_str(),
+                atlas.tree.rows[r].name.as_str(),
+            ),
             _ => ("outside", "Outside the brain"),
         }
     }
@@ -305,16 +344,11 @@ impl AtlasUi {
 
     /// Start loading the atlas (if needed) and registering in the background; false if
     /// it couldn't be started (the reason is shown in the window).
-    fn dispatch(&mut self, ctx: &egui::Context, meta: &Arc<Meta>, bin_path: &Path) -> bool {
+    fn dispatch(&mut self, ctx: &egui::Context, meta: &Arc<Meta>) -> bool {
         let Some(dir) = self.atlas_dir().map(PathBuf::from) else {
             self.error = Some("select the folder containing the Allen atlas first".into());
             return false;
         };
-        if let Err(e) = atlas::save_sidecar(bin_path, &self.ins, &self.edits) {
-            self.error = Some(format!("{e:#}"));
-            return false;
-        }
-        self.sidecar_dirty = false;
         self.prefs_dirty = true;
 
         self.job_cancel.store(true, Ordering::Relaxed);
@@ -343,8 +377,15 @@ impl AtlasUi {
                     },
                 };
                 progress.store(PROGRESS_TOTAL * 3 / 10, Ordering::Relaxed);
-                Ok(atlas::register(&atlas, &meta, &ins, &cancel, &progress)?
-                    .map(|registration| JobOutput { atlas, registration, ins: job_ins }))
+                Ok(
+                    atlas::register(&atlas, &meta, &ins, &cancel, &progress)?.map(|registration| {
+                        JobOutput {
+                            atlas,
+                            registration,
+                            ins: job_ins,
+                        }
+                    }),
+                )
             };
             let _ = tx.send(run().map_err(|e| format!("{e:#}")));
             ctx.request_repaint();
@@ -355,8 +396,16 @@ impl AtlasUi {
     /// Re-register synchronously with the already-loaded atlas — fast enough (well
     /// under a millisecond) to follow the depth slider live.
     fn register_now(&mut self, meta: &Meta) {
-        let Some(atlas) = self.atlas.clone() else { return };
-        match atlas::register(&atlas, meta, &self.ins, &AtomicBool::new(false), &AtomicUsize::new(0)) {
+        let Some(atlas) = self.atlas.clone() else {
+            return;
+        };
+        match atlas::register(
+            &atlas,
+            meta,
+            &self.ins,
+            &AtomicBool::new(false),
+            &AtomicUsize::new(0),
+        ) {
             Ok(Some(reg)) => {
                 self.registration = Some(Arc::new(reg));
                 self.registered_ins = Some(self.ins.clone());
@@ -366,7 +415,6 @@ impl AtlasUi {
             Ok(None) => {}
             Err(e) => self.error = Some(format!("{e:#}")),
         }
-        self.sidecar_dirty = true;
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) {
@@ -390,6 +438,8 @@ impl AtlasUi {
                     }
                     Err(e) => {
                         self.error = Some(e);
+                        // also after a registration started on opening the recording
+                        self.open = true;
                         if self.registration.is_none() {
                             self.show_overlay = false;
                         }
@@ -421,7 +471,9 @@ impl AtlasUi {
             .show(ctx, |ui| {
                 ui.set_min_width(220.0);
                 ui.label(stage);
-                ui.add(egui::ProgressBar::new(done as f32 / PROGRESS_TOTAL as f32).show_percentage());
+                ui.add(
+                    egui::ProgressBar::new(done as f32 / PROGRESS_TOTAL as f32).show_percentage(),
+                );
                 if ui.button("Abort").clicked() {
                     self.job_cancel.store(true, Ordering::Relaxed);
                 }
@@ -435,7 +487,12 @@ impl AtlasUi {
             .channel_regions
             .iter()
             .enumerate()
-            .map(|(ch, &r)| (meta.channel_id(ch).to_string(), self.region_names(r).0.to_string()))
+            .map(|(ch, &r)| {
+                (
+                    meta.channel_id(ch).to_string(),
+                    self.region_names(r).0.to_string(),
+                )
+            })
             .collect();
         self.save_note = Some(match atlas::save_regions_csv(bin_path, &rows) {
             Ok(path) => (format!("saved to {}", path.display()), true, Instant::now()),
@@ -447,7 +504,13 @@ impl AtlasUi {
     // window
     // -----------------------------------------------------------------------
 
-    pub fn draw_window(&mut self, ctx: &egui::Context, meta: &Arc<Meta>, bin_path: &Path, cmap: &ColorMapChoice) {
+    pub fn draw_window(
+        &mut self,
+        ctx: &egui::Context,
+        meta: &Arc<Meta>,
+        bin_path: &Path,
+        cmap: &ColorMapChoice,
+    ) {
         if let Some(rx) = &self.pick_rx {
             match rx.try_recv() {
                 Ok(picked) => {
@@ -464,11 +527,6 @@ impl AtlasUi {
             }
         }
 
-        // live depth changes / dragged borders: write the sidecar once the mouse is released
-        if self.sidecar_dirty && !ctx.input(|i| i.pointer.any_down()) {
-            self.save_sidecar(bin_path);
-        }
-
         let mut open = self.open;
         egui::Window::new("Atlas Registration")
             .open(&mut open)
@@ -483,7 +541,13 @@ impl AtlasUi {
         self.open = open;
     }
 
-    fn window_contents(&mut self, ui: &mut Ui, meta: &Arc<Meta>, bin_path: &Path, cmap: &ColorMapChoice) {
+    fn window_contents(
+        &mut self,
+        ui: &mut Ui,
+        meta: &Arc<Meta>,
+        bin_path: &Path,
+        cmap: &ColorMapChoice,
+    ) {
         let busy = self.busy();
 
         ui.label(egui::RichText::new("Atlas").strong());
@@ -519,13 +583,13 @@ impl AtlasUi {
                     egui::DragValue::new(&mut self.ins.bregma_lambda_mm)
                         .speed(0.01)
                         .range(2.0..=6.0)
-                        .fixed_decimals(2)
-                        .suffix(" mm"),
+                        .fixed_decimals(2),
                 )
                 .changed()
             {
                 self.prefs_dirty = true;
             }
+            ui.label("mm");
         });
 
         ui.separator();
@@ -544,73 +608,99 @@ impl AtlasUi {
             );
         });
 
-        let num = |ui: &mut Ui, v: &mut f64, speed: f64, lo: f64, hi: f64, dec: usize, suffix: &str| {
-            ui.add(egui::DragValue::new(v).speed(speed).range(lo..=hi).fixed_decimals(dec).suffix(suffix))
-                .changed()
-        };
+        // only the number is editable; the unit is a label next to it
+        let num =
+            |ui: &mut Ui, v: &mut f64, speed: f64, lo: f64, hi: f64, dec: usize, unit: &str| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    let changed = ui
+                        .add(
+                            egui::DragValue::new(v)
+                                .speed(speed)
+                                .range(lo..=hi)
+                                .fixed_decimals(dec),
+                        )
+                        .changed();
+                    ui.label(unit);
+                    changed
+                })
+                .inner
+            };
         let mut depth_changed = false;
-        egui::Grid::new("atlas_insertion_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-            ui.label("AP (from bregma, + anterior)");
-            num(ui, &mut self.ins.ap_mm, 0.01, -10.0, 10.0, 2, " mm");
-            ui.end_row();
-            ui.label("ML (from bregma, + right)");
-            num(ui, &mut self.ins.ml_mm, 0.01, -10.0, 10.0, 2, " mm");
-            ui.end_row();
+        egui::Grid::new("atlas_insertion_grid")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("AP (from bregma, + anterior)");
+                num(ui, &mut self.ins.ap_mm, 0.01, -10.0, 10.0, 2, "mm");
+                ui.end_row();
+                ui.label("ML (from bregma, + right)");
+                num(ui, &mut self.ins.ml_mm, 0.01, -10.0, 10.0, 2, "mm");
+                ui.end_row();
 
-            match self.ins.angle_convention {
-                AngleConvention::AzimuthElevation => {
-                    ui.label("Azimuth (from lambda→bregma axis)");
-                    num(ui, &mut self.ins.azimuth_deg, 0.5, 0.0, 360.0, 1, "°");
-                    ui.end_row();
-                    ui.label("Elevation (from horizontal)");
-                    num(ui, &mut self.ins.elevation_deg, 0.5, 0.0, 90.0, 1, "°");
-                    ui.end_row();
-                    ui.label("Rotation (around probe axis)");
-                    num(ui, &mut self.ins.rotation_deg, 0.5, -360.0, 360.0, 1, "°");
-                    ui.end_row();
-                }
-                AngleConvention::PolarAzimuth => {
-                    let (mut theta, mut phi) = az_el_to_polar(self.ins.azimuth_deg, self.ins.elevation_deg);
-                    ui.label("Polar angle (from vertical)");
-                    let c1 = num(ui, &mut theta, 0.5, 0.0, 90.0, 1, "°");
-                    ui.end_row();
-                    ui.label("Azimuth (from +ML, counter-clockwise)");
-                    let c2 = num(ui, &mut phi, 0.5, 0.0, 360.0, 1, "°");
-                    ui.end_row();
-                    if c1 || c2 {
-                        let (az, el) = polar_to_az_el(theta, phi);
-                        self.ins.azimuth_deg = az;
-                        self.ins.elevation_deg = el;
+                match self.ins.angle_convention {
+                    AngleConvention::AzimuthElevation => {
+                        ui.label("Azimuth (from lambda→bregma axis)");
+                        num(ui, &mut self.ins.azimuth_deg, 0.5, 0.0, 360.0, 1, "°");
+                        ui.end_row();
+                        ui.label("Elevation (from horizontal)");
+                        num(ui, &mut self.ins.elevation_deg, 0.5, 0.0, 90.0, 1, "°");
+                        ui.end_row();
+                        ui.label("Rotation (around probe axis)");
+                        num(ui, &mut self.ins.rotation_deg, 0.5, -360.0, 360.0, 1, "°");
+                        ui.end_row();
                     }
-                    ui.label("Roll (around probe axis)");
-                    num(ui, &mut self.ins.rotation_deg, 0.5, -360.0, 360.0, 1, "°");
-                    ui.end_row();
+                    AngleConvention::PolarAzimuth => {
+                        let (mut theta, mut phi) =
+                            az_el_to_polar(self.ins.azimuth_deg, self.ins.elevation_deg);
+                        ui.label("Polar angle (from vertical)");
+                        let c1 = num(ui, &mut theta, 0.5, 0.0, 90.0, 1, "°");
+                        ui.end_row();
+                        ui.label("Azimuth (from +ML, counter-clockwise)");
+                        let c2 = num(ui, &mut phi, 0.5, 0.0, 360.0, 1, "°");
+                        ui.end_row();
+                        if c1 || c2 {
+                            let (az, el) = polar_to_az_el(theta, phi);
+                            self.ins.azimuth_deg = az;
+                            self.ins.elevation_deg = el;
+                        }
+                        ui.label("Roll (around probe axis)");
+                        num(ui, &mut self.ins.rotation_deg, 0.5, -360.0, 360.0, 1, "°");
+                        ui.end_row();
+                    }
                 }
-            }
 
-            ui.label("Depth (brain surface to tip)");
-            ui.horizontal(|ui| {
-                let max = atlas::SHANK_LENGTH_UM / 1000.0;
-                depth_changed |= num(ui, &mut self.ins.depth_mm, 0.01, 0.0, max, 3, " mm");
-                ui.spacing_mut().item_spacing.x = 2.0;
-                if ui.small_button("⏶").on_hover_text("10 µm deeper (borders move up)").clicked() {
-                    self.ins.depth_mm = (self.ins.depth_mm + DEPTH_STEP_MM).min(max);
-                    depth_changed = true;
-                }
-                if ui.small_button("⏷").on_hover_text("10 µm shallower (borders move down)").clicked() {
-                    self.ins.depth_mm = (self.ins.depth_mm - DEPTH_STEP_MM).max(0.0);
-                    depth_changed = true;
-                }
-                ui.add_space(6.0);
-                depth_changed |= ui
-                    .add(egui::Slider::new(&mut self.ins.depth_mm, 0.0..=max).show_value(false))
-                    .changed();
+                ui.label("Depth (brain surface to tip)");
+                ui.horizontal(|ui| {
+                    let max = atlas::SHANK_LENGTH_UM / 1000.0;
+                    depth_changed |= num(ui, &mut self.ins.depth_mm, 0.01, 0.0, max, 3, "mm");
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    if ui
+                        .small_button("⏶")
+                        .on_hover_text("10 µm deeper (borders move up)")
+                        .clicked()
+                    {
+                        self.ins.depth_mm = (self.ins.depth_mm + DEPTH_STEP_MM).min(max);
+                        depth_changed = true;
+                    }
+                    if ui
+                        .small_button("⏷")
+                        .on_hover_text("10 µm shallower (borders move down)")
+                        .clicked()
+                    {
+                        self.ins.depth_mm = (self.ins.depth_mm - DEPTH_STEP_MM).max(0.0);
+                        depth_changed = true;
+                    }
+                    ui.add_space(6.0);
+                    depth_changed |= ui
+                        .add(egui::Slider::new(&mut self.ins.depth_mm, 0.0..=max).show_value(false))
+                        .changed();
+                });
+                ui.end_row();
+                ui.label("Tip to first electrode row");
+                num(ui, &mut self.ins.tip_offset_um, 1.0, 0.0, 1000.0, 0, "µm");
+                ui.end_row();
             });
-            ui.end_row();
-            ui.label("Tip to first electrode row");
-            num(ui, &mut self.ins.tip_offset_um, 1.0, 0.0, 1000.0, 0, " µm");
-            ui.end_row();
-        });
         // once an overlay exists, depth changes are applied immediately
         if depth_changed && self.registration.is_some() && !busy {
             self.register_now(meta);
@@ -619,7 +709,10 @@ impl AtlasUi {
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Region level:");
-            let max_level = self.atlas.as_ref().map_or(FALLBACK_MAX_LEVEL, |a| a.tree.max_depth);
+            let max_level = self
+                .atlas
+                .as_ref()
+                .map_or(FALLBACK_MAX_LEVEL, |a| a.tree.max_depth);
             let label = |l: Option<u32>| match l {
                 None => "Finest (incl. cortical layers)".to_string(),
                 Some(l) => format!("Hierarchy level {l}"),
@@ -636,12 +729,13 @@ impl AtlasUi {
             if level != self.ins.level {
                 self.ins.level = level;
                 self.refresh_channel_regions();
-                self.sidecar_dirty = true;
             }
         });
         ui.horizontal(|ui| {
             ui.label("Skip drawing regions with less than");
-            let resp = ui.add(egui::TextEdit::singleline(&mut self.min_region_channels_text).desired_width(30.0));
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.min_region_channels_text).desired_width(30.0),
+            );
             ui.label("channels");
             if resp.changed() {
                 if let Ok(n) = self.min_region_channels_text.trim().parse::<usize>() {
@@ -663,36 +757,49 @@ impl AtlasUi {
 
         ui.horizontal(|ui| {
             if ui.add_enabled(!busy, egui::Button::new("Apply")).clicked() {
-                self.dispatch(ui.ctx(), meta, bin_path);
+                self.dispatch(ui.ctx(), meta);
             }
             let mut show = self.show_overlay;
-            if ui.add_enabled(!busy, egui::Checkbox::new(&mut show, "Show overlay")).changed() {
+            if ui
+                .add_enabled(!busy, egui::Checkbox::new(&mut show, "Show overlay"))
+                .changed()
+            {
                 self.show_overlay = show;
-                if show && self.registration.is_none() && !self.dispatch(ui.ctx(), meta, bin_path) {
+                if show && self.registration.is_none() && !self.dispatch(ui.ctx(), meta) {
                     self.show_overlay = false;
                 }
             }
             if ui
-                .add_enabled(self.registration.is_some() && !busy, egui::Button::new("Save"))
+                .add_enabled(
+                    self.registration.is_some() && !busy,
+                    egui::Button::new("Save"),
+                )
                 .on_hover_text("write each channel's region to a .csv next to the recording")
                 .clicked()
             {
                 self.save_csv(bin_path, meta);
             }
             if !self.edits.is_empty()
-                && ui.button("Reset borders").on_hover_text("undo all dragged region borders").clicked()
+                && ui
+                    .button("Reset borders")
+                    .on_hover_text("undo all dragged region borders")
+                    .clicked()
             {
                 self.edits.clear();
                 self.refresh_channel_regions();
-                self.sidecar_dirty = true;
             }
         });
         if let Some((msg, ok, when)) = &self.save_note {
             let elapsed = when.elapsed();
             if elapsed < SAVED_NOTE_DURATION {
-                let c = if *ok { Color32::from_rgb(0x66, 0xdd, 0x66) } else { Color32::from_rgb(0xff, 0x66, 0x66) };
+                let c = if *ok {
+                    Color32::from_rgb(0x66, 0xdd, 0x66)
+                } else {
+                    Color32::from_rgb(0xff, 0x66, 0x66)
+                };
                 ui.colored_label(c, msg);
-                ui.ctx().request_repaint_after(SAVED_NOTE_DURATION - elapsed);
+                ui.ctx()
+                    .request_repaint_after(SAVED_NOTE_DURATION - elapsed);
             }
         }
 
@@ -725,25 +832,34 @@ impl AtlasUi {
                     });
             });
         }
-        let Some(samples) = reg.shanks.get(self.table_shank) else { return };
+        let Some(samples) = reg.shanks.get(self.table_shank) else {
+            return;
+        };
         let segs = atlas::shank_segments(samples, &atlas.tree, self.ins.level);
         let region_color = color(cmap, 255);
-        egui::Grid::new("atlas_region_table").striped(true).num_columns(4).show(ui, |ui| {
-            ui.label(egui::RichText::new("Region").strong());
-            ui.label(egui::RichText::new("From (µm)").strong());
-            ui.label(egui::RichText::new("To (µm)").strong());
-            ui.label(egui::RichText::new("Recorded").strong());
-            ui.end_row();
-            for s in &segs {
-                let (acr, name) = self.region_names(s.region);
-                ui.label(egui::RichText::new(acr).color(region_color).background_color(label_bg(cmap)))
-                    .on_hover_text(name);
-                ui.label(format!("{:.0}", s.from_um));
-                ui.label(format!("{:.0}", s.to_um));
-                ui.label(if s.recorded { "✔" } else { "" });
+        egui::Grid::new("atlas_region_table")
+            .striped(true)
+            .num_columns(4)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Region").strong());
+                ui.label(egui::RichText::new("From (µm)").strong());
+                ui.label(egui::RichText::new("To (µm)").strong());
+                ui.label(egui::RichText::new("Recorded").strong());
                 ui.end_row();
-            }
-        });
+                for s in &segs {
+                    let (acr, name) = self.region_names(s.region);
+                    ui.label(
+                        egui::RichText::new(acr)
+                            .color(region_color)
+                            .background_color(label_bg(cmap)),
+                    )
+                    .on_hover_text(name);
+                    ui.label(format!("{:.0}", s.from_um));
+                    ui.label(format!("{:.0}", s.to_um));
+                    ui.label(if s.recorded { "✔" } else { "" });
+                    ui.end_row();
+                }
+            });
         ui.label(
             egui::RichText::new(
                 "depths along the probe axis from the brain-surface entry point, from the atlas \
@@ -777,6 +893,7 @@ impl AtlasUi {
         ui: &Ui,
         meta: &Meta,
         rect: egui::Rect,
+        line_right: f32,
         display_rows: &[DisplayRow],
         first_row: usize,
         last_row: usize,
@@ -797,11 +914,18 @@ impl AtlasUi {
         // the spans clipped to the rows on screen
         let mut spans: Vec<Span> = Vec::new();
         for (r, row) in display_rows.iter().enumerate() {
-            if let DisplayRow::Data { first_ch, shank, .. } = row {
+            if let DisplayRow::Data {
+                first_ch, shank, ..
+            } = row
+            {
                 let region = self.channel_regions.get(*first_ch).copied().flatten();
                 match spans.last_mut() {
                     Some(s) if s.shank == *shank && s.region == region => s.rows.push(r),
-                    _ => spans.push(Span { shank: *shank, region, rows: vec![r] }),
+                    _ => spans.push(Span {
+                        shank: *shank,
+                        region,
+                        rows: vec![r],
+                    }),
                 }
             }
         }
@@ -835,22 +959,28 @@ impl AtlasUi {
                 index_in_shank = 0;
                 continue;
             }
-            let border_y = |split: &[usize], k: usize| (row_top(split[k - 1]) + row_bottom(split[k])) / 2.0;
+            let border_y =
+                |split: &[usize], k: usize| (row_top(split[k - 1]) + row_bottom(split[k])) / 2.0;
             let rows: Vec<usize> = below.rows.iter().chain(&above.rows).copied().collect();
             let k = below.rows.len();
             let y = border_y(&rows, k);
 
             let id = ui.id().with(("atlas_border", below.shank, index_in_shank));
             index_in_shank += 1;
-            let grab = egui::Rect::from_x_y_ranges(rect.x_range(), (y - BORDER_GRAB_PX)..=(y + BORDER_GRAB_PX));
+            let grab = egui::Rect::from_x_y_ranges(
+                rect.x_range(),
+                (y - BORDER_GRAB_PX)..=(y + BORDER_GRAB_PX),
+            );
             let resp = ui.interact(grab, id, egui::Sense::drag());
-            let active = resp.hovered() || resp.dragged();
+            let active = (resp.hovered() || resp.dragged()) && !self.no_hover;
             if active {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
             }
             if resp.drag_started() && alt {
                 // Alt+drag: move all borders together by changing the insertion depth
-                let start_y_um = resp.interact_pointer_pos().and_then(|p| y_um_at(p.y, below.shank));
+                let start_y_um = resp
+                    .interact_pointer_pos()
+                    .and_then(|p| y_um_at(p.y, below.shank));
                 if let Some(start_y_um) = start_y_um {
                     self.depth_drag = Some(DepthDrag {
                         start_depth_mm: self.ins.depth_mm,
@@ -864,7 +994,9 @@ impl AtlasUi {
                     // nearest split that leaves at least one row on either side
                     let k_new = (1..rows.len())
                         .min_by(|&a, &b| {
-                            (border_y(&rows, a) - p.y).abs().total_cmp(&(border_y(&rows, b) - p.y).abs())
+                            (border_y(&rows, a) - p.y)
+                                .abs()
+                                .total_cmp(&(border_y(&rows, b) - p.y).abs())
                         })
                         .unwrap_or(k);
                     if k_new < k {
@@ -890,7 +1022,8 @@ impl AtlasUi {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
                 if let Some(y_um) = pos.and_then(|p| y_um_at(p.y, d.shank)) {
                     let max = atlas::SHANK_LENGTH_UM / 1000.0;
-                    let depth = (d.start_depth_mm + (y_um - d.start_y_um) as f64 / 1000.0).clamp(0.0, max);
+                    let depth =
+                        (d.start_depth_mm + (y_um - d.start_y_um) as f64 / 1000.0).clamp(0.0, max);
                     if (depth - self.ins.depth_mm).abs() > 1e-9 {
                         new_depth = Some(depth);
                     }
@@ -902,9 +1035,13 @@ impl AtlasUi {
         let all_active = self.depth_drag.is_some() || (alt && borders.iter().any(|b| b.1));
         let painter = ui.painter();
         for &(y, active) in &borders {
-            let alpha = if active || all_active { 255 } else { BORDER_ALPHA };
+            let alpha = if active || all_active {
+                255
+            } else {
+                BORDER_ALPHA
+            };
             painter.line_segment(
-                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                [egui::pos2(rect.left(), y), egui::pos2(line_right, y)],
                 egui::Stroke::new(1.5_f32, color(cmap, alpha)),
             );
         }
@@ -913,7 +1050,10 @@ impl AtlasUi {
         let col = color(cmap, 255);
         let font = egui::FontId::proportional(12.0);
         let bg = label_bg(cmap);
-        let hover = ui.ctx().input(|i| i.pointer.hover_pos());
+        let hover = ui
+            .ctx()
+            .input(|i| i.pointer.hover_pos())
+            .filter(|_| !self.no_hover);
         for (i, s) in spans.iter().enumerate() {
             let (top, bottom) = (row_top(*s.rows.last().unwrap()), row_bottom(s.rows[0]));
             let (acr, name) = self.region_names(s.region);
@@ -921,12 +1061,20 @@ impl AtlasUi {
             if bottom - top < galley.size().y + 2.0 {
                 continue;
             }
-            let pos = egui::pos2(rect.left() + 6.0, (top + bottom) / 2.0 - galley.size().y / 2.0);
+            let pos = egui::pos2(
+                rect.left() + 6.0,
+                (top + bottom) / 2.0 - galley.size().y / 2.0,
+            );
             let bg_rect = egui::Rect::from_min_size(pos, galley.size()).expand(2.0);
             painter.rect_filled(bg_rect, 2.0, bg);
             painter.galley(pos, galley, col);
             if hover.is_some_and(|p| bg_rect.contains(p)) {
-                egui::show_tooltip_text(ui.ctx(), ui.layer_id(), egui::Id::new(("atlas_label", i)), name);
+                egui::show_tooltip_text(
+                    ui.ctx(),
+                    ui.layer_id(),
+                    egui::Id::new(("atlas_label", i)),
+                    name,
+                );
             }
         }
 
@@ -949,27 +1097,44 @@ mod tests {
     /// one single-channel data row per entry, all on shank 0
     fn setup(regions: &[usize]) -> (Vec<DisplayRow>, Vec<Span>) {
         let rows: Vec<DisplayRow> = (0..regions.len())
-            .map(|i| DisplayRow::Data { data_idx: i, channels: vec![i], first_ch: i, x_um: 0.0, y_um: i as f32, shank: 0 })
+            .map(|i| DisplayRow::Data {
+                data_idx: i,
+                channels: vec![i],
+                first_ch: i,
+                x_um: 0.0,
+                y_um: i as f32,
+                shank: 0,
+            })
             .collect();
         let mut spans: Vec<Span> = Vec::new();
         for (r, &region) in regions.iter().enumerate() {
             match spans.last_mut() {
                 Some(s) if s.region == Some(region) => s.rows.push(r),
-                _ => spans.push(Span { shank: 0, region: Some(region), rows: vec![r] }),
+                _ => spans.push(Span {
+                    shank: 0,
+                    region: Some(region),
+                    rows: vec![r],
+                }),
             }
         }
         (rows, spans)
     }
 
     fn summary(spans: &[Span]) -> Vec<(usize, Vec<usize>)> {
-        spans.iter().map(|s| (s.region.unwrap(), s.rows.clone())).collect()
+        spans
+            .iter()
+            .map(|s| (s.region.unwrap(), s.rows.clone()))
+            .collect()
     }
 
     #[test]
     fn thin_region_is_split_between_neighbours() {
         let (rows, mut spans) = setup(&[1, 1, 1, 1, 2, 2, 3, 3, 3, 3]);
         fold_small_spans(&mut spans, &rows, 4);
-        assert_eq!(summary(&spans), vec![(1, vec![0, 1, 2, 3, 4]), (3, vec![5, 6, 7, 8, 9])]);
+        assert_eq!(
+            summary(&spans),
+            vec![(1, vec![0, 1, 2, 3, 4]), (3, vec![5, 6, 7, 8, 9])]
+        );
     }
 
     #[test]

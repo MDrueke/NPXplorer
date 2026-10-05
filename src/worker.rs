@@ -301,6 +301,8 @@ fn run_extend(
     // of the visible view, regardless of cap or memory pressure (correctness floor)
     let safety_retain = EXTENSION_OVERLAP_SAMP;
     let pressure = memory_pressure(mem_pressure_pct, mem_reserve_bytes);
+    // narrow notches need longer than the highpass to settle at the seam
+    let overlap = EXTENSION_OVERLAP_SAMP.max((crate::notch::settle_s(cfg) * meta.sample_rate).ceil() as usize);
 
     let (read_start, read_n, clean_offset, actual_ext, drop_samp, new_first) = if direction > 0 {
         // extend right: read [buf_end - overlap, buf_end + ext]
@@ -309,7 +311,7 @@ fn run_extend(
         let ext = extension_samp.min(available);
         if ext == 0 { finish_cancelled(lock); return; }
 
-        let rs = buf_end.saturating_sub(EXTENSION_OVERLAP_SAMP);
+        let rs = buf_end.saturating_sub(overlap);
         let act_overlap = buf_end - rs;
         let rn = act_overlap + ext;
 
@@ -327,7 +329,7 @@ fn run_extend(
         if ext == 0 { finish_cancelled(lock); return; }
 
         let rs = old_first - ext;
-        let act_overlap = EXTENSION_OVERLAP_SAMP.min(old_n_samp);
+        let act_overlap = overlap.min(old_n_samp);
         let rn = ext + act_overlap;
 
         let over_cap = (old_n_samp + ext).saturating_sub(max_buffer_samp);

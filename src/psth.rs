@@ -181,8 +181,8 @@ fn load_columns(stim_path: &Path, n_header_rows: usize, cols: &[usize], what: &s
     Ok(times)
 }
 
-/// The layout file next to the raw data. It is written when the format is edited in
-/// the PSTH or TTL window and takes precedence over the default in `config/`.
+/// `stims_file_layout.csv` in the data folder, where earlier versions saved an edited
+/// stim-file format (now part of the recording's settings, see settings.rs).
 pub fn layout_sidecar_path(bin_path: &Path) -> PathBuf {
     bin_path.with_file_name("stims_file_layout.csv")
 }
@@ -192,25 +192,11 @@ pub fn default_layout_text() -> String {
     read_text_file(&default_layout_path()).unwrap_or_else(|_| DEFAULT_LAYOUT.to_string())
 }
 
-/// Layout text for a recording: the file next to the raw data if present, else the default.
-pub fn layout_text(bin_path: &Path) -> String {
-    read_text_file(&layout_sidecar_path(bin_path)).unwrap_or_else(|_| default_layout_text())
-}
-
-/// Store the layout text next to the raw data. Text equal to the default removes that
-/// file instead, so the recording follows the default again.
-pub fn save_layout_text(bin_path: &Path, text: &str) -> Result<()> {
-    let path = layout_sidecar_path(bin_path);
+/// `None` for text equal to the default, so a recording follows later changes to the
+/// default instead of keeping a copy.
+pub fn layout_to_save(text: &str) -> Option<String> {
     let norm = |s: &str| s.replace("\r\n", "\n").trim_end().to_string();
-    if norm(text) == norm(&default_layout_text()) {
-        if path.is_file() {
-            std::fs::remove_file(&path)
-                .map_err(|e| anyhow::anyhow!("could not remove {}: {e}", path.display()))?;
-        }
-        return Ok(());
-    }
-    std::fs::write(&path, text)
-        .map_err(|e| anyhow::anyhow!("could not save the stim file format to {}: {e}", path.display()))
+    (norm(text) != norm(&default_layout_text())).then(|| text.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +270,7 @@ pub fn compute_psth(
     // ±0.05 s (destripe always includes the highpass). DC removal without the highpass
     // keeps 0.15 s, as its baseline is the mean of the read chunk; with the highpass the
     // DC step has no effect (the filter removes any constant exactly).
-    let pad_s = if cfg.spatial_filter == SpatialFilter::Destripe {
+    let pad_s: f64 = if cfg.spatial_filter == SpatialFilter::Destripe {
         0.08
     } else if cfg.highpass {
         0.02
@@ -293,6 +279,8 @@ pub fn compute_psth(
     } else {
         0.0
     };
+    // narrow notches ring for longer than any of the above
+    let pad_s = pad_s.max(crate::notch::settle_s(cfg));
     let pad = (pad_s * fs).round() as i64;
 
     let display_rows = Arc::new(meta.build_display_rows(cfg.avg_depths, &cfg.removed_channels, cfg.channel_order, cfg.shank_order));

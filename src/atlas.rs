@@ -559,7 +559,7 @@ impl CcfTransform {
 }
 
 // ---------------------------------------------------------------------------
-// Insertion parameters, angle conventions, sidecar
+// Insertion parameters, angle conventions, region edits
 // ---------------------------------------------------------------------------
 
 /// How the insertion angles are entered in the UI. Stored values are always
@@ -696,21 +696,6 @@ pub fn half_pitch_per_shank(meta: &Meta) -> HashMap<u32, f64> {
         .collect()
 }
 
-/// Contents of the sidecar: the insertion plus the edits made by dragging borders.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct SidecarFile {
-    #[serde(flatten)]
-    insertion: Insertion,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    region_edits: Vec<RegionEdit>,
-}
-
-/// Sidecar file next to the recording holding its insertion coordinates. The AP and
-/// LF files of one SpikeGLX recording share it (".ap"/".lf" is stripped).
-pub fn sidecar_path(bin_path: &Path) -> PathBuf {
-    recording_sidecar(bin_path, ".npx_atlas.toml")
-}
-
 /// `<recording><suffix>` next to the data file; the AP and LF files of a SpikeGLX
 /// recording share it.
 pub fn recording_sidecar(bin_path: &Path, suffix: &str) -> PathBuf {
@@ -721,19 +706,6 @@ pub fn recording_sidecar(bin_path: &Path, suffix: &str) -> PathBuf {
         .unwrap_or(&stem)
         .to_string();
     bin_path.with_file_name(format!("{base}{suffix}"))
-}
-
-pub fn load_sidecar(bin_path: &Path) -> Option<(Insertion, Vec<RegionEdit>)> {
-    let text = std::fs::read_to_string(sidecar_path(bin_path)).ok()?;
-    let f: SidecarFile = toml::from_str(&text).ok()?;
-    Some((f.insertion, f.region_edits))
-}
-
-pub fn save_sidecar(bin_path: &Path, ins: &Insertion, region_edits: &[RegionEdit]) -> Result<()> {
-    let path = sidecar_path(bin_path);
-    let f = SidecarFile { insertion: ins.clone(), region_edits: region_edits.to_vec() };
-    let text = toml::to_string_pretty(&f)?;
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
 }
 
 /// Path of the per-channel region table: `<data file stem>_regions.csv` next to it.
@@ -1203,27 +1175,6 @@ id,atlas_id,name,acronym,st_level,ontology_id,hemisphere_id,weight,parent_struct
     }
 
     #[test]
-    fn sidecar_round_trip_with_edits() {
-        let dir = std::env::temp_dir().join(format!("npx_sidecar_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("rec.imec0.ap.bin");
-        let ins = Insertion { ap_mm: -2.5, depth_mm: 3.2, ..Default::default() };
-        let edits = vec![
-            RegionEdit { shank: 0, from_um: 100.0, to_um: 140.0, region: Some(385) },
-            RegionEdit { shank: 1, from_um: 0.0, to_um: 20.0, region: None },
-        ];
-        save_sidecar(&bin, &ins, &edits).unwrap();
-        let (ins2, edits2) = load_sidecar(&bin).unwrap();
-        assert_eq!(ins2, ins);
-        assert_eq!(edits2, edits);
-        // a level is kept too, and a sidecar without edits still loads
-        let ins = Insertion { level: Some(5), ..ins };
-        save_sidecar(&bin, &ins, &[]).unwrap();
-        assert_eq!(load_sidecar(&bin).unwrap(), (ins, vec![]));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn upsert_cuts_replaces_and_merges() {
         let e = |from_um: f64, to_um: f64, region: Option<u32>| RegionEdit { shank: 0, from_um, to_um, region };
         let mut edits = vec![e(0.0, 100.0, Some(1))];
@@ -1253,9 +1204,9 @@ id,atlas_id,name,acronym,st_level,ontology_id,hemisphere_id,weight,parent_struct
 
     #[test]
     fn sidecar_name_shared_between_bands() {
-        let a = sidecar_path(Path::new("/d/rec_g0_t0.imec0.ap.bin"));
-        let b = sidecar_path(Path::new("/d/rec_g0_t0.imec0.lf.bin"));
+        let a = recording_sidecar(Path::new("/d/rec_g0_t0.imec0.ap.bin"), ".x.toml");
+        let b = recording_sidecar(Path::new("/d/rec_g0_t0.imec0.lf.bin"), ".x.toml");
         assert_eq!(a, b);
-        assert_eq!(a, Path::new("/d/rec_g0_t0.imec0.npx_atlas.toml"));
+        assert_eq!(a, Path::new("/d/rec_g0_t0.imec0.x.toml"));
     }
 }

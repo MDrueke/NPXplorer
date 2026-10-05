@@ -20,17 +20,7 @@ pub enum ColorMode {
     Voltage,
 }
 
-#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ColorMapChoice {
-    SunFire,
-    YellowMagenta,
-    RedBlue,
-    OrangeBlue,
-    IceFire,
-    Vanimo,
-    GreyScale,
-    CoolWarm,
-}
+use crate::colormap::ColorMapChoice;
 
 fn default_initial_buffer_s() -> f64 {
     30.0
@@ -61,6 +51,18 @@ fn default_atlas_min_region_channels() -> usize {
 }
 fn default_bregma_lambda_mm() -> f64 {
     crate::atlas::REFERENCE_BREGMA_LAMBDA_MM
+}
+fn default_spectrum_n_chunks() -> usize {
+    100
+}
+fn default_spectrum_freq_min_hz() -> f64 {
+    1.0
+}
+fn default_spectrum_freq_max_hz() -> f64 {
+    5000.0
+}
+fn default_spectrum_time_end_s() -> f64 {
+    60.0
 }
 
 /// Largest buffer duration (s) that fits in currently-available system memory, minus
@@ -139,12 +141,44 @@ pub struct Preferences {
     /// folder holding the Allen CCF atlas files (Atlas Registration)
     #[serde(default)]
     pub atlas_dir: Option<String>,
-    /// last-used bregma-lambda distance; a recording's atlas sidecar overrides it
+    /// last-used bregma-lambda distance; a recording's saved insertion overrides it
     #[serde(default = "default_bregma_lambda_mm")]
     pub bregma_lambda_mm: f64,
     /// atlas overlay: regions with fewer channels are not drawn on their own
     #[serde(default = "default_atlas_min_region_channels")]
     pub atlas_min_region_channels: usize,
+    /// applied noise-suppression settings (visual filter)
+    #[serde(default)]
+    pub noise_suppression: crate::noise::NoiseSuppression,
+    /// power spectrum: time span the PSD is computed over
+    #[serde(default)]
+    pub spectrum_time_scope: crate::spectrum::SpectrumTimeScope,
+    /// power spectrum: raw voltage or the current preprocessed buffer
+    #[serde(default)]
+    pub spectrum_source: crate::spectrum::SpectrumSource,
+    /// power spectrum: linear power or dB
+    #[serde(default)]
+    pub spectrum_scaling: crate::spectrum::SpectrumScaling,
+    /// power spectrum: colour range shared across channels, or per-channel
+    #[serde(default)]
+    pub spectrum_normalization: crate::spectrum::SpectrumNormalization,
+    /// power spectrum: number of evenly-spaced chunks sampled in whole-recording mode
+    #[serde(default = "default_spectrum_n_chunks")]
+    pub spectrum_n_chunks: usize,
+    /// power spectrum: restrict the displayed/coloured band to a sub-range
+    #[serde(default)]
+    pub spectrum_freq_restrict: bool,
+    #[serde(default = "default_spectrum_freq_min_hz")]
+    pub spectrum_freq_min_hz: f64,
+    #[serde(default = "default_spectrum_freq_max_hz")]
+    pub spectrum_freq_max_hz: f64,
+    /// power spectrum: restrict the span whole-recording chunks are sourced from
+    #[serde(default)]
+    pub spectrum_time_restrict: bool,
+    #[serde(default)]
+    pub spectrum_time_start_s: f64,
+    #[serde(default = "default_spectrum_time_end_s")]
+    pub spectrum_time_end_s: f64,
 }
 
 impl Preferences {
@@ -278,9 +312,13 @@ impl PsthState {
 
 impl PsthState {
     /// Fill in the file and settings saved for this recording.
-    fn restore(&mut self, sc: &crate::ttl::StimSidecar) {
-        self.stim_path = sc.stim_file.clone().filter(|p| p.is_file());
-        let s = &sc.psth;
+    fn restore(&mut self, stim_file: Option<&std::path::Path>, s: &crate::ttl::PsthSettings) {
+        self.stim_path = stim_file.filter(|p| p.is_file()).map(|p| p.to_path_buf());
+        if let Some(m) = &s.color_mode {
+            self.color_mode = m.clone();
+        }
+        self.color_pct = s.color_pct.unwrap_or(self.color_pct).clamp(95.0, 100.0);
+        self.color_uv = s.color_uv.unwrap_or(self.color_uv).clamp(1.0, 200.0);
         if let (Some(a), Some(b)) = (s.start_ms, s.end_ms) {
             (self.start_ms, self.end_ms) = (a, b);
             self.start_ms_str = format!("{a}");
@@ -291,6 +329,19 @@ impl PsthState {
             self.stim_t_end = b.clamp(0.0, self.total_s);
             self.stim_t_start_str = format!("{:.3}", self.stim_t_start);
             self.stim_t_end_str = format!("{:.3}", self.stim_t_end);
+        }
+    }
+
+    /// What is saved with the recording.
+    fn settings(&self) -> crate::ttl::PsthSettings {
+        crate::ttl::PsthSettings {
+            start_ms: Some(self.start_ms),
+            end_ms: Some(self.end_ms),
+            stim_t_start: Some(self.stim_t_start),
+            stim_t_end: Some(self.stim_t_end),
+            color_mode: Some(self.color_mode.clone()),
+            color_pct: Some(self.color_pct),
+            color_uv: Some(self.color_uv),
         }
     }
 
@@ -356,6 +407,41 @@ fn all_rows(display_rows: &[DisplayRow]) -> (usize, usize) {
 
 /// Rectangle zoom (left-drag on the heatmap): a channel range plus the time view from
 /// before the first zoom, which Esc restores.
+/// Everything the spectrum panel's texture depends on. Holds the result's `Arc`
+/// (compared by pointer) rather than a bare address, so a freed result's address
+/// being reused by the next one can't make a stale texture look current.
+struct SpectrumTexKey {
+    result: Arc<crate::spectrum::ComputedSpectrum>,
+    size: [usize; 2],
+    rows: (usize, usize),
+    scaling: crate::spectrum::SpectrumScaling,
+    normalization: crate::spectrum::SpectrumNormalization,
+    freq_range: Option<(f32, f32)>,
+}
+
+impl PartialEq for SpectrumTexKey {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.result, &other.result)
+            && self.size == other.size
+            && self.rows == other.rows
+            && self.scaling == other.scaling
+            && self.normalization == other.normalization
+            && self.freq_range == other.freq_range
+    }
+}
+
+/// How long the view must stay put before a live (current-view) spectrum is
+/// recomputed, so scrolling isn't slowed down by an FFT every frame.
+const SPECTRUM_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Rectangle zoom in the waveform view: the time window and voltage range from before
+/// the first zoom, which Esc restores.
+struct WaveformZoom {
+    prev_start_s: f64,
+    prev_dur_s: f64,
+    prev_y_range_uv: f32,
+}
+
 struct Zoom {
     /// channels of the bottom and top rows; stored as channels rather than row indices
     /// because the rows are rebuilt when channels are removed or averaged
@@ -378,6 +464,9 @@ fn view_rows(display_rows: &[DisplayRow], zoom: Option<&Zoom>) -> (usize, usize)
         _ => all_rows(display_rows),
     }
 }
+
+/// Smallest ± voltage range (µV) of the waveform view.
+const WAVEFORM_MIN_RANGE_UV: f32 = 1.0;
 
 /// Smallest drag (px, in each direction) that zooms; anything less stays a click.
 const ZOOM_MIN_DRAG_PX: f32 = 4.0;
@@ -493,6 +582,43 @@ fn channel_at_heatmap_y(result: &PsthResult, heat_rect: egui::Rect, y: f32) -> O
     }
 }
 
+/// "Esc to close zoom" at `pos`: solid text on a semi-transparent box, both switching
+/// with the colormap (dark box / white text, or the reverse on Cool-Warm's light
+/// background).
+fn draw_zoom_notice(painter: &egui::Painter, pos: egui::Pos2, cmap: &ColorMapChoice) {
+    let [fr, fg, fb] = cmap.spec().heatmap_fg;
+    let fg_color = egui::Color32::from_rgb(fr, fg, fb);
+    let [br, bg, bb] = cmap.spec().label_bg;
+    let galley = painter.layout_no_wrap("Esc to close zoom".to_string(), egui::FontId::proportional(13.0), fg_color);
+    painter.rect_filled(
+        galley.rect.translate(pos.to_vec2()).expand2(egui::vec2(6.0, 4.0)),
+        4.0,
+        egui::Color32::from_rgba_unmultiplied(br, bg, bb, 160),
+    );
+    painter.galley(pos, galley, fg_color);
+}
+
+/// The hover readout (channel, time, voltage) at the bottom left of `rect`.
+fn draw_readout(painter: &egui::Painter, rect: egui::Rect, label: String) {
+    let color = egui::Color32::from_rgba_unmultiplied(220, 220, 220, 200);
+    let galley = painter.layout_no_wrap(label, egui::FontId::proportional(12.0), color);
+    let text_pos = rect.left_bottom() + Vec2::new(6.0, -6.0 - galley.rect.height());
+    let bg_rect = galley.rect.translate(text_pos.to_vec2()).expand(4.0);
+    let [r, g, b] = crate::render::C_ZERO;
+    painter.rect_filled(bg_rect, 2.0, egui::Color32::from_rgba_unmultiplied(r, g, b, 200));
+    painter.galley(text_pos, galley, color);
+}
+
+/// Noise-filtered copy of the view; `key` = (buffer data pointer, buffer first sample,
+/// buffer length, view first sample, view length).
+struct NoiseView {
+    key: (usize, usize, usize, usize, usize),
+    settings: crate::noise::NoiseSuppression,
+    data: Arc<Vec<f32>>,
+    first: usize,
+    n: usize,
+}
+
 pub struct NPXplorerApp {
     bin_path: PathBuf,
     meta: Arc<Meta>,
@@ -537,6 +663,11 @@ pub struct NPXplorerApp {
     // plot of that channel; y-axis is ±waveform_y_range_uv, adjustable via Alt+scroll
     waveform_channel: Option<usize>,
     waveform_y_range_uv: f32,
+    /// voltage at the middle of the waveform view: 0, except when zoomed into a range
+    waveform_y_center_uv: f32,
+    /// rectangle zoom in the waveform view (left-drag); Esc returns to `WaveformZoom`'s
+    /// view before closing the waveform view
+    waveform_zoom: Option<WaveformZoom>,
 
     // channel removal
     show_remove_channels: bool,
@@ -560,6 +691,55 @@ pub struct NPXplorerApp {
     /// snapshot of `classify_n_chunks` taken when the in-flight run was dispatched,
     /// so the progress bar stays correct even if the preference changes mid-run
     classify_run_total: usize,
+
+    // noise suppression (visual filter on the view only); the window edits the draft,
+    // Apply copies it to `noise`
+    noise_open: bool,
+    /// "Notch filters" section of the noise window (scan + notch list)
+    notch_panel: crate::notch::NotchPanel,
+    noise: crate::noise::NoiseSuppression,
+    noise_draft: crate::noise::NoiseSuppression,
+    /// filtered copy of the view (plus margin) and what it was computed from
+    noise_view: Option<NoiseView>,
+    /// noise settings the current heatmap texture was drawn with
+    last_rendered_noise: Option<crate::noise::NoiseSuppression>,
+
+    // power spectrum (per-channel PSD overlay)
+    spectrum_open: bool,
+    spectrum_time_scope: crate::spectrum::SpectrumTimeScope,
+    spectrum_source: crate::spectrum::SpectrumSource,
+    spectrum_scaling: crate::spectrum::SpectrumScaling,
+    spectrum_normalization: crate::spectrum::SpectrumNormalization,
+    spectrum_n_chunks: usize,
+    /// whole-recording mode: whether chunks are sourced only from
+    /// [spectrum_time_start_s, spectrum_time_end_s] rather than the whole recording
+    spectrum_time_restrict: bool,
+    spectrum_time_start_s: f64,
+    spectrum_time_end_s: f64,
+    /// whether the displayed/coloured band is restricted to [spectrum_freq_min_hz,
+    /// spectrum_freq_max_hz] rather than the full 0..nyquist band
+    spectrum_freq_restrict: bool,
+    spectrum_freq_min_hz: f64,
+    spectrum_freq_max_hz: f64,
+    spectrum_show_overlay: bool,
+    /// true once the user has pressed "Calculate" with scope = current view; keeps
+    /// the result live-recomputed as the view scrolls, until the scope is changed
+    spectrum_want_live: bool,
+    spectrum_result: Option<Arc<crate::spectrum::ComputedSpectrum>>,
+    spectrum_texture: Option<TextureHandle>,
+    /// inputs the current `spectrum_texture` was built from; rebuilt only when they change
+    spectrum_tex_key: Option<SpectrumTexKey>,
+    spectrum_pixel_buf: Vec<u8>,
+    spectrum_computing: bool,
+    spectrum_error: Option<String>,
+    spectrum_rx: Option<mpsc::Receiver<Result<crate::spectrum::ComputedSpectrum, String>>>,
+    spectrum_cancel: Arc<AtomicBool>,
+    spectrum_progress: Arc<AtomicUsize>,
+    spectrum_run_total: usize,
+    // live current-view recompute waits until the view has stopped moving: the
+    // last (view_first, view_n) seen and when it last changed
+    spectrum_view_seen: (usize, usize),
+    spectrum_view_changed_at: std::time::Instant,
 
     // async worker
     worker_state: SharedWorkerState,
@@ -608,8 +788,62 @@ pub struct NPXplorerApp {
     stim_layout_text: String,
     /// stimulus file last loaded in the TTL or PSTH window (saved per recording)
     stim_file: Option<PathBuf>,
-    stim_sidecar_dirty: bool,
+
+    // the recording's settings file (settings.rs): which section is ours, what was
+    // last written, and since when the settings differ from it
+    band: crate::settings::Band,
+    settings_saved: Option<crate::settings::RecordingSettings>,
+    settings_changed_at: Option<std::time::Instant>,
+    settings_error: Option<String>,
+
+    // screenshot of the plot area
+    /// the central panel: heatmap plus spectrum strip, or the waveform view
+    plot_rect: Option<egui::Rect>,
+    screenshot: ScreenshotState,
+    capture: Option<Capture>,
 }
+
+/// How long the settings must have differed from the file before it is rewritten,
+/// so scrolling or dragging a value doesn't write on every frame.
+const SETTINGS_SAVE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Overlays that can be left out of a screenshot.
+#[derive(Clone, Copy, PartialEq)]
+struct ShotOverlays {
+    ttl: bool,
+    atlas: bool,
+    firing_rate: bool,
+    spectrum: bool,
+    classification: bool,
+    selection: bool,
+    scale_bar: bool,
+}
+
+/// The "Screenshot" window.
+#[derive(Default)]
+struct ScreenshotState {
+    open: bool,
+    /// overlays to include; filled from what is shown when the window opens
+    include: Option<ShotOverlays>,
+    pick_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
+    /// result of the last screenshot: (message, success)
+    note: Option<(String, bool)>,
+}
+
+/// A screenshot being taken: the windows, the legend and the hover readout are hidden,
+/// the overlays set to the chosen ones, until the image arrives.
+struct Capture {
+    path: PathBuf,
+    include: ShotOverlays,
+    /// overlay visibility to restore afterwards
+    restore: ShotOverlays,
+    /// frames drawn so far in screenshot mode; the image is requested in the second,
+    /// the first one drawn entirely without windows
+    frames: u32,
+}
+
+/// Tags our screenshot request, so the PSTH export's doesn't take its image.
+struct MainScreenshot;
 
 impl NPXplorerApp {
     pub fn new(ctx: &egui::Context, bin_path: PathBuf) -> anyhow::Result<Self> {
@@ -629,6 +863,8 @@ impl NPXplorerApp {
             removed_channels: Default::default(),
             channel_order: Default::default(),
             shank_order: Default::default(),
+            notches: Vec::new(),
+            notch_enabled: false,
         };
 
         let mut view_dur_s = 0.5;
@@ -651,6 +887,18 @@ impl NPXplorerApp {
         let mut atlas_dir = None;
         let mut bregma_lambda_mm = default_bregma_lambda_mm();
         let mut atlas_min_region_channels = default_atlas_min_region_channels();
+        let mut noise = crate::noise::NoiseSuppression::default();
+        let mut spectrum_time_scope = crate::spectrum::SpectrumTimeScope::default();
+        let mut spectrum_source = crate::spectrum::SpectrumSource::default();
+        let mut spectrum_scaling = crate::spectrum::SpectrumScaling::default();
+        let mut spectrum_normalization = crate::spectrum::SpectrumNormalization::default();
+        let mut spectrum_n_chunks = default_spectrum_n_chunks();
+        let mut spectrum_freq_restrict = false;
+        let mut spectrum_freq_min_hz = default_spectrum_freq_min_hz();
+        let mut spectrum_freq_max_hz = default_spectrum_freq_max_hz();
+        let mut spectrum_time_restrict = false;
+        let mut spectrum_time_start_s = 0.0;
+        let mut spectrum_time_end_s = default_spectrum_time_end_s();
 
         if let Some(p) = prefs {
             preproc_cfg = p.preproc_cfg;
@@ -675,43 +923,61 @@ impl NPXplorerApp {
             atlas_dir = p.atlas_dir;
             bregma_lambda_mm = p.bregma_lambda_mm;
             atlas_min_region_channels = p.atlas_min_region_channels;
+            noise = p.noise_suppression;
+            spectrum_time_scope = p.spectrum_time_scope;
+            spectrum_source = p.spectrum_source;
+            spectrum_scaling = p.spectrum_scaling;
+            spectrum_normalization = p.spectrum_normalization;
+            spectrum_n_chunks = p.spectrum_n_chunks;
+            spectrum_freq_restrict = p.spectrum_freq_restrict;
+            spectrum_freq_min_hz = p.spectrum_freq_min_hz;
+            spectrum_freq_max_hz = p.spectrum_freq_max_hz;
+            spectrum_time_restrict = p.spectrum_time_restrict;
+            spectrum_time_start_s = p.spectrum_time_start_s;
+            spectrum_time_end_s = p.spectrum_time_end_s;
         }
 
-        // reference sites carry no neural signal: start with them removed (listed in
-        // the Remove-channels dialog; Reset brings them back)
-        if meta.reference_channels.len() < meta.n_ap_chans {
-            preproc_cfg.removed_channels = meta.reference_channels.clone();
-        }
+        // the recording's own settings (see settings.rs); the band section is applied
+        // once the app exists, below
+        let settings_file = crate::settings::load_table(&bin_path);
+        let band = crate::settings::Band::of_sample_rate(fs);
+
+        // removed channels: as saved, else the reference sites, which carry no neural
+        // signal (listed in the Remove-channels dialog; Reset brings them back). Set
+        // before the filters and the first preprocessing request are made.
+        let saved_removed = settings_file
+            .get("removed_channels")
+            .and_then(|v| v.clone().try_into::<Vec<usize>>().ok())
+            .map(|v| v.into_iter().filter(|&c| c < meta.n_ap_chans).collect::<BTreeSet<usize>>())
+            .filter(|set| set.len() < meta.n_ap_chans);
+        preproc_cfg.removed_channels = match saved_removed {
+            Some(set) => set,
+            None if meta.reference_channels.len() < meta.n_ap_chans => meta.reference_channels.clone(),
+            None => BTreeSet::new(),
+        };
+
+        let stim_settings = match settings_file.get("stim") {
+            Some(v) => crate::settings::overlay(&crate::settings::StimSettings::default(), Some(v)),
+            None => crate::settings::legacy_stim(&bin_path).unwrap_or_default(),
+        };
+        let atlas_default = crate::settings::AtlasSettings {
+            insertion: crate::atlas::Insertion { bregma_lambda_mm, ..Default::default() },
+            ..Default::default()
+        };
+        let atlas_settings = match settings_file.get("atlas") {
+            Some(v) => crate::settings::overlay(&atlas_default, Some(v)),
+            None => crate::settings::legacy_atlas(&bin_path).unwrap_or(atlas_default),
+        };
 
         // move this recording to the front of the recent-files list (max 5)
         recent_files.retain(|p| p != &bin_path);
         recent_files.insert(0, bin_path.clone());
         recent_files.truncate(5);
 
-        // defensively re-clamp in case prefs were saved on a machine with more RAM,
-        // or with an initial_buffer_s/view_dur_s combination that no longer satisfies
-        // the no-oscillation bound
-        let n_data_rows = meta
-            .build_display_rows(
-                preproc_cfg.avg_depths,
-                &preproc_cfg.removed_channels,
-                preproc_cfg.channel_order,
-                preproc_cfg.shank_order,
-            )
-            .iter()
-            .filter(|r| matches!(r, DisplayRow::Data { .. }))
-            .count();
-        initial_buffer_s =
-            initial_buffer_s.min(max_feasible_buffer_s(n_data_rows, fs, mem_reserve_mb));
-        extension_margin_s =
-            extension_margin_s.min(max_extension_margin_s(initial_buffer_s, view_dur_s));
-
         let filters = Arc::new(Mutex::new(Filters::new(&preproc_cfg)));
         let shared: SharedWorkerState = Arc::new((Mutex::new(WorkerState::new()), Condvar::new()));
         let cancel: SharedCancel = Arc::new(AtomicBool::new(false));
-
-        let half_window = compute_half_window(initial_buffer_s, fs);
-
+        // the first request is sent by `start`, once the settings are applied
         let handle = spawn_worker(
             Arc::clone(&raw),
             Arc::clone(&meta),
@@ -721,32 +987,19 @@ impl NPXplorerApp {
             ctx.clone(),
         );
 
-        // send initial request
-        {
-            let (lock, cvar) = &*shared;
-            lock.lock().unwrap().request = Some(WorkerRequest {
-                kind: RequestKind::Full {
-                    center_sample: half_window,
-                    half_window,
-                },
-                cfg: preproc_cfg.clone(),
-            });
-            cvar.notify_one();
-        }
-
         let is_compressed = bin_path.extension().and_then(|s| s.to_str()) == Some("cbin");
 
-        let bin_path_for_atlas = bin_path.clone();
         let meta_for_atlas = Arc::clone(&meta);
         let psth_total_s = meta.n_samples as f64 / meta.sample_rate;
-        let stim_sidecar = crate::ttl::load_sidecar(&bin_path);
         let mut psth = PsthState::new(psth_total_s);
-        psth.restore(&stim_sidecar);
+        psth.restore(stim_settings.stim_file.as_deref(), &stim_settings.psth);
         let remove_channels_text = crate::channel_remove::format_channel_list(
             &preproc_cfg.removed_channels,
             &meta.channel_ids,
         );
-        let app = Self {
+        let notch_panel = crate::notch::NotchPanel::new(&[], Default::default());
+
+        let mut app = Self {
             bin_path,
             meta,
             raw: Arc::clone(&raw),
@@ -775,6 +1028,8 @@ impl NPXplorerApp {
             context_menu_pos: None,
             waveform_channel: None,
             waveform_y_range_uv: 200.0,
+            waveform_y_center_uv: 0.0,
+            waveform_zoom: None,
             show_remove_channels: false,
             remove_channels_text,
             remove_channels_error: None,
@@ -790,9 +1045,41 @@ impl NPXplorerApp {
             classify_outside_rule,
             peak_pooling,
             classify_run_total: 0,
+            noise_open: false,
+            notch_panel,
+            noise_draft: noise.clone(),
+            noise,
+            noise_view: None,
+            last_rendered_noise: None,
+            spectrum_open: false,
+            spectrum_time_scope,
+            spectrum_source,
+            spectrum_scaling,
+            spectrum_normalization,
+            spectrum_n_chunks,
+            spectrum_freq_restrict,
+            spectrum_freq_min_hz,
+            spectrum_freq_max_hz,
+            spectrum_time_restrict,
+            spectrum_time_start_s,
+            spectrum_time_end_s,
+            spectrum_show_overlay: false,
+            spectrum_want_live: false,
+            spectrum_result: None,
+            spectrum_texture: None,
+            spectrum_tex_key: None,
+            spectrum_pixel_buf: Vec::new(),
+            spectrum_computing: false,
+            spectrum_error: None,
+            spectrum_rx: None,
+            spectrum_cancel: Arc::new(AtomicBool::new(false)),
+            spectrum_progress: Arc::new(AtomicUsize::new(0)),
+            spectrum_run_total: 0,
+            spectrum_view_seen: (usize::MAX, 0),
+            spectrum_view_changed_at: std::time::Instant::now(),
             worker_state: shared,
             worker_cancel: cancel,
-            worker_half_window: half_window,
+            worker_half_window: compute_half_window(initial_buffer_s, fs),
             initial_buffer_s,
             extension_margin_s,
             mem_pressure_pct,
@@ -820,28 +1107,253 @@ impl NPXplorerApp {
             proj_cfg: None,
             proj_rows: None,
             psth,
-            atlas: crate::atlas_ui::AtlasUi::new(
-                &bin_path_for_atlas,
-                &meta_for_atlas,
-                atlas_dir,
-                bregma_lambda_mm,
-                atlas_min_region_channels,
-            ),
-            ttl: crate::ttl::TtlState::new(&stim_sidecar.ttl, stim_sidecar.stim_file.as_deref()),
-            stim_layout_text: crate::psth::layout_text(&bin_path_for_atlas),
-            stim_file: stim_sidecar.stim_file.clone(),
-            stim_sidecar_dirty: false,
+            atlas: crate::atlas_ui::AtlasUi::new(&meta_for_atlas, atlas_dir, atlas_settings, atlas_min_region_channels),
+            ttl: crate::ttl::TtlState::new(&stim_settings.ttl, stim_settings.stim_file.as_deref()),
+            stim_layout_text: stim_settings.layout.clone().unwrap_or_else(crate::psth::default_layout_text),
+            stim_file: stim_settings.stim_file.clone(),
+            band,
+            settings_saved: None,
+            settings_changed_at: None,
+            settings_error: None,
+            plot_rect: None,
+            screenshot: ScreenshotState::default(),
+            capture: None,
         };
-        app.save_prefs();
+
+        // this band's settings, over the ones taken from the preferences above
+        let key = band.key();
+        let mut band_settings = crate::settings::overlay(&app.band_settings(), settings_file.get(key));
+        if settings_file.get(key).is_none() {
+            // notches saved by an earlier version are restored and switched on
+            if let Some(notches) = crate::settings::legacy_notches(&app.bin_path) {
+                band_settings.preproc.notch_enabled = !notches.is_empty();
+                band_settings.preproc.notches = notches;
+            }
+        }
+        app.apply_band_settings(band_settings);
+        app.start(ctx);
         Ok(app)
+    }
+
+    /// Clamp the buffer settings, start preprocessing, and load the atlas if its
+    /// overlay was shown last time. Writes the settings file, so a recording opened
+    /// once keeps its settings even when the preferences change later.
+    fn start(&mut self, ctx: &egui::Context) {
+        let fs = self.meta.sample_rate;
+        // defensively re-clamp in case prefs were saved on a machine with more RAM,
+        // or with an initial_buffer_s/view_dur_s combination that no longer satisfies
+        // the no-oscillation bound
+        let n_data_rows = self
+            .meta
+            .build_display_rows(
+                self.preproc_cfg.avg_depths,
+                &self.preproc_cfg.removed_channels,
+                self.preproc_cfg.channel_order,
+                self.preproc_cfg.shank_order,
+            )
+            .iter()
+            .filter(|r| matches!(r, DisplayRow::Data { .. }))
+            .count();
+        self.initial_buffer_s =
+            self.initial_buffer_s.min(max_feasible_buffer_s(n_data_rows, fs, self.mem_reserve_mb));
+        self.extension_margin_s =
+            self.extension_margin_s.min(max_extension_margin_s(self.initial_buffer_s, self.view_dur_s));
+        self.worker_half_window = compute_half_window(self.initial_buffer_s, fs);
+
+        *self.preproc_filters.lock().unwrap() = Filters::new(&self.preproc_cfg);
+        self.request_recompute();
+        let meta = Arc::clone(&self.meta);
+        self.atlas.register_on_open(ctx, &meta);
+        self.save_settings();
     }
 }
 
 impl Drop for NPXplorerApp {
     /// Stop the worker thread when the recording is closed, so its thread pool, the
-    /// preprocessed buffer and the mapped data file are released.
+    /// preprocessed buffer and the mapped data file are released. Unsaved settings
+    /// changes are written first.
     fn drop(&mut self) {
+        self.flush_settings();
         request_shutdown(&self.worker_state, &self.worker_cancel, &self.preproc_cfg);
+    }
+}
+
+impl NPXplorerApp {
+    /// This band's settings, as saved in the recording's settings file.
+    fn band_settings(&self) -> crate::settings::BandSettings {
+        use crate::settings::*;
+        let c = &self.preproc_cfg;
+        // a zoomed view isn't restored; the view from before the (outermost) zoom is
+        let (view_start_s, view_dur_s) = match (&self.zoom, &self.waveform_zoom) {
+            (Some(z), _) => (z.prev_start_s, z.prev_dur_s),
+            (None, Some(z)) => (z.prev_start_s, z.prev_dur_s),
+            (None, None) => (self.view_start_s, self.view_dur_s),
+        };
+        BandSettings {
+            view_start_s,
+            view_dur_s,
+            scroll_fine: self.scroll_speed_fine,
+            color_mode: self.color_mode.clone(),
+            color_pct: self.color_pct,
+            color_uv: self.color_uv,
+            colormap: self.colormap_choice.clone(),
+            peak_pooling: self.peak_pooling,
+            waveform_y_range_uv: self.waveform_zoom.as_ref().map_or(self.waveform_y_range_uv, |z| z.prev_y_range_uv),
+            preproc: PreprocSettings {
+                dc_removal: c.dc_removal,
+                phase_shift: c.phase_shift,
+                highpass: c.highpass,
+                spatial_filter: c.spatial_filter,
+                avg_depths: c.avg_depths,
+                channel_order: c.channel_order,
+                shank_order: c.shank_order,
+                notch_enabled: c.notch_enabled,
+                notches: c.notches.clone(),
+            },
+            firing_rate: FiringRateSettings {
+                show: self.show_firing_rate_overlay,
+                threshold_uv: self.spike_threshold,
+                overlay_scale: self.spike_overlay_scale,
+                smoothing_sigma: self.spike_smoothing_sigma,
+            },
+            classification: ClassificationSettings {
+                n_chunks: self.classify_n_chunks,
+                outside_rule: self.classify_outside_rule,
+                show_overlay: self.show_classification_overlay,
+            },
+            spectrum: SpectrumSettings {
+                time_scope: self.spectrum_time_scope,
+                source: self.spectrum_source,
+                scaling: self.spectrum_scaling,
+                normalization: self.spectrum_normalization,
+                n_chunks: self.spectrum_n_chunks,
+                freq_restrict: self.spectrum_freq_restrict,
+                freq_min_hz: self.spectrum_freq_min_hz,
+                freq_max_hz: self.spectrum_freq_max_hz,
+                time_restrict: self.spectrum_time_restrict,
+                time_start_s: self.spectrum_time_start_s,
+                time_end_s: self.spectrum_time_end_s,
+                show_overlay: self.spectrum_show_overlay,
+            },
+            noise: self.noise.clone(),
+            notch_scan: self.notch_panel.scan_settings().clone(),
+        }
+    }
+
+    /// Take over a band's saved settings; called before preprocessing starts.
+    fn apply_band_settings(&mut self, s: crate::settings::BandSettings) {
+        let total_s = self.meta.n_samples as f64 / self.meta.sample_rate;
+        self.view_dur_s = s.view_dur_s.clamp(0.01, 10.0);
+        self.view_start_s = s.view_start_s.clamp(0.0, (total_s - self.view_dur_s).max(0.0));
+        self.window_dur_str = format!("{:.3}", self.view_dur_s);
+        self.jump_str = format!("{:.3}", self.view_start_s);
+        self.scroll_speed_fine = s.scroll_fine;
+        self.color_mode = s.color_mode;
+        self.color_pct = s.color_pct.clamp(95.0, 100.0);
+        self.color_uv = s.color_uv.clamp(10.0, 300.0);
+        self.color_pct_str = format!("{:.2}", self.color_pct);
+        self.color_uv_str = format!("{:.0}", self.color_uv);
+        self.colormap_choice = s.colormap;
+        self.peak_pooling = s.peak_pooling;
+        self.waveform_y_range_uv = s.waveform_y_range_uv.clamp(WAVEFORM_MIN_RANGE_UV, 2000.0);
+
+        let c = &mut self.preproc_cfg;
+        c.dc_removal = s.preproc.dc_removal;
+        c.phase_shift = s.preproc.phase_shift;
+        c.spatial_filter = s.preproc.spatial_filter;
+        // destripe includes the highpass
+        c.highpass = s.preproc.highpass || c.spatial_filter == SpatialFilter::Destripe;
+        c.avg_depths = s.preproc.avg_depths;
+        c.channel_order = s.preproc.channel_order;
+        c.shank_order = s.preproc.shank_order;
+        c.notch_enabled = s.preproc.notch_enabled && !s.preproc.notches.is_empty();
+        c.notches = s.preproc.notches;
+        self.notch_panel = crate::notch::NotchPanel::new(&self.preproc_cfg.notches, s.notch_scan);
+
+        self.show_firing_rate_overlay = s.firing_rate.show;
+        self.spike_threshold = s.firing_rate.threshold_uv;
+        self.spike_overlay_scale = s.firing_rate.overlay_scale;
+        self.spike_smoothing_sigma = s.firing_rate.smoothing_sigma;
+        self.classify_n_chunks = s.classification.n_chunks;
+        self.classify_outside_rule = s.classification.outside_rule;
+        self.show_classification_overlay = s.classification.show_overlay;
+
+        self.spectrum_time_scope = s.spectrum.time_scope;
+        self.spectrum_source = s.spectrum.source;
+        self.spectrum_scaling = s.spectrum.scaling;
+        self.spectrum_normalization = s.spectrum.normalization;
+        self.spectrum_n_chunks = s.spectrum.n_chunks;
+        self.spectrum_freq_restrict = s.spectrum.freq_restrict;
+        self.spectrum_freq_min_hz = s.spectrum.freq_min_hz;
+        self.spectrum_freq_max_hz = s.spectrum.freq_max_hz;
+        self.spectrum_time_restrict = s.spectrum.time_restrict;
+        self.spectrum_time_start_s = s.spectrum.time_start_s;
+        self.spectrum_time_end_s = s.spectrum.time_end_s;
+        self.spectrum_show_overlay = s.spectrum.show_overlay;
+
+        self.noise_draft = s.noise.clone();
+        self.noise = s.noise;
+    }
+
+    /// Everything saved in the recording's settings file.
+    fn recording_settings(&self) -> crate::settings::RecordingSettings {
+        let mut s = crate::settings::RecordingSettings {
+            removed_channels: Some(self.preproc_cfg.removed_channels.iter().copied().collect()),
+            stim: Some(crate::settings::StimSettings {
+                stim_file: self.stim_file.clone(),
+                layout: Some(self.stim_layout_text.clone()),
+                ttl: self.ttl.settings(),
+                psth: self.psth.settings(),
+            }),
+            atlas: Some(self.atlas.settings()),
+            ..Default::default()
+        };
+        *s.band_mut(self.band) = Some(self.band_settings());
+        s
+    }
+
+    /// Write the settings file (and the preferences, which hold the last-used settings
+    /// as defaults for recordings opened for the first time).
+    fn save_settings(&mut self) {
+        let current = self.recording_settings();
+        let mut to_write = current.clone();
+        if let Some(stim) = &mut to_write.stim {
+            stim.layout = stim.layout.as_deref().and_then(crate::psth::layout_to_save);
+        }
+        self.settings_error = crate::settings::save(&self.bin_path, self.band, &to_write)
+            .err()
+            .map(|e| format!("settings not saved: {e:#}"));
+        self.settings_saved = Some(current);
+        self.settings_changed_at = None;
+        self.save_prefs();
+    }
+
+    /// Rewrite the settings file once they have differed from it for
+    /// `SETTINGS_SAVE_DELAY` and no mouse button is held (a drag in progress).
+    fn autosave_settings(&mut self, ctx: &egui::Context) {
+        if self.capture.is_some() {
+            return; // overlay visibility is temporarily changed for the screenshot
+        }
+        if self.settings_saved.as_ref() == Some(&self.recording_settings()) {
+            self.settings_changed_at = None;
+            return;
+        }
+        let since = *self.settings_changed_at.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() >= SETTINGS_SAVE_DELAY && !ctx.input(|i| i.pointer.any_down()) {
+            self.save_settings();
+        } else {
+            ctx.request_repaint_after(SETTINGS_SAVE_DELAY);
+        }
+    }
+
+    /// Write unsaved settings changes now (closing the recording or the app).
+    pub fn flush_settings(&mut self) {
+        if let Some(c) = self.capture.take() {
+            self.set_overlay_visibility(c.restore);
+        }
+        if self.settings_saved.as_ref() != Some(&self.recording_settings()) {
+            self.save_settings();
+        }
     }
 }
 
@@ -879,6 +1391,18 @@ impl NPXplorerApp {
             atlas_dir: self.atlas.atlas_dir(),
             bregma_lambda_mm: self.atlas.bregma_lambda_mm(),
             atlas_min_region_channels: self.atlas.min_region_channels(),
+            noise_suppression: self.noise.clone(),
+            spectrum_time_scope: self.spectrum_time_scope,
+            spectrum_source: self.spectrum_source,
+            spectrum_scaling: self.spectrum_scaling,
+            spectrum_normalization: self.spectrum_normalization,
+            spectrum_n_chunks: self.spectrum_n_chunks,
+            spectrum_freq_restrict: self.spectrum_freq_restrict,
+            spectrum_freq_min_hz: self.spectrum_freq_min_hz,
+            spectrum_freq_max_hz: self.spectrum_freq_max_hz,
+            spectrum_time_restrict: self.spectrum_time_restrict,
+            spectrum_time_start_s: self.spectrum_time_start_s,
+            spectrum_time_end_s: self.spectrum_time_end_s,
         };
         prefs.save();
     }
@@ -1149,6 +1673,625 @@ impl NPXplorerApp {
     }
 
     // -----------------------------------------------------------------------
+    // Power spectrum overlay
+    // -----------------------------------------------------------------------
+
+    /// `None` shows the full band up to Nyquist; see `spectrum_freq_restrict`.
+    fn spectrum_freq_range(&self) -> Option<(f32, f32)> {
+        self.spectrum_freq_restrict
+            .then(|| (self.spectrum_freq_min_hz as f32, self.spectrum_freq_max_hz as f32))
+    }
+
+    /// `None` sources whole-recording chunks from the whole recording; see
+    /// `spectrum_time_restrict`.
+    fn spectrum_time_range(&self) -> Option<(f64, f64)> {
+        self.spectrum_time_restrict
+            .then_some((self.spectrum_time_start_s, self.spectrum_time_end_s))
+    }
+
+    /// Background scan: evenly-spaced raw chunks across the whole recording.
+    fn dispatch_spectrum(&mut self, ctx: &egui::Context) {
+        self.spectrum_cancel.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.spectrum_cancel = Arc::clone(&cancel);
+        let progress = Arc::new(AtomicUsize::new(0));
+        self.spectrum_progress = Arc::clone(&progress);
+
+        let (tx, rx) = mpsc::channel();
+        self.spectrum_rx = Some(rx);
+        self.spectrum_computing = true;
+        self.spectrum_error = None;
+
+        let raw = Arc::clone(&self.raw);
+        let meta = Arc::clone(&self.meta);
+        let display_rows = self.meta.build_display_rows(
+            self.preproc_cfg.avg_depths,
+            &self.preproc_cfg.removed_channels,
+            self.preproc_cfg.channel_order,
+            self.preproc_cfg.shank_order,
+        );
+        let n_chunks = self.spectrum_n_chunks.max(1);
+        let time_range = self.spectrum_time_range();
+        self.spectrum_run_total = n_chunks;
+        // the row layout this job's rows are indexed by travels with the result, so a
+        // result is only ever shown against the layout it was computed for
+        let cfg = self.preproc_cfg.clone();
+        let ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            let res = crate::spectrum::compute_psd_whole_recording(
+                &raw,
+                &meta,
+                &display_rows,
+                n_chunks,
+                time_range,
+                &cancel,
+                &progress,
+            )
+            .map(|result| crate::spectrum::ComputedSpectrum {
+                result,
+                cfg,
+                source: crate::spectrum::SpectrumSource::Raw,
+                view: None,
+            });
+            let _ = tx.send(res);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_spectrum(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.spectrum_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.spectrum_rx = None;
+                    self.spectrum_computing = false;
+                    match res {
+                        Ok(result) => {
+                            self.spectrum_result = Some(Arc::new(result));
+                            self.spectrum_show_overlay = true;
+                            self.spectrum_error = None;
+                        }
+                        Err(e) if e == "cancelled" => {}
+                        Err(e) => self.spectrum_error = Some(e),
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.spectrum_rx = None;
+                    self.spectrum_computing = false;
+                }
+            }
+        }
+    }
+
+    fn draw_spectrum_error_window(&mut self, ctx: &egui::Context) {
+        if let Some(err) = self.spectrum_error.clone() {
+            let mut dismiss = false;
+            egui::Window::new("Power Spectrum failed")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.colored_label(egui::Color32::from_rgb(0xff, 0x66, 0x66), &err);
+                    if ui.button("OK").clicked() {
+                        dismiss = true;
+                    }
+                });
+            if dismiss {
+                self.spectrum_error = None;
+            }
+        }
+    }
+
+    /// Settings window opened by the "Noise Suppression" toolbar button.
+    fn draw_noise_window(&mut self, ctx: &egui::Context) {
+        if !self.noise_open {
+            return;
+        }
+        let mut open = self.noise_open;
+        egui::Window::new("Noise Suppression")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.strong("Display filters");
+                    match crate::noise::draw_settings(ui, &mut self.noise_draft, &self.noise) {
+                        crate::noise::Action::Apply => self.noise = self.noise_draft.clone(),
+                        crate::noise::Action::DisableAll => {
+                            self.noise_draft.disable_all();
+                            self.noise.disable_all();
+                        }
+                        crate::noise::Action::None => {}
+                    }
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.strong("Notch filters");
+                    if let Some(notches) = self.notch_panel.draw(ui, &self.raw, &self.meta, &self.preproc_cfg) {
+                        self.preproc_cfg.notch_enabled = !notches.is_empty();
+                        self.preproc_cfg.notches = notches;
+                        self.heatmap_texture = None;
+                        self.pending_cfg_recompute = true;
+                    }
+                });
+            });
+        self.noise_open = open;
+    }
+
+    /// The samples to draw as `(data, first_sample, n_samp)`: the worker buffer, or
+    /// with noise suppression on, a filtered copy of the view plus a margin. The copy
+    /// is cached until the view, the buffer or the settings change.
+    fn display_source(
+        &mut self,
+        buf_data: &Option<Arc<Vec<f32>>>,
+        buf_display_rows: &Option<Arc<Vec<DisplayRow>>>,
+        buf_first: usize,
+        buf_n_samp: usize,
+        view_first: usize,
+        view_n: usize,
+    ) -> (Option<Arc<Vec<f32>>>, usize, usize) {
+        let unfiltered = (buf_data.clone(), buf_first, buf_n_samp);
+        let (Some(data), Some(rows)) = (buf_data, buf_display_rows) else { return unfiltered };
+        if !self.noise.active() || buf_n_samp == 0 {
+            self.noise_view = None;
+            return unfiltered;
+        }
+        let key = (Arc::as_ptr(data) as usize, buf_first, buf_n_samp, view_first, view_n);
+        if let Some(v) = &self.noise_view {
+            if v.key == key && v.settings == self.noise {
+                return (Some(Arc::clone(&v.data)), v.first, v.n);
+            }
+        }
+        let fs = self.meta.sample_rate;
+        let margin = crate::noise::margin_samples(fs);
+        let lo = view_first.saturating_sub(margin).max(buf_first);
+        let hi = (view_first + view_n + margin).min(buf_first + buf_n_samp);
+        if lo >= hi {
+            return unfiltered;
+        }
+        let n = hi - lo;
+        let off = lo - buf_first;
+        let n_rows = data.len() / buf_n_samp;
+        let mut out = vec![0.0f32; n_rows * n];
+        {
+            use rayon::prelude::*;
+            out.par_chunks_mut(n).enumerate().for_each(|(r, row)| {
+                row.copy_from_slice(&data[r * buf_n_samp + off..r * buf_n_samp + off + n]);
+            });
+        }
+        crate::noise::apply(&mut out, n, rows, &self.noise, fs);
+        let out = Arc::new(out);
+        self.noise_view = Some(NoiseView { key, settings: self.noise.clone(), data: Arc::clone(&out), first: lo, n });
+        (Some(out), lo, n)
+    }
+
+    /// Settings window opened by the "Power Spectrum" toolbar button.
+    fn draw_spectrum_window(&mut self, ctx: &egui::Context) {
+        if !self.spectrum_open {
+            return;
+        }
+        use crate::spectrum::{SpectrumNormalization, SpectrumScaling, SpectrumSource, SpectrumTimeScope};
+        let mut open = self.spectrum_open;
+        let mut dirty = false;
+        egui::Window::new("Power Spectrum")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Time scope:");
+                    let mut scope = self.spectrum_time_scope;
+                    egui::ComboBox::from_id_salt("spec_scope_combo")
+                        .selected_text(match scope {
+                            SpectrumTimeScope::CurrentView => "Current view window",
+                            SpectrumTimeScope::WholeRecordingChunks => "Whole recording (chunks)",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut scope, SpectrumTimeScope::CurrentView, "Current view window");
+                            ui.selectable_value(
+                                &mut scope,
+                                SpectrumTimeScope::WholeRecordingChunks,
+                                "Whole recording (chunks)",
+                            );
+                        });
+                    if scope != self.spectrum_time_scope {
+                        self.spectrum_time_scope = scope;
+                        self.spectrum_want_live = false;
+                        dirty = true;
+                    }
+                });
+
+                if self.spectrum_time_scope == SpectrumTimeScope::CurrentView {
+                    ui.label(
+                        egui::RichText::new(
+                            "Recomputes automatically as you scroll, once calculated.",
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("Chunks to sample:");
+                        if ui
+                            .add(egui::DragValue::new(&mut self.spectrum_n_chunks).speed(1.0).range(1..=500))
+                            .changed()
+                        {
+                            dirty = true;
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "number of 1 s snippets, evenly spaced across the recording, averaged together",
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+
+                    let total_s = self.meta.n_samples as f64 / self.meta.sample_rate;
+                    if ui
+                        .checkbox(&mut self.spectrum_time_restrict, "Restrict time window")
+                        .changed()
+                    {
+                        if self.spectrum_time_restrict {
+                            // seed with the full recording, so the fields start somewhere
+                            // sensible instead of an arbitrary fixed default
+                            self.spectrum_time_start_s = 0.0;
+                            self.spectrum_time_end_s = total_s;
+                        }
+                        dirty = true;
+                    }
+                    if self.spectrum_time_restrict {
+                        ui.horizontal(|ui| {
+                            ui.label("s:");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.spectrum_time_start_s)
+                                        .speed(1.0)
+                                        .range(0.0..=self.spectrum_time_end_s.clamp(0.0, total_s)),
+                                )
+                                .changed()
+                            {
+                                dirty = true;
+                            }
+                            ui.label("–");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.spectrum_time_end_s)
+                                        .speed(1.0)
+                                        .range(self.spectrum_time_start_s.clamp(0.0, total_s)..=total_s),
+                                )
+                                .changed()
+                            {
+                                dirty = true;
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new("chunks are sourced only from this time window")
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+                    }
+                }
+
+                ui.separator();
+                let forced_raw = self.spectrum_time_scope == SpectrumTimeScope::WholeRecordingChunks;
+                ui.horizontal(|ui| {
+                    ui.label("Source:");
+                    let mut source = if forced_raw { SpectrumSource::Raw } else { self.spectrum_source };
+                    ui.add_enabled_ui(!forced_raw, |ui| {
+                        egui::ComboBox::from_id_salt("spec_source_combo")
+                            .selected_text(match source {
+                                SpectrumSource::Raw => "Raw voltage",
+                                SpectrumSource::Preprocessed => "Preprocessed",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut source, SpectrumSource::Raw, "Raw voltage");
+                                ui.selectable_value(&mut source, SpectrumSource::Preprocessed, "Preprocessed");
+                            });
+                    });
+                    if forced_raw {
+                        ui.label(
+                            egui::RichText::new("(whole-recording mode always uses raw)")
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+                    } else if source != self.spectrum_source {
+                        self.spectrum_source = source;
+                        dirty = true;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Scaling:");
+                    let mut scaling = self.spectrum_scaling;
+                    egui::ComboBox::from_id_salt("spec_scaling_combo")
+                        .selected_text(match scaling {
+                            SpectrumScaling::Linear => "Linear power",
+                            SpectrumScaling::Db => "dB",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut scaling, SpectrumScaling::Linear, "Linear power");
+                            ui.selectable_value(&mut scaling, SpectrumScaling::Db, "dB");
+                        });
+                    if scaling != self.spectrum_scaling {
+                        self.spectrum_scaling = scaling;
+                        dirty = true;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Colour range:");
+                    let mut norm = self.spectrum_normalization;
+                    egui::ComboBox::from_id_salt("spec_norm_combo")
+                        .selected_text(match norm {
+                            SpectrumNormalization::PerChannel => "Per-channel",
+                            SpectrumNormalization::Global => "Global",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut norm, SpectrumNormalization::PerChannel, "Per-channel");
+                            ui.selectable_value(&mut norm, SpectrumNormalization::Global, "Global");
+                        });
+                    if norm != self.spectrum_normalization {
+                        self.spectrum_normalization = norm;
+                        dirty = true;
+                    }
+                });
+
+                if ui
+                    .checkbox(&mut self.spectrum_freq_restrict, "Restrict frequency range")
+                    .changed()
+                {
+                    if self.spectrum_freq_restrict {
+                        // seed with the current result's own band, so the fields start
+                        // somewhere sensible instead of an arbitrary fixed default
+                        let (lo, hi) = self
+                            .spectrum_result
+                            .as_ref()
+                            .map(|c| crate::render::spectrum_freq_bounds(&c.result.freqs, None))
+                            .unwrap_or((1.0, (self.meta.sample_rate / 2.0) as f32));
+                        self.spectrum_freq_min_hz = lo as f64;
+                        self.spectrum_freq_max_hz = hi as f64;
+                    }
+                    dirty = true;
+                }
+                if self.spectrum_freq_restrict {
+                    ui.horizontal(|ui| {
+                        let nyquist = self.meta.sample_rate / 2.0;
+                        ui.label("Hz:");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.spectrum_freq_min_hz)
+                                    .speed(1.0)
+                                    .range(0.1..=self.spectrum_freq_max_hz.clamp(0.1, nyquist)),
+                            )
+                            .changed()
+                        {
+                            dirty = true;
+                        }
+                        ui.label("–");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.spectrum_freq_max_hz)
+                                    .speed(1.0)
+                                    .range(self.spectrum_freq_min_hz.clamp(0.1, nyquist)..=nyquist),
+                            )
+                            .changed()
+                        {
+                            dirty = true;
+                        }
+                    });
+                }
+
+                ui.separator();
+                if self.spectrum_computing {
+                    let done = self.spectrum_progress.load(Ordering::Relaxed);
+                    let total = self.spectrum_run_total;
+                    ui.label("Computing power spectrum across the recording…");
+                    ui.add(
+                        egui::ProgressBar::new(done as f32 / total.max(1) as f32).show_percentage(),
+                    );
+                    ui.label(format!("{done} / {total} chunks"));
+                    if ui.button("Abort").clicked() {
+                        self.spectrum_cancel.store(true, Ordering::Relaxed);
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        if ui.button("Calculate").clicked() {
+                            self.spectrum_show_overlay = true;
+                            match self.spectrum_time_scope {
+                                SpectrumTimeScope::WholeRecordingChunks => self.dispatch_spectrum(ui.ctx()),
+                                // computed (immediately: no scrolling to wait for)
+                                // by the live recompute in the central panel
+                                SpectrumTimeScope::CurrentView => {
+                                    self.spectrum_want_live = true;
+                                    let now = std::time::Instant::now();
+                                    self.spectrum_view_changed_at =
+                                        now.checked_sub(SPECTRUM_SETTLE).unwrap_or(now);
+                                }
+                            }
+                        }
+                    });
+
+                    if let Some(err) = &self.spectrum_error {
+                        ui.colored_label(egui::Color32::from_rgb(0xff, 0x66, 0x66), err);
+                    } else if self.spectrum_result.is_some() {
+                        ui.colored_label(egui::Color32::from_rgb(0x55, 0xdd, 0x77), "Computed");
+                    }
+                }
+            });
+        self.spectrum_open = open;
+        if dirty {
+            self.save_prefs();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Screenshot of the plot area
+    // -----------------------------------------------------------------------
+
+    /// Which overlays are shown now.
+    fn overlay_visibility(&self) -> ShotOverlays {
+        ShotOverlays {
+            ttl: self.ttl.show_overlay,
+            atlas: self.atlas.show_overlay,
+            firing_rate: self.show_firing_rate_overlay,
+            spectrum: self.spectrum_show_overlay,
+            classification: self.show_classification_overlay,
+            selection: true,
+            scale_bar: true,
+        }
+    }
+
+    fn set_overlay_visibility(&mut self, v: ShotOverlays) {
+        self.ttl.show_overlay = v.ttl;
+        self.atlas.show_overlay = v.atlas;
+        if v.firing_rate != self.show_firing_rate_overlay {
+            self.show_firing_rate_overlay = v.firing_rate;
+            // the (skipped while hidden) spike projection has to catch up
+            self.proj_view_first = usize::MAX;
+            self.heatmap_texture = None;
+        }
+        self.spectrum_show_overlay = v.spectrum;
+        self.show_classification_overlay = v.classification;
+    }
+
+    /// The overlays of the current view in the screenshot, or all of them outside a
+    /// screenshot.
+    fn shot_includes(&self) -> ShotOverlays {
+        self.capture.as_ref().map_or(
+            ShotOverlays {
+                ttl: true,
+                atlas: true,
+                firing_rate: true,
+                spectrum: true,
+                classification: true,
+                selection: true,
+                scale_bar: true,
+            },
+            |c| c.include,
+        )
+    }
+
+    /// Default file name: recording, (channel,) start of the view.
+    fn default_screenshot_name(&self) -> String {
+        let stem = self.bin_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let start = self.view_start_s;
+        match self.waveform_channel {
+            Some(ch) => format!("{stem}_{}_{start:.3}s.png", self.meta.channel_id(ch - 1)),
+            None => format!("{stem}_{start:.3}s.png"),
+        }
+    }
+
+    /// The "Screenshot" window: which computed overlays to include, and Save.
+    fn draw_screenshot_window(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.screenshot.pick_rx {
+            match rx.try_recv() {
+                Ok(picked) => {
+                    self.screenshot.pick_rx = None;
+                    if let Some(mut path) = picked {
+                        if path.extension().is_none() {
+                            path.set_extension("png");
+                        }
+                        let include = self.screenshot.include.unwrap_or_else(|| self.overlay_visibility());
+                        let restore = self.overlay_visibility();
+                        self.set_overlay_visibility(include);
+                        self.capture = Some(Capture { path, include, restore, frames: 0 });
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.screenshot.pick_rx = None,
+            }
+        }
+        if !self.screenshot.open {
+            self.screenshot.include = None; // taken from the view again on the next open
+            return;
+        }
+        let waveform = self.waveform_channel.is_some();
+        let spectrum = self.spectrum_result.as_ref().is_some_and(|c| c.matches(&self.preproc_cfg));
+        let mut inc = self.screenshot.include.unwrap_or_else(|| self.overlay_visibility());
+        let mut open = self.screenshot.open;
+        egui::Window::new("Screenshot")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Saves the plot area as a PNG image, without the windows and the legend.");
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Include").strong());
+                let mut any = false;
+                let mut item = |ui: &mut Ui, show: bool, value: &mut bool, label: &str| {
+                    if show {
+                        ui.checkbox(value, label);
+                        any = true;
+                    }
+                };
+                item(ui, self.ttl.has_data(), &mut inc.ttl, "TTL");
+                item(ui, !waveform && self.atlas.has_data(), &mut inc.atlas, "Atlas regions");
+                item(ui, !waveform && !self.projection_sums.is_empty(), &mut inc.firing_rate, "Firing rate");
+                item(ui, !waveform && spectrum, &mut inc.spectrum, "Power spectrum");
+                item(ui, !waveform && self.channel_labels.is_some(), &mut inc.classification, "Channel classification");
+                let selected = self.selected_channel_1.is_some() || self.selected_channel_2.is_some();
+                item(ui, !waveform && selected, &mut inc.selection, "Selected channels");
+                item(ui, !waveform, &mut inc.scale_bar, "Scale bar");
+                if !any {
+                    ui.label(egui::RichText::new("no overlays calculated").color(egui::Color32::GRAY));
+                }
+                ui.add_space(4.0);
+                if ui.add_enabled(self.screenshot.pick_rx.is_none(), egui::Button::new("Save…")).clicked() {
+                    self.screenshot.note = None;
+                    self.screenshot.pick_rx = Some(spawn_png_saver(
+                        self.bin_path.parent().map(|p| p.to_path_buf()),
+                        self.default_screenshot_name(),
+                    ));
+                }
+                if let Some((msg, ok)) = &self.screenshot.note {
+                    let c = if *ok { egui::Color32::from_rgb(0x66, 0xdd, 0x66) } else { egui::Color32::from_rgb(0xff, 0x66, 0x66) };
+                    ui.colored_label(c, msg);
+                }
+            });
+        self.screenshot.include = Some(inc);
+        self.screenshot.open = open;
+    }
+
+    /// Once the requested image has arrived: crop it to the plot area, save it, and
+    /// show the overlays as before.
+    fn poll_capture(&mut self, ctx: &egui::Context) {
+        if self.capture.is_none() {
+            return;
+        }
+        let shot = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, user_data, .. }
+                    if user_data.data.as_ref().is_some_and(|d| d.as_ref().is::<MainScreenshot>()) =>
+                {
+                    Some(image.clone())
+                }
+                _ => None,
+            })
+        });
+        let Some(image) = shot else { return };
+        let c = self.capture.take().unwrap();
+        self.set_overlay_visibility(c.restore);
+        let note = match self.plot_rect {
+            Some(rect) => {
+                let cropped = image.region(&rect, Some(ctx.pixels_per_point()));
+                let [w, h] = cropped.size;
+                match crate::psth::save_png(&c.path, w, h, cropped.as_raw()) {
+                    Ok(()) => (format!("saved to {}", c.path.display()), true),
+                    Err(e) => (format!("screenshot not saved: {e:#}"), false),
+                }
+            }
+            None => ("nothing to save: no plot on screen".to_string(), false),
+        };
+        self.screenshot.note = Some(note);
+    }
+
+    // -----------------------------------------------------------------------
     // Per-channel context menu (plain right-click, no Alt)
     // -----------------------------------------------------------------------
 
@@ -1212,7 +2355,56 @@ impl NPXplorerApp {
         buf_display_rows: &Option<Arc<Vec<DisplayRow>>>,
     ) {
         let rect = ui.available_rect_before_wrap();
+        let resp = ui.interact(rect, ui.id().with("waveform_plot"), egui::Sense::click_and_drag());
+        let hover = resp
+            .hover_pos()
+            .or_else(|| self.zoom_drag_start.and_then(|_| ui.input(|i| i.pointer.interact_pos())))
+            .filter(|_| self.capture.is_none());
         let painter = ui.painter_at(rect);
+
+        // vertical axis: ±half_range around the centre voltage
+        let half_range = self.waveform_y_range_uv.max(WAVEFORM_MIN_RANGE_UV);
+        let center_uv = self.waveform_y_center_uv;
+        let mid_y = rect.center().y;
+        let half_h = rect.height() * 0.5 - 4.0;
+        let y_of = |v: f32| mid_y - ((v - center_uv) / half_range).clamp(-1.0, 1.0) * half_h;
+        let uv_at = |y: f32| center_uv + (mid_y - y) / half_h * half_range;
+        let (view_start_s, view_dur_s) = (self.view_start_s, self.view_dur_s);
+        let t_at = |x: f32| view_start_s + ((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64 * view_dur_s;
+
+        // rectangle zoom: left-drag selects a time and voltage range
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            self.zoom_drag_start = ui.input(|i| i.pointer.press_origin());
+        }
+        let mut drag_sel = None;
+        if let Some(start) = self.zoom_drag_start {
+            let end = ui.input(|i| i.pointer.interact_pos()).unwrap_or(start);
+            let sel = egui::Rect::from_two_pos(start, end).intersect(rect);
+            if resp.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
+                self.zoom_drag_start = None;
+                if sel.width() >= ZOOM_MIN_DRAG_PX && sel.height() >= ZOOM_MIN_DRAG_PX {
+                    let (t0, t1) = (t_at(sel.left()), t_at(sel.right()));
+                    let (v_lo, v_hi) = (uv_at(sel.bottom()), uv_at(sel.top()));
+                    // nested zooms keep the view from before the first one
+                    if self.waveform_zoom.is_none() {
+                        self.waveform_zoom = Some(WaveformZoom {
+                            prev_start_s: self.view_start_s,
+                            prev_dur_s: self.view_dur_s,
+                            prev_y_range_uv: self.waveform_y_range_uv,
+                        });
+                    }
+                    let total_s = self.meta.n_samples as f64 / self.meta.sample_rate;
+                    self.view_dur_s = (t1 - t0).max(0.01);
+                    self.view_start_s = t0.clamp(0.0, (total_s - self.view_dur_s).max(0.0));
+                    self.window_dur_str = format!("{:.3}", self.view_dur_s);
+                    self.waveform_y_center_uv = (v_lo + v_hi) / 2.0;
+                    self.waveform_y_range_uv = ((v_hi - v_lo) / 2.0).max(WAVEFORM_MIN_RANGE_UV);
+                    ui.ctx().request_repaint();
+                }
+            } else {
+                drag_sel = Some(sel);
+            }
+        }
         painter.rect_filled(
             rect,
             0.0,
@@ -1261,7 +2453,7 @@ impl NPXplorerApp {
                     let n = samples.len();
 
                     if n >= 2 {
-                        let [ar, ag, ab] = crate::render::colormap_accent(&self.colormap_choice);
+                        let [ar, ag, ab] = self.colormap_choice.spec().accent;
                         let line_color = egui::Color32::from_rgb(ar, ag, ab);
 
                         // base line width — tune WAVEFORM_LINE_BASE_WIDTH below; it
@@ -1271,41 +2463,69 @@ impl NPXplorerApp {
                         let line_width =
                             WAVEFORM_LINE_BASE_WIDTH * (rect.height() / 400.0).clamp(0.5, 2.5);
 
-                        let half_range = self.waveform_y_range_uv.max(1.0);
-                        let mid_y = rect.center().y;
-                        let half_h = rect.height() * 0.5 - 4.0;
                         let pts: Vec<egui::Pos2> = samples
                             .iter()
                             .enumerate()
                             .map(|(i, &v)| {
                                 let x = rect.left() + (i as f32 / (n - 1) as f32) * rect.width();
-                                let y = mid_y - (v / half_range).clamp(-1.0, 1.0) * half_h;
-                                egui::pos2(x, y)
+                                egui::pos2(x, y_of(v))
                             })
                             .collect();
 
-                        painter.line_segment(
-                            [
-                                egui::pos2(rect.left(), mid_y),
-                                egui::pos2(rect.right(), mid_y),
-                            ],
-                            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)),
-                        );
+                        // 0 µV line, while it is in the shown range
+                        if (center_uv - 0.0).abs() <= half_range {
+                            let y0 = y_of(0.0);
+                            painter.line_segment(
+                                [egui::pos2(rect.left(), y0), egui::pos2(rect.right(), y0)],
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)),
+                            );
+                        }
+                        // hovered sample: marked on the trace, values in the readout
+                        let hovered = hover.map(|p| {
+                            let frac = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                            let i = (frac * (n - 1) as f32).round() as usize;
+                            (i, pts[i])
+                        });
                         painter.add(egui::Shape::line(
                             pts,
                             egui::Stroke::new(line_width, line_color),
                         ));
 
+                        let hint = if self.capture.is_some() { "" } else { " (Alt+scroll to rescale, drag to zoom)" };
+                        let range = if center_uv == 0.0 {
+                            format!("±{half_range:.0} µV")
+                        } else {
+                            format!("{:.1} to {:.1} µV", center_uv - half_range, center_uv + half_range)
+                        };
                         painter.text(
                             egui::pos2(rect.left() + 6.0, rect.top() + 4.0),
                             egui::Align2::LEFT_TOP,
-                            format!(
-                                "{}  ·  ±{half_range:.0} µV (Alt+scroll to rescale)",
-                                self.meta.channel_id(ch - 1)
-                            ),
+                            format!("{}  ·  {range}{hint}", self.meta.channel_id(ch - 1)),
                             egui::FontId::proportional(13.0),
                             egui::Color32::from_gray(200),
                         );
+
+                        let id = self.meta.channel_id(ch - 1);
+                        match (drag_sel, hovered) {
+                            // while dragging a zoom rectangle: the ranges it covers
+                            (Some(sel), _) => draw_readout(
+                                &painter,
+                                rect,
+                                format!(
+                                    "{id}  t = {:.4}–{:.4} s  {:.1} to {:.1} µV",
+                                    t_at(sel.left()),
+                                    t_at(sel.right()),
+                                    uv_at(sel.bottom()),
+                                    uv_at(sel.top())
+                                ),
+                            ),
+                            (None, Some((i, pt))) => {
+                                painter.circle_filled(pt, line_width + 2.0, line_color);
+                                let t = (ov_start + i) as f64 / self.meta.sample_rate;
+                                draw_readout(&painter, rect, format!("{id}  t = {t:.4} s  {:.1} µV", samples[i]));
+                            }
+                            (None, None) => {}
+                        }
                     }
                 } else {
                     Self::draw_centered_message(&painter, rect, "⏳ Loading…");
@@ -1321,17 +2541,39 @@ impl NPXplorerApp {
             }
         }
 
+        if self.capture.is_some() {
+            return;
+        }
+        if let Some(sel) = drag_sel {
+            painter.rect_filled(sel, 0.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 3));
+            painter.rect_stroke(sel, 0.0, egui::Stroke::new(1.0_f32, egui::Color32::WHITE), egui::StrokeKind::Inside);
+        }
+        if self.waveform_zoom.is_some() {
+            draw_zoom_notice(&painter, rect.left_top() + egui::vec2(10.0, 28.0), &self.colormap_choice);
+        }
         let close_rect = egui::Rect::from_min_size(
             rect.right_top() + egui::vec2(-34.0, 6.0),
             egui::vec2(28.0, 24.0),
         );
         if ui
             .put(close_rect, egui::Button::new("✖"))
-            .on_hover_text("Back to heatmap")
+            .on_hover_text("Back to heatmap (Esc)")
             .clicked()
         {
+            self.leave_waveform_zoom();
             self.waveform_channel = None;
         }
+    }
+
+    /// Return to the waveform view from before the zoom; false if not zoomed.
+    fn leave_waveform_zoom(&mut self) -> bool {
+        let Some(z) = self.waveform_zoom.take() else { return false };
+        self.view_start_s = z.prev_start_s;
+        self.view_dur_s = z.prev_dur_s;
+        self.window_dur_str = format!("{:.3}", self.view_dur_s);
+        self.waveform_y_range_uv = z.prev_y_range_uv;
+        self.waveform_y_center_uv = 0.0;
+        true
     }
 
     fn draw_centered_message(painter: &egui::Painter, rect: egui::Rect, msg: &str) {
@@ -1417,10 +2659,7 @@ impl NPXplorerApp {
             Some(p) => p.clone(),
             None => return,
         };
-        let layout = match StimLayout::parse(&self.stim_layout_text).and_then(|l| {
-            crate::psth::save_layout_text(&self.bin_path, &self.stim_layout_text)?;
-            Ok(l)
-        }) {
+        let layout = match StimLayout::parse(&self.stim_layout_text) {
             Ok(l) => l,
             Err(e) => {
                 self.psth.error = Some(e.to_string());
@@ -1428,7 +2667,6 @@ impl NPXplorerApp {
             }
         };
         self.stim_file = Some(stim_path.clone());
-        self.stim_sidecar_dirty = true;
 
         // cancel any in-flight compute and install a fresh cancel flag
         self.psth.cancel.store(true, Ordering::Relaxed);
@@ -1576,9 +2814,9 @@ impl NPXplorerApp {
             ui.label("Window:");
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.window_dur_str)
-                    .desired_width(55.0)
-                    .hint_text("s"),
+                    .desired_width(55.0),
             );
+            ui.label("s");
             if resp.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 if let Ok(v) = self.window_dur_str.trim().parse::<f64>() {
                     let new_dur = v.clamp(0.01, 10.0);
@@ -1616,7 +2854,7 @@ impl NPXplorerApp {
                     .add(
                         egui::Slider::new(&mut self.color_pct, 95.0..=100.0)
                             .step_by(0.1)
-                            .suffix("%"),
+                            .text("%"),
                     )
                     .changed()
                 {
@@ -1628,7 +2866,7 @@ impl NPXplorerApp {
                     .add(
                         egui::Slider::new(&mut self.color_uv, 10.0..=300.0)
                             .integer()
-                            .suffix("µV"),
+                            .text("µV"),
                     )
                     .changed()
                 {
@@ -1640,6 +2878,9 @@ impl NPXplorerApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Preferences").clicked() {
                     self.show_preferences = !self.show_preferences;
+                }
+                if ui.button("Screenshot").on_hover_text("Save the plot area as an image").clicked() {
+                    self.screenshot.open = !self.screenshot.open;
                 }
             });
         });
@@ -1664,6 +2905,21 @@ impl NPXplorerApp {
             }
 
             ui.separator();
+
+            // only once notches exist (Noise Suppression window); switches them all
+            if !self.preproc_cfg.notches.is_empty() {
+                let mut on = self.preproc_cfg.notch_enabled;
+                let list: Vec<String> = self.preproc_cfg.notches.iter().map(|n| format!("{:.1} Hz (width {:.1} Hz)", n.freq_hz, n.bw_hz)).collect();
+                if ui
+                    .checkbox(&mut on, format!("Notch ({})", self.preproc_cfg.notches.len()))
+                    .on_hover_text(format!("Notch filters for this file, edited in the Noise Suppression window:\n{}", list.join("\n")))
+                    .changed()
+                {
+                    self.preproc_cfg.notch_enabled = on;
+                    self.pending_cfg_recompute = true;
+                }
+                ui.separator();
+            }
 
             let hp_enabled = self.preproc_cfg.spatial_filter != SpatialFilter::Destripe;
             let mut hp = self.preproc_cfg.highpass;
@@ -1768,6 +3024,18 @@ impl NPXplorerApp {
                     self.dispatch_classify(ui.ctx());
                 }
                 ui.add(egui::Separator::default().vertical().spacing(1.0));
+                if ui.button("Power Spectrum").clicked() {
+                    self.spectrum_open = !self.spectrum_open;
+                }
+                ui.add(egui::Separator::default().vertical().spacing(1.0));
+                // highlighted while any suppression step is on
+                if ui
+                    .add(egui::Button::new("Noise Suppression").selected(self.noise.active()))
+                    .clicked()
+                {
+                    self.noise_open = !self.noise_open;
+                }
+                ui.add(egui::Separator::default().vertical().spacing(1.0));
                 if ui.button("Remove channels…").clicked() {
                     self.show_remove_channels = !self.show_remove_channels;
                 }
@@ -1870,6 +3138,12 @@ impl NPXplorerApp {
                 );
             }
 
+            if let Some(e) = &self.settings_error {
+                ui.separator();
+                ui.colored_label(egui::Color32::from_rgb(0xff, 0x66, 0x66), format!("⚠ {e}"))
+                    .on_hover_text(e);
+            }
+
             // values the metadata did not provide (gain, geometry, ...)
             for w in &self.meta.warnings {
                 ui.separator();
@@ -1889,7 +3163,7 @@ impl NPXplorerApp {
 
         painter.rect_filled(rect, 2.0, egui::Color32::BLACK);
 
-        let [ar, ag, ab] = crate::render::colormap_accent(&self.colormap_choice);
+        let [ar, ag, ab] = self.colormap_choice.spec().accent;
 
         // preprocessed-buffer extent, drawn first so it sits beneath the view marker
         let buf_extent = {
@@ -1971,7 +3245,7 @@ impl NPXplorerApp {
             crate::render::C_ZERO[1],
             crate::render::C_ZERO[2],
         );
-        let [ar, ag, ab] = crate::render::colormap_accent(&self.colormap_choice);
+        let [ar, ag, ab] = self.colormap_choice.spec().accent;
         let accent = egui::Color32::from_rgb(ar, ag, ab);
         let accent_50 = egui::Color32::from_rgba_unmultiplied(ar, ag, ab, 128);
         let cmap = self.colormap_choice.clone();
@@ -2033,11 +3307,7 @@ impl NPXplorerApp {
                 });
             });
 
-            if let Some(e) =
-                crate::ttl::format_editor(ui, &mut self.stim_layout_text, &self.bin_path)
-            {
-                self.psth.error = Some(e);
-            }
+            crate::ttl::format_editor(ui, &mut self.stim_layout_text);
 
             ui.horizontal(|ui| {
                 // stimulus time-range selector (seconds)
@@ -2120,12 +3390,12 @@ impl NPXplorerApp {
                         .add(
                             egui::Slider::new(&mut self.psth.color_pct, 95.0..=100.0)
                                 .step_by(0.1)
-                                .suffix("%"),
+                                .text("%"),
                         )
                         .changed();
                 } else {
                     changed |= ui
-                        .add(egui::Slider::new(&mut self.psth.color_uv, 1.0..=200.0).suffix("µV"))
+                        .add(egui::Slider::new(&mut self.psth.color_uv, 1.0..=200.0).text("µV"))
                         .changed();
                 }
                 if changed {
@@ -2357,7 +3627,7 @@ impl NPXplorerApp {
                 }
             };
         if let Some(c) = self.psth.sel_ch1 {
-            let [fr, fg, fb] = crate::render::heatmap_fg(&self.colormap_choice);
+            let [fr, fg, fb] = self.colormap_choice.spec().heatmap_fg;
             draw_marker(c, egui::Color32::from_rgba_unmultiplied(fr, fg, fb, 128));
         }
         if let Some(c) = self.psth.sel_ch2 {
@@ -2543,7 +3813,8 @@ impl NPXplorerApp {
     }
 
     /// Esc closes the topmost open tool window (PSTH, Atlas Registration, Preferences,
-    /// ...), one per press; with no window open it returns from the rectangle zoom. It is left alone while a text field, combo box or the
+    /// ...), one per press; with no window open it closes the waveform view, then
+    /// returns from the rectangle zoom. It is left alone while a text field, combo box or the
     /// channel context menu has it, and progress windows (with Abort) are never closed.
     fn close_top_window_on_escape(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.key_pressed(egui::Key::Escape))
@@ -2553,7 +3824,13 @@ impl NPXplorerApp {
         {
             return;
         }
-        // area ids are the window titles (see egui::Window::new)
+        // General rule: every `egui::Window` other than the main one should close on
+        // Escape, topmost first. Area ids are the window titles (see egui::Window::new),
+        // so each one needs an entry here — a window-less "open" flag can't be
+        // discovered automatically. A transient progress popup with no open/close
+        // state of its own (classification/atlas/spectrum "computing") doesn't need
+        // one: it closes itself when the job finishes, and Escape isn't a stand-in
+        // for its "Abort" button.
         let open: Vec<(egui::Id, u8)> = [
             (self.psth.open, "Peri-Stimulus Time Histogram", 0),
             (self.atlas.open, "Atlas Registration", 1),
@@ -2565,13 +3842,25 @@ impl NPXplorerApp {
                 "Channel Classification failed",
                 5,
             ),
+            (self.spectrum_open, "Power Spectrum", 6),
+            (self.spectrum_error.is_some(), "Power Spectrum failed", 7),
+            (self.noise_open, "Noise Suppression", 8),
+            (self.screenshot.open, "Screenshot", 9),
         ]
         .into_iter()
         .filter(|(is_open, ..)| *is_open)
         .map(|(_, title, which)| (egui::Id::new(title), which))
         .collect();
         if open.is_empty() {
-            // no window left to close: Esc leaves the rectangle zoom
+            // no window left to close: Esc leaves the waveform zoom, the waveform view,
+        // then the heatmap zoom
+            if self.waveform_channel.is_some() {
+                if !self.leave_waveform_zoom() {
+                    self.waveform_channel = None;
+                }
+                self.heatmap_texture = None;
+                return;
+            }
             if let Some(z) = self.zoom.take() {
                 self.view_start_s = z.prev_start_s;
                 self.view_dur_s = z.prev_dur_s;
@@ -2589,52 +3878,55 @@ impl NPXplorerApp {
             2 => self.show_remove_channels = false,
             3 => self.show_preferences = false,
             4 => self.ttl.open = false,
-            _ => self.classify_error = None,
+            5 => self.classify_error = None,
+            6 => self.spectrum_open = false,
+            7 => self.spectrum_error = None,
+            8 => self.noise_open = false,
+            _ => self.screenshot.open = false,
         }
     }
 
     pub fn update(&mut self, ctx: &egui::Context) {
+        self.poll_capture(ctx);
+        // taking a screenshot: no windows, menus or hover effects over the plot
+        let capturing = self.capture.is_some();
+        self.atlas.no_hover = capturing;
         self.close_top_window_on_escape(ctx);
         self.poll_and_maybe_dispatch_psth(ctx);
-        self.draw_psth_window(ctx);
         self.poll_remove_channels_picker(ctx);
-        self.draw_remove_channels_window(ctx);
         self.poll_classify(ctx);
-        self.draw_classify_progress_window(ctx);
-        self.draw_channel_context_menu(ctx);
+        self.poll_spectrum(ctx);
+        self.notch_panel.poll(ctx);
         self.atlas.poll(ctx);
-        self.atlas
-            .draw_window(ctx, &self.meta, &self.bin_path, &self.colormap_choice);
-        self.atlas.draw_progress_window(ctx);
-        if self.ttl.draw_window(
-            ctx,
-            &mut self.stim_layout_text,
-            &self.bin_path,
-            &mut self.stim_file,
-        ) {
-            self.stim_sidecar_dirty = true;
+        if !capturing {
+            self.draw_psth_window(ctx);
+            self.draw_remove_channels_window(ctx);
+            self.draw_classify_progress_window(ctx);
+            self.draw_spectrum_error_window(ctx);
+            self.draw_spectrum_window(ctx);
+            self.draw_noise_window(ctx);
+            self.draw_channel_context_menu(ctx);
+            self.atlas
+                .draw_window(ctx, &self.meta, &self.bin_path, &self.colormap_choice);
+            self.atlas.draw_progress_window(ctx);
+            self.ttl.draw_window(
+                ctx,
+                &mut self.stim_layout_text,
+                &self.bin_path,
+                &mut self.stim_file,
+                &mut self.view_start_s,
+                self.view_dur_s,
+                self.meta.n_samples as f64 / self.meta.sample_rate,
+            );
+            self.draw_screenshot_window(ctx);
         }
-        // written once the mouse is released, so slider drags don't write every frame
-        if self.stim_sidecar_dirty && !ctx.input(|i| i.pointer.any_down()) {
-            self.stim_sidecar_dirty = false;
-            let sc = crate::ttl::StimSidecar {
-                stim_file: self.stim_file.clone(),
-                ttl: self.ttl.settings(),
-                psth: crate::ttl::PsthSettings {
-                    start_ms: Some(self.psth.start_ms),
-                    end_ms: Some(self.psth.end_ms),
-                    stim_t_start: Some(self.psth.stim_t_start),
-                    stim_t_end: Some(self.psth.stim_t_end),
-                },
-            };
-            let _ = crate::ttl::save_sidecar(&self.bin_path, &sc);
-        }
+        self.autosave_settings(ctx);
         if self.atlas.take_prefs_dirty() {
             self.save_prefs();
         }
 
         let mut show_prefs = self.show_preferences;
-        if show_prefs {
+        if show_prefs && !capturing {
             egui::Window::new("Preferences")
                 .anchor(egui::Align2::RIGHT_TOP, [-10.0, 40.0])
                 .collapsible(false)
@@ -2651,25 +3943,11 @@ impl NPXplorerApp {
                         ui.label("Colormap:");
                         let mut cm = self.colormap_choice.clone();
                         egui::ComboBox::from_id_salt("cm_combo")
-                            .selected_text(match cm {
-                                ColorMapChoice::SunFire => "SunFire",
-                                ColorMapChoice::YellowMagenta => "Yellow-Magenta",
-                                ColorMapChoice::RedBlue => "Red-Blue",
-                                ColorMapChoice::OrangeBlue => "Orange-Blue",
-                                ColorMapChoice::IceFire => "Ice-Fire",
-                                ColorMapChoice::Vanimo => "Vanimo",
-                                ColorMapChoice::GreyScale => "Greyscale",
-                                ColorMapChoice::CoolWarm => "Cool-Warm",
-                            })
+                            .selected_text(cm.spec().name)
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut cm, ColorMapChoice::SunFire, "SunFire");
-                                ui.selectable_value(&mut cm, ColorMapChoice::YellowMagenta, "Yellow-Magenta");
-                                ui.selectable_value(&mut cm, ColorMapChoice::RedBlue, "Red-Blue");
-                                ui.selectable_value(&mut cm, ColorMapChoice::OrangeBlue, "Orange-Blue");
-                                ui.selectable_value(&mut cm, ColorMapChoice::IceFire, "Ice-Fire");
-                                ui.selectable_value(&mut cm, ColorMapChoice::Vanimo, "Vanimo");
-                                ui.selectable_value(&mut cm, ColorMapChoice::GreyScale, "Greyscale");
-                                ui.selectable_value(&mut cm, ColorMapChoice::CoolWarm, "Cool-Warm");
+                                for c in ColorMapChoice::ALL {
+                                    ui.selectable_value(&mut cm, c.clone(), c.spec().name);
+                                }
                             });
                         if cm != self.colormap_choice {
                             self.colormap_choice = cm;
@@ -2743,7 +4021,7 @@ impl NPXplorerApp {
 
                     ui.horizontal(|ui| {
                         ui.label("Spike Threshold (µV):");
-                        if ui.add(egui::DragValue::new(&mut self.spike_threshold).speed(1.0).suffix(" µV")).changed() {
+                        if ui.add(egui::DragValue::new(&mut self.spike_threshold).speed(1.0)).changed() {
                             self.heatmap_texture = None;
                             self.save_prefs();
                         }
@@ -2823,7 +4101,7 @@ impl NPXplorerApp {
                         ui.label("Initial buffer size (s):");
                         if ui.add(
                             egui::DragValue::new(&mut self.initial_buffer_s)
-                                .speed(0.5).range(1.0..=max_feasible).suffix(" s")
+                                .speed(0.5).range(1.0..=max_feasible)
                         ).changed() {
                             let fs = self.meta.sample_rate;
                             self.worker_half_window = compute_half_window(self.initial_buffer_s, fs);
@@ -2843,7 +4121,7 @@ impl NPXplorerApp {
                         ui.label("Extension margin (s):");
                         if ui.add(
                             egui::DragValue::new(&mut self.extension_margin_s)
-                                .speed(0.1).range(0.5..=max_margin).suffix(" s")
+                                .speed(0.1).range(0.5..=max_margin)
                         ).changed() {
                             self.save_prefs();
                         }
@@ -2859,7 +4137,7 @@ impl NPXplorerApp {
                         ui.label("Memory pressure threshold (%):");
                         if ui.add(
                             egui::DragValue::new(&mut self.mem_pressure_pct)
-                                .speed(1.0).range(1.0..=90.0).suffix(" %")
+                                .speed(1.0).range(1.0..=90.0)
                         ).changed() {
                             self.save_prefs();
                         }
@@ -2868,7 +4146,7 @@ impl NPXplorerApp {
                         ui.label("Memory reserve (MB):");
                         if ui.add(
                             egui::DragValue::new(&mut self.mem_reserve_mb)
-                                .speed(50.0).range(100.0..=20000.0).suffix(" MB")
+                                .speed(50.0).range(100.0..=20000.0)
                         ).changed() {
                             self.save_prefs();
                         }
@@ -2908,8 +4186,9 @@ impl NPXplorerApp {
             // inverted relative to a plain sum of tick signs: scrolling up now
             // decreases the value (mirrors the "zoom out" feel of scroll-up elsewhere)
             if self.waveform_channel.is_some() {
-                self.waveform_y_range_uv =
-                    (self.waveform_y_range_uv - ticks * 5.0).clamp(10.0, 2000.0);
+                // proportional steps, so the scale stays usable when zoomed to a few µV
+                self.waveform_y_range_uv = (self.waveform_y_range_uv * 1.05f32.powf(-ticks))
+                    .clamp(WAVEFORM_MIN_RANGE_UV, 2000.0);
             } else if self.color_mode == ColorMode::Percentile {
                 self.color_pct = (self.color_pct - ticks * 0.1).clamp(95.0, 100.0);
                 self.color_pct_str = format!("{:.2}", self.color_pct);
@@ -2967,8 +4246,16 @@ impl NPXplorerApp {
         CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::from_rgb(crate::render::C_ZERO[0], crate::render::C_ZERO[1], crate::render::C_ZERO[2])))
             .show(ctx, |ui| {
+                self.plot_rect = Some(ui.available_rect_before_wrap());
+                let shot = self.shot_includes();
                 let avail = ui.available_size();
-                let pw = avail.x as usize;
+                // power spectrum panel: a fixed 20% strip to the right of the main
+                // heatmap, once a result exists and the user hasn't hidden it
+                let spec_visible = self.spectrum_show_overlay
+                    && self.waveform_channel.is_none()
+                    && self.spectrum_result.as_ref().is_some_and(|c| c.matches(&self.preproc_cfg));
+                let heat_w = if spec_visible { (avail.x * 0.8).max(1.0) } else { avail.x };
+                let pw = heat_w as usize;
                 let ph = avail.y as usize;
                 if pw < 2 || ph < 2 { return; }
 
@@ -3016,6 +4303,13 @@ impl NPXplorerApp {
                     }
                 };
 
+                // what the heatmap and waveform view draw (noise-filtered or not)
+                let (src_data, src_first, src_n) = if matches_cfg {
+                    self.display_source(&buf_data, &buf_display_rows, buf_first, buf_n_samp, view_first, view_n)
+                } else {
+                    (buf_data.clone(), buf_first, buf_n_samp)
+                };
+
                 // request repaint while worker is busy (moved here from top to use snapshot)
                 if w_status == WorkerStatus::Computing || w_has_request {
                     ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -3056,7 +4350,8 @@ impl NPXplorerApp {
                     let need_rebuild = self.heatmap_texture.is_none()
                         || pos_changed || view_n != self.last_rendered_n
                         || size_changed || buf_changed
-                        || cfg_changed || rows_now != self.last_rendered_rows;
+                        || cfg_changed || rows_now != self.last_rendered_rows
+                        || self.last_rendered_noise.as_ref() != Some(&self.noise);
 
                     if need_rebuild && view_n > 0 {
                         if let (Some(data_arc), Some(display_rows)) = (&buf_data, &buf_display_rows) {
@@ -3164,9 +4459,9 @@ impl NPXplorerApp {
                             };
                             build_heatmap_into(
                                 &mut self.pixel_buf,
-                                data_arc,
+                                src_data.as_deref().map_or(&data_arc[..], |d| &d[..]),
                                 shown_rows,
-                                stride, buf_first, buf_n_samp, view_first, view_n,
+                                src_n, src_first, src_n, view_first, view_n,
                                 pw, ph, scale, self.peak_pooling,
                                 &self.colormap_choice,
                             );
@@ -3183,6 +4478,7 @@ impl NPXplorerApp {
                             self.last_rendered_size = Some([pw, ph]);
                             self.last_rendered_buf = Some((buf_first, buf_n_samp));
                             self.last_rendered_rows = Some((first_row, last_row));
+                            self.last_rendered_noise = Some(self.noise.clone());
                         }
                     }
                 }
@@ -3264,8 +4560,67 @@ impl NPXplorerApp {
 
                 self.pending_cfg_recompute = false;
 
+                // power spectrum, current-view scope: recomputed once "Calculate" has been
+                // pressed, whenever the result no longer matches the view/settings — but
+                // only after the view has stopped moving for SPECTRUM_SETTLE, so scrolling
+                // isn't slowed down by an FFT of every channel on each frame. Skipped while
+                // the panel is hidden or the waveform view replaces the heatmap.
+                if (view_first, view_n) != self.spectrum_view_seen {
+                    self.spectrum_view_seen = (view_first, view_n);
+                    self.spectrum_view_changed_at = std::time::Instant::now();
+                }
+                if self.spectrum_want_live
+                    && self.spectrum_show_overlay
+                    && self.waveform_channel.is_none()
+                    && self.spectrum_time_scope == crate::spectrum::SpectrumTimeScope::CurrentView
+                {
+                    let stale = self.spectrum_result.as_ref().is_none_or(|c| {
+                        c.view != Some((view_first, view_n))
+                            || c.source != self.spectrum_source
+                            || !c.matches(&self.preproc_cfg)
+                    });
+                    let still_for = self.spectrum_view_changed_at.elapsed();
+                    if stale && still_for < SPECTRUM_SETTLE {
+                        ctx.request_repaint_after(SPECTRUM_SETTLE - still_for);
+                    } else if stale {
+                        let new_result = match self.spectrum_source {
+                            crate::spectrum::SpectrumSource::Raw => {
+                                let full_rows = self.meta.build_display_rows(
+                                    self.preproc_cfg.avg_depths,
+                                    &self.preproc_cfg.removed_channels,
+                                    self.preproc_cfg.channel_order,
+                                    self.preproc_cfg.shank_order,
+                                );
+                                crate::spectrum::compute_psd_raw_current_view(
+                                    &self.raw, &self.meta, &full_rows, view_first, view_n,
+                                )
+                            }
+                            // the buffer's rows are indexed by this same config's layout
+                            crate::spectrum::SpectrumSource::Preprocessed => {
+                                match (&buf_data, &buf_display_rows) {
+                                    (Some(data), Some(rows)) if matches_cfg => {
+                                        crate::spectrum::compute_psd_preprocessed_current_view(
+                                            data, rows, buf_n_samp, buf_first, buf_n_samp, view_first,
+                                            view_n, fs,
+                                        )
+                                    }
+                                    _ => None,
+                                }
+                            }
+                        };
+                        if let Some(result) = new_result {
+                            self.spectrum_result = Some(Arc::new(crate::spectrum::ComputedSpectrum {
+                                result,
+                                cfg: self.preproc_cfg.clone(),
+                                source: self.spectrum_source,
+                                view: Some((view_first, view_n)),
+                            }));
+                        }
+                    }
+                }
+
                 if let Some(ch) = self.waveform_channel {
-                    self.draw_waveform_view(ui, ch, matches_cfg, view_first, view_n, buf_first, buf_n_samp, &buf_data, &buf_display_rows);
+                    self.draw_waveform_view(ui, ch, matches_cfg, view_first, view_n, src_first, src_n, &src_data, &buf_display_rows);
                 } else {
 
                 // loading indicator
@@ -3282,10 +4637,122 @@ impl NPXplorerApp {
                 // draw texture
                 if let Some(tex) = &self.heatmap_texture {
                     let img_widget = egui::Image::new(tex)
-                        .fit_to_exact_size(avail)
+                        .fit_to_exact_size(egui::vec2(heat_w, avail.y))
                         .sense(egui::Sense::click_and_drag());
                     let resp = ui.add(img_widget);
                     self.ttl.draw_overlay(&ui.painter_at(resp.rect), resp.rect, self.view_start_s, self.view_dur_s, &self.colormap_choice);
+
+                    // power spectrum panel: opaque heatmap in the strip to the right of
+                    // the main view, one row per channel, aligned with the main heatmap's
+                    // rows (including the current zoom)
+                    if spec_visible {
+                        if let Some(computed) = self.spectrum_result.clone() {
+                            let full_rows: Arc<Vec<DisplayRow>> = match &buf_display_rows {
+                                Some(rows) if matches_cfg => Arc::clone(rows),
+                                _ => Arc::new(self.meta.build_display_rows(
+                                    self.preproc_cfg.avg_depths,
+                                    &self.preproc_cfg.removed_channels,
+                                    self.preproc_cfg.channel_order,
+                                    self.preproc_cfg.shank_order,
+                                )),
+                            };
+                            let (sfirst_row, slast_row) = view_rows(&full_rows, self.zoom.as_ref());
+                            let shown_rows = if full_rows.is_empty() {
+                                &full_rows[..]
+                            } else {
+                                &full_rows[sfirst_row..=slast_row]
+                            };
+                            let row_offset = full_rows[..sfirst_row.min(full_rows.len())]
+                                .iter()
+                                .filter(|r| matches!(r, DisplayRow::Data { .. }))
+                                .count();
+                            let spec_w = (avail.x - resp.rect.width()).max(1.0) as usize;
+                            let spec_h = ph;
+                            let freq_range = self.spectrum_freq_range();
+                            let key = SpectrumTexKey {
+                                result: Arc::clone(&computed),
+                                size: [spec_w, spec_h],
+                                rows: (sfirst_row, slast_row),
+                                scaling: self.spectrum_scaling,
+                                normalization: self.spectrum_normalization,
+                                freq_range,
+                            };
+                            if self.spectrum_tex_key.as_ref() != Some(&key) || self.spectrum_texture.is_none() {
+                                crate::render::build_spectrum_heatmap_into(
+                                    &mut self.spectrum_pixel_buf,
+                                    &computed.result.power,
+                                    &computed.result.freqs,
+                                    shown_rows,
+                                    row_offset,
+                                    spec_w,
+                                    spec_h,
+                                    self.spectrum_scaling,
+                                    self.spectrum_normalization,
+                                    freq_range,
+                                );
+                                let simg = egui::ColorImage::from_rgba_unmultiplied(
+                                    [spec_w, spec_h],
+                                    &self.spectrum_pixel_buf,
+                                );
+                                match &mut self.spectrum_texture {
+                                    Some(stex) if stex.size() == [spec_w, spec_h] => {
+                                        stex.set(simg, TextureOptions::NEAREST)
+                                    }
+                                    _ => {
+                                        self.spectrum_texture =
+                                            Some(ctx.load_texture("spectrum", simg, TextureOptions::NEAREST))
+                                    }
+                                }
+                                self.spectrum_tex_key = Some(key);
+                            }
+                            if let Some(stex) = &self.spectrum_texture {
+                                let spec_rect = egui::Rect::from_min_max(
+                                    egui::pos2(resp.rect.right(), resp.rect.top()),
+                                    egui::pos2(resp.rect.right() + spec_w as f32, resp.rect.bottom()),
+                                );
+                                ui.painter().image(
+                                    stex.id(),
+                                    spec_rect,
+                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                    egui::Color32::WHITE,
+                                );
+
+                                // frequency axis: ticks + labels, black, at the bottom
+                                let (f_lo, f_hi) = crate::render::spectrum_freq_bounds(&computed.result.freqs, freq_range);
+                                let log_lo = f_lo.ln();
+                                let log_span = (f_hi.ln() - log_lo).max(1e-6);
+                                let painter = ui.painter();
+                                let font = egui::FontId::proportional(9.0);
+                                let y_bottom = spec_rect.bottom();
+                                for f in crate::render::spectrum_ticks(f_lo, f_hi, freq_range.is_some()) {
+                                    let frac = ((f.ln() - log_lo) / log_span).clamp(0.0, 1.0);
+                                    let x = (spec_rect.left() + frac * spec_rect.width())
+                                        .clamp(spec_rect.left() + 0.5, spec_rect.right() - 0.5);
+                                    painter.line_segment(
+                                        [egui::pos2(x, y_bottom - 5.5), egui::pos2(x, y_bottom - 1.0)],
+                                        egui::Stroke::new(1.0_f32, egui::Color32::BLACK),
+                                    );
+                                    // centred on the tick, but kept inside the panel so labels
+                                    // at the band edges aren't cut off (only the label moves)
+                                    let galley = painter.layout_no_wrap(
+                                        crate::render::spectrum_tick_label(f),
+                                        font.clone(),
+                                        egui::Color32::BLACK,
+                                    );
+                                    let size = galley.size();
+                                    let lx = (x - size.x / 2.0)
+                                        .min(spec_rect.right() - 2.0 - size.x)
+                                        .max(spec_rect.left() + 2.0);
+                                    painter.galley(egui::pos2(lx, y_bottom - 6.5 - size.y), galley, egui::Color32::BLACK);
+                                }
+                            }
+                        }
+                    }
+
+                    // right edge the channel-selection lines and atlas region borders
+                    // visually extend to: the spectrum panel's right edge when it's
+                    // showing, otherwise the same as resp.rect.right()
+                    let full_right = resp.rect.left() + avail.x;
 
                     // click detection — channel selection now requires Alt (plain
                     // left-click is a no-op; plain right-click opens the context menu)
@@ -3384,7 +4851,7 @@ impl NPXplorerApp {
                                         let frac_y = (last_row - r) as f32 / n_rows as f32 + (0.5 / n_rows as f32);
                                         let y = resp.rect.top() + frac_y * resp.rect.height();
                                         ui.painter().line_segment(
-                                            [egui::pos2(resp.rect.left(), y), egui::pos2(resp.rect.right(), y)],
+                                            [egui::pos2(resp.rect.left(), y), egui::pos2(full_right, y)],
                                             egui::Stroke::new(2.0_f32, color)
                                         );
                                         break;
@@ -3393,14 +4860,16 @@ impl NPXplorerApp {
                             }
                         };
 
-                        let [fr, fg, fb] = crate::render::heatmap_fg(&self.colormap_choice);
-                        if let Some(ch1) = self.selected_channel_1 {
-                            draw_line(ch1, egui::Color32::from_rgba_unmultiplied(fr, fg, fb, 128));
+                        let [fr, fg, fb] = self.colormap_choice.spec().heatmap_fg;
+                        if shot.selection {
+                            if let Some(ch1) = self.selected_channel_1 {
+                                draw_line(ch1, egui::Color32::from_rgba_unmultiplied(fr, fg, fb, 128));
+                            }
+                            if let Some(ch2) = self.selected_channel_2 {
+                                draw_line(ch2, egui::Color32::from_rgba_unmultiplied(255, 182, 23, 128));
+                            }
                         }
-                        if let Some(ch2) = self.selected_channel_2 {
-                            draw_line(ch2, egui::Color32::from_rgba_unmultiplied(255, 182, 23, 128));
-                        }
-                        if let Some(ctx_ch) = self.context_menu_channel {
+                        if let Some(ctx_ch) = self.context_menu_channel.filter(|_| self.capture.is_none()) {
                             draw_line(ctx_ch, egui::Color32::from_rgba_unmultiplied(fr, fg, fb, 100));
                         }
 
@@ -3438,18 +4907,9 @@ impl NPXplorerApp {
                             let spike_scale_factor = threshold_scale * (0.5 / self.view_dur_s) as f32 * self.spike_overlay_scale;
 
                             // per-map alpha is tuned for this overlay's many-triangle accumulation,
-                            // so it stays separate from the shared RGB in render::colormap_accent
-                            let overlay_alpha = match self.colormap_choice {
-                                ColorMapChoice::SunFire => 5,
-                                ColorMapChoice::YellowMagenta => 5,
-                                ColorMapChoice::RedBlue => 8,
-                                ColorMapChoice::OrangeBlue => 5,
-                                ColorMapChoice::IceFire => 8,
-                                ColorMapChoice::Vanimo => 5,
-                                ColorMapChoice::GreyScale => 2,
-                                ColorMapChoice::CoolWarm => 10,
-                            };
-                            let [pr, pg, pb] = crate::render::colormap_accent(&self.colormap_choice);
+                            // so it is a separate field from the shared accent RGB in colormap.rs
+                            let overlay_alpha = self.colormap_choice.spec().overlay_alpha;
+                            let [pr, pg, pb] = self.colormap_choice.spec().accent;
                             let color = egui::Color32::from_rgba_unmultiplied(pr, pg, pb, overlay_alpha);
 
                             let min_x = resp.rect.left();
@@ -3532,6 +4992,7 @@ impl NPXplorerApp {
                             ui,
                             &self.meta,
                             resp.rect,
+                            full_right,
                             display_rows,
                             first_row,
                             last_row,
@@ -3539,12 +5000,18 @@ impl NPXplorerApp {
                             &self.colormap_choice,
                         );
 
-                        // legend box (TTL + classification with its overlay toggle), pinned
-                        // to the heatmap's bottom-right corner just above the scale bar —
-                        // shown while the TTL overlay is on or once a classification has
-                        // been run this session. Laid out inside the heatmap panel itself
-                        // (not a floating Area), so every window the user opens stays on top of it.
-                        if self.channel_labels.is_some() || self.ttl.overlay_visible() {
+                        // legend box: one Show/Hide row per overlay that has been computed
+                        // this session (TTL, Atlas, firing rate, power spectrum, channel
+                        // classification), pinned to the heatmap's bottom-right corner just
+                        // above the scale bar. Laid out inside the heatmap panel itself (not
+                        // a floating Area), so every window the user opens stays on top of it.
+                        if self.capture.is_none()
+                            && (self.channel_labels.is_some()
+                                || self.ttl.has_data()
+                                || self.atlas.has_data()
+                                || !self.projection_sums.is_empty()
+                                || self.spectrum_result.is_some())
+                        {
                             // anchored by its bottom-right corner; the scale bar's top
                             // edge sits 30 px above the heatmap bottom. The box's size is
                             // only known after layout, so last frame's size places it and
@@ -3582,20 +5049,97 @@ impl NPXplorerApp {
                                                 ui.label(text);
                                             });
                                         };
-                                        if self.ttl.overlay_visible() {
-                                            let [r, g, b] = crate::render::colormap_accent(&self.colormap_choice);
-                                            legend_row(ui, egui::Color32::from_rgb(r, g, b), "TTL");
+                                        let mut any_above = false;
+
+                                        if self.ttl.has_data() {
+                                            if self.ttl.show_overlay {
+                                                let [r, g, b] = self.colormap_choice.spec().accent;
+                                                legend_row(ui, egui::Color32::from_rgb(r, g, b), "TTL");
+                                            }
+                                            let label = if self.ttl.show_overlay { "Hide TTL" } else { "Show TTL" };
+                                            ui.toggle_value(&mut self.ttl.show_overlay, label);
+                                            any_above = true;
                                         }
+
+                                        if self.atlas.has_data() {
+                                            if any_above {
+                                                ui.add_space(4.0);
+                                            }
+                                            if self.atlas.show_overlay {
+                                                let [r, g, b] = self.colormap_choice.spec().atlas;
+                                                legend_row(ui, egui::Color32::from_rgb(r, g, b), "Atlas");
+                                            }
+                                            let label = if self.atlas.show_overlay { "Hide Atlas" } else { "Show Atlas" };
+                                            ui.toggle_value(&mut self.atlas.show_overlay, label);
+                                            any_above = true;
+                                        }
+
+                                        if !self.projection_sums.is_empty() {
+                                            if any_above {
+                                                ui.add_space(4.0);
+                                            }
+                                            if self.show_firing_rate_overlay {
+                                                let [r, g, b] = self.colormap_choice.spec().accent;
+                                                legend_row(ui, egui::Color32::from_rgb(r, g, b), "Firing rate");
+                                            }
+                                            let label = if self.show_firing_rate_overlay {
+                                                "Hide firing rate"
+                                            } else {
+                                                "Show firing rate"
+                                            };
+                                            if ui.toggle_value(&mut self.show_firing_rate_overlay, label).changed() {
+                                                self.proj_view_first = usize::MAX;
+                                                self.heatmap_texture = None;
+                                            }
+                                            any_above = true;
+                                        }
+
+                                        if self.spectrum_result.is_some() {
+                                            if any_above {
+                                                ui.add_space(4.0);
+                                            }
+                                            if self.spectrum_show_overlay {
+                                                // swatch: the spectrum palette, low to high power
+                                                ui.horizontal(|ui| {
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        egui::vec2(12.0, 12.0),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    for i in 0..12 {
+                                                        let [r, g, b] = crate::render::spectrum_color(i as f32 / 11.0);
+                                                        let x = rect.left() + i as f32;
+                                                        ui.painter().rect_filled(
+                                                            egui::Rect::from_x_y_ranges(x..=x + 1.0, rect.y_range()),
+                                                            0.0,
+                                                            egui::Color32::from_rgb(r, g, b),
+                                                        );
+                                                    }
+                                                    ui.label("Power spectrum");
+                                                });
+                                            }
+                                            let label =
+                                                if self.spectrum_show_overlay { "Hide Spectra" } else { "Show Spectra" };
+                                            ui.toggle_value(&mut self.spectrum_show_overlay, label);
+                                            any_above = true;
+                                        }
+
                                         if self.channel_labels.is_some() {
+                                            if any_above {
+                                                ui.add_space(4.0);
+                                            }
                                             if self.show_classification_overlay {
                                                 legend_row(ui, classification_color(1, 255), "Dead");
                                                 legend_row(ui, classification_color(2, 255), "Noisy");
                                                 legend_row(ui, classification_color(3, 255), "Out of brain");
                                             }
-                                            if self.show_classification_overlay || self.ttl.overlay_visible() {
+                                            if self.show_classification_overlay || any_above {
                                                 ui.add_space(4.0);
                                             }
-                                            let label = if self.show_classification_overlay { "Hide" } else { "Show" };
+                                            let label = if self.show_classification_overlay {
+                                                "Hide Chan Classification"
+                                            } else {
+                                                "Show Chan Classification"
+                                            };
                                             ui.toggle_value(&mut self.show_classification_overlay, label);
                                         }
                                     });
@@ -3617,7 +5161,7 @@ impl NPXplorerApp {
                         } else {
                             None
                         }
-                    });
+                    }).filter(|_| self.capture.is_none());
 
                     if let Some(pos) = hover_pos {
                         if let Some(display_rows) = buf_display_rows.as_ref().filter(|r| !r.is_empty()) {
@@ -3646,12 +5190,13 @@ impl NPXplorerApp {
 
                             // voltage readout from snapshot data
                             let voltage_uv: Option<f32> = if let Some(DisplayRow::Data { data_idx, .. }) = display_rows.get(disp_idx) {
-                                if let Some(data) = &buf_data {
+                                // same samples as drawn (noise-filtered when that is on)
+                                if let Some(data) = &src_data {
                                     let t_sample = (t * self.meta.sample_rate) as usize;
-                                    if t_sample >= buf_first {
-                                        let off = t_sample - buf_first;
-                                        let idx = data_idx * buf_n_samp + off;
-                                        if off < buf_n_samp && idx < data.len() {
+                                    if t_sample >= src_first {
+                                        let off = t_sample - src_first;
+                                        let idx = data_idx * src_n + off;
+                                        if off < src_n && idx < data.len() {
                                             Some(data[idx])
                                         } else { None }
                                     } else { None }
@@ -3673,63 +5218,158 @@ impl NPXplorerApp {
                                 label = format!("{chans}t = {:.4}–{:.4} s", t_at(sel.left()), t_at(sel.right()));
                             }
 
-                            let font_id = egui::FontId::proportional(12.0);
-                            let galley = ui.painter().layout_no_wrap(label, font_id.clone(), egui::Color32::from_rgba_unmultiplied(220, 220, 220, 200));
-                            let text_pos = resp.rect.left_bottom() + Vec2::new(6.0, -6.0 - galley.rect.height());
-
-                            let bg_rect = galley.rect.translate(text_pos.to_vec2()).expand(4.0);
-                            ui.painter().rect_filled(bg_rect, 2.0, egui::Color32::from_rgba_unmultiplied(crate::render::C_ZERO[0], crate::render::C_ZERO[1], crate::render::C_ZERO[2], 200));
-
-                            ui.painter().galley(text_pos, galley, egui::Color32::from_rgba_unmultiplied(220, 220, 220, 200));
+                            draw_readout(ui.painter(), resp.rect, label);
                         }
                     }
 
                     // scale bar overlay (10% of view_dur_s) bottom right
-                    let scale_bar_frac = 0.1;
-                    let scale_bar_w = avail.x * scale_bar_frac;
-                    let scale_bar_h = 4.0;
-                    let bar_min = resp.rect.right_bottom() - egui::vec2(scale_bar_w + 20.0, 30.0);
-                    let bar_rect = egui::Rect::from_min_size(bar_min, egui::vec2(scale_bar_w, scale_bar_h));
-                    let [fr, fg, fb] = crate::render::heatmap_fg(&self.colormap_choice);
+                    let [fr, fg, fb] = self.colormap_choice.spec().heatmap_fg;
                     let fg_color = egui::Color32::from_rgb(fr, fg, fb);
-                    ui.painter().rect_filled(bar_rect, 0.0, fg_color);
+                    if shot.scale_bar {
+                        let scale_bar_frac = 0.1;
+                        let scale_bar_w = resp.rect.width() * scale_bar_frac;
+                        let scale_bar_h = 4.0;
+                        let bar_min = resp.rect.right_bottom() - egui::vec2(scale_bar_w + 20.0, 30.0);
+                        let bar_rect = egui::Rect::from_min_size(bar_min, egui::vec2(scale_bar_w, scale_bar_h));
+                        ui.painter().rect_filled(bar_rect, 0.0, fg_color);
 
-                    let dur_ms = self.view_dur_s * (scale_bar_frac as f64) * 1000.0;
-                    ui.painter().text(
-                        bar_rect.right_bottom() + egui::vec2(0.0, 5.0),
-                        egui::Align2::RIGHT_TOP,
-                        format!("{:.0} ms", dur_ms),
-                        egui::FontId::proportional(14.0),
-                        fg_color,
-                    );
-
-                    // zoom notice, top left: solid text on a semi-transparent box, both
-                    // switching with the colormap (dark box / white text, or the reverse
-                    // on Cool-Warm's light background)
-                    if self.zoom.is_some() {
-                        let [br, bg, bb] = crate::render::atlas_label_bg(&self.colormap_choice);
-                        let galley = ui.painter().layout_no_wrap(
-                            "Esc to close zoom".to_string(),
-                            egui::FontId::proportional(13.0),
+                        let dur_ms = self.view_dur_s * (scale_bar_frac as f64) * 1000.0;
+                        ui.painter().text(
+                            bar_rect.right_bottom() + egui::vec2(0.0, 5.0),
+                            egui::Align2::RIGHT_TOP,
+                            format!("{:.0} ms", dur_ms),
+                            egui::FontId::proportional(14.0),
                             fg_color,
                         );
-                        let text_pos = resp.rect.left_top() + egui::vec2(10.0, 10.0);
-                        ui.painter().rect_filled(
-                            galley.rect.translate(text_pos.to_vec2()).expand2(egui::vec2(6.0, 4.0)),
-                            4.0,
-                            egui::Color32::from_rgba_unmultiplied(br, bg, bb, 160),
-                        );
-                        ui.painter().galley(text_pos, galley, fg_color);
+                    }
+
+                    // zoom notice, top left
+                    if self.zoom.is_some() && self.capture.is_none() {
+                        draw_zoom_notice(ui.painter(), resp.rect.left_top() + egui::vec2(10.0, 10.0), &self.colormap_choice);
                     }
                 }
 
                 } // end else (heatmap view)
             });
 
+        if let Some(c) = &mut self.capture {
+            c.frames += 1;
+            if c.frames == 2 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(MainScreenshot)));
+            }
+            ctx.request_repaint();
+        }
+
         // Idle heartbeat: some Wayland compositors flag a window that stops submitting
         // frames entirely (fully event-driven idle, no pending repaint requests) as
         // "not responding", even though the event loop is fine. Keep a low-frequency
         // repaint going at all times so a frame always lands within ~1s.
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A short synthetic NP 1.0 recording without a geometry map (so the reference
+    /// site comes from the probe type); returns the AP and LF data files.
+    fn write_recording(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut out = Vec::new();
+        for (band, fs, n_samp, ap_lf) in [("ap", 30000.0, 9000usize, "384,0,1"), ("lf", 2500.0, 750, "0,384,1")] {
+            let bin = dir.join(format!("rec_g0_t0.imec0.{band}.bin"));
+            let n_ch = 385;
+            let data: Vec<u8> = (0..n_samp * n_ch).flat_map(|i| (((i * 7) % 200) as i16 - 100).to_le_bytes()).collect();
+            std::fs::write(&bin, &data).unwrap();
+            std::fs::write(
+                bin.with_extension("meta"),
+                format!(
+                    "nSavedChans={n_ch}\nimSampRate={fs}\nfileSizeBytes={}\nsnsApLfSy={ap_lf}\nimDatPrb_type=0\n",
+                    data.len()
+                ),
+            )
+            .unwrap();
+            out.push(bin);
+        }
+        (out[0].clone(), out[1].clone())
+    }
+
+    #[test]
+    fn waveform_zoom_returns_to_the_previous_view() {
+        let dir = std::env::temp_dir().join(format!("npx_app_wzoom_{}", std::process::id()));
+        let (ap, _) = write_recording(&dir);
+        let mut app = NPXplorerApp::new(&egui::Context::default(), ap).unwrap();
+        app.waveform_channel = Some(5);
+        let before = (app.view_start_s, app.view_dur_s, app.waveform_y_range_uv);
+        app.waveform_zoom = Some(WaveformZoom { prev_start_s: before.0, prev_dur_s: before.1, prev_y_range_uv: before.2 });
+        (app.view_start_s, app.view_dur_s, app.waveform_y_range_uv, app.waveform_y_center_uv) = (0.1, 0.02, 12.0, -30.0);
+        // the zoom isn't what is saved
+        let s = app.band_settings();
+        assert_eq!((s.view_start_s, s.view_dur_s, s.waveform_y_range_uv), before);
+
+        assert!(app.leave_waveform_zoom());
+        assert_eq!((app.view_start_s, app.view_dur_s, app.waveform_y_range_uv), before);
+        assert_eq!(app.waveform_y_center_uv, 0.0);
+        assert!(!app.leave_waveform_zoom());
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_are_restored_on_reopen() {
+        let dir = std::env::temp_dir().join(format!("npx_app_settings_{}", std::process::id()));
+        let (ap, lf) = write_recording(&dir);
+        let ctx = egui::Context::default();
+
+        // first open: the reference site is removed and the settings file written
+        let mut app = NPXplorerApp::new(&ctx, ap.clone()).unwrap();
+        assert_eq!(app.preproc_cfg.removed_channels, BTreeSet::from([191]));
+        assert!(crate::settings::path(&ap).is_file());
+
+        app.preproc_cfg.removed_channels = BTreeSet::from([3, 191]);
+        app.preproc_cfg.spatial_filter = SpatialFilter::Destripe;
+        app.preproc_cfg.notches = vec![crate::notch::Notch { freq_hz: 50.0, bw_hz: 1.0 }];
+        app.preproc_cfg.notch_enabled = true;
+        app.view_dur_s = 0.1;
+        app.view_start_s = 0.05;
+        app.color_mode = ColorMode::Voltage;
+        app.color_uv = 77.0;
+        app.colormap_choice = ColorMapChoice::Vanimo;
+        app.waveform_y_range_uv = 333.0;
+        app.noise.sigmoid_enabled = true;
+        app.spectrum_n_chunks = 42;
+        app.show_classification_overlay = true;
+        app.stim_layout_text = "header\no,f\n".to_string();
+        app.psth.color_pct = 97.5;
+        drop(app);
+
+        let app = NPXplorerApp::new(&ctx, ap.clone()).unwrap();
+        assert_eq!(app.preproc_cfg.removed_channels, BTreeSet::from([3, 191]));
+        assert_eq!(app.preproc_cfg.spatial_filter, SpatialFilter::Destripe);
+        assert!(app.preproc_cfg.highpass && app.preproc_cfg.notch_enabled);
+        assert_eq!(app.preproc_cfg.notches.len(), 1);
+        assert_eq!((app.view_dur_s, app.view_start_s), (0.1, 0.05));
+        assert!(app.color_mode == ColorMode::Voltage && app.colormap_choice == ColorMapChoice::Vanimo);
+        assert_eq!((app.color_uv, app.waveform_y_range_uv), (77.0, 333.0));
+        assert!(app.noise.sigmoid_enabled && app.noise_draft.sigmoid_enabled);
+        assert_eq!(app.spectrum_n_chunks, 42);
+        assert!(app.show_classification_overlay);
+        assert_eq!(app.stim_layout_text, "header\no,f\n");
+        assert_eq!(app.psth.color_pct, 97.5);
+        drop(app);
+
+        // the LF file shares the removed channels and stimulus settings, but has its
+        // own band settings (from the preferences, not the AP band's)
+        let app = NPXplorerApp::new(&ctx, lf.clone()).unwrap();
+        assert_eq!(app.band, crate::settings::Band::Lf);
+        assert_eq!(app.preproc_cfg.removed_channels, BTreeSet::from([3, 191]));
+        assert_eq!(app.stim_layout_text, "header\no,f\n");
+        assert!(app.preproc_cfg.notches.is_empty());
+        drop(app);
+        let t = crate::settings::load_table(&ap);
+        assert!(t.contains_key("ap") && t.contains_key("lf"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

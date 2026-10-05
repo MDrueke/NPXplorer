@@ -6,68 +6,45 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::app::ColorMapChoice;
+use crate::colormap::ColorMapChoice;
 use crate::psth::{self, StimLayout};
 
 const FORMAT_HELP: &str = "One line per line of the stimulus file (lines starting with # are ignored). \
 Lines without 'o' are header rows to skip. The first line with 'o' marks the onset column(s), \
 'f' the offset column(s) and 'x' columns to ignore.\n\n\
-Edits are saved as stims_file_layout.csv next to the recording when the file is loaded \
-(PSTH: Apply/Compute) and used by both PSTH and TTL. The default in config/ is not changed.";
+Edits are saved with the recording's settings and used by both PSTH and TTL. \
+The default in config/ is not changed.";
 
 const DURATION_HELP: &str = "Width of each shaded area. Only used when the file format marks \
 no offset column: offset columns ('f') take precedence.";
 
-/// Recording-specific stimulus settings in `<recording>.npx_stim.toml` next to the data
-/// file (like the atlas sidecar), restored in the TTL and PSTH windows on opening.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-#[serde(default)]
-pub struct StimSidecar {
-    /// stimulus file last loaded in the TTL or PSTH window
-    pub stim_file: Option<PathBuf>,
-    pub ttl: TtlSettings,
-    pub psth: PsthSettings,
-}
-
+/// TTL window settings, saved per recording (see settings.rs).
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct TtlSettings {
     pub duration_ms: f64,
     pub opacity_pct: f32,
     pub emphasize_edges: bool,
+    pub show_overlay: bool,
 }
 
 impl Default for TtlSettings {
     fn default() -> Self {
-        Self { duration_ms: 100.0, opacity_pct: 10.0, emphasize_edges: false }
+        Self { duration_ms: 100.0, opacity_pct: 10.0, emphasize_edges: false, show_overlay: true }
     }
 }
 
-/// `None` = the PSTH window's default
-#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+/// PSTH window settings, saved per recording; `None` = the window's default
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default, PartialEq)]
 #[serde(default)]
 pub struct PsthSettings {
     pub start_ms: Option<f64>,
     pub end_ms: Option<f64>,
     pub stim_t_start: Option<f64>,
     pub stim_t_end: Option<f64>,
-}
-
-fn sidecar_path(bin_path: &Path) -> PathBuf {
-    crate::atlas::recording_sidecar(bin_path, ".npx_stim.toml")
-}
-
-pub fn load_sidecar(bin_path: &Path) -> StimSidecar {
-    std::fs::read_to_string(sidecar_path(bin_path))
-        .ok()
-        .and_then(|t| toml::from_str(&t).ok())
-        .unwrap_or_default()
-}
-
-pub fn save_sidecar(bin_path: &Path, sc: &StimSidecar) -> anyhow::Result<()> {
-    let path = sidecar_path(bin_path);
-    std::fs::write(&path, toml::to_string_pretty(sc)?)
-        .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))
+    pub color_mode: Option<crate::app::ColorMode>,
+    pub color_pct: Option<f32>,
+    pub color_uv: Option<f32>,
 }
 
 pub struct TtlState {
@@ -77,7 +54,7 @@ pub struct TtlState {
     duration_ms: f64,
     /// opacity of the shaded areas, %
     opacity_pct: f32,
-    show_overlay: bool,
+    pub(crate) show_overlay: bool,
     emphasize_edges: bool,
     onsets: Vec<f64>,
     /// offsets from 'f' columns, same order as `onsets`
@@ -93,7 +70,7 @@ impl TtlState {
             pick_rx: None,
             duration_ms: settings.duration_ms,
             opacity_pct: settings.opacity_pct,
-            show_overlay: true,
+            show_overlay: settings.show_overlay,
             emphasize_edges: settings.emphasize_edges,
             onsets: Vec::new(),
             offsets: None,
@@ -106,6 +83,7 @@ impl TtlState {
             duration_ms: self.duration_ms,
             opacity_pct: self.opacity_pct,
             emphasize_edges: self.emphasize_edges,
+            show_overlay: self.show_overlay,
         }
     }
 
@@ -114,12 +92,17 @@ impl TtlState {
         self.show_overlay && !self.onsets.is_empty()
     }
 
+    /// Whether a stimulus file has been loaded this session (regardless of
+    /// `show_overlay`) — gates showing the legend's Show/Hide TTL toggle.
+    pub fn has_data(&self) -> bool {
+        !self.onsets.is_empty()
+    }
+
     /// Returns whether the file was loaded.
-    fn load(&mut self, layout_text: &str, bin_path: &Path) -> bool {
+    fn load(&mut self, layout_text: &str) -> bool {
         let path = PathBuf::from(self.path_text.trim());
         let res = (|| -> anyhow::Result<(Vec<f64>, Option<Vec<f64>>)> {
             let layout = StimLayout::parse(layout_text)?;
-            psth::save_layout_text(bin_path, layout_text)?;
             let onsets = psth::load_stim_times(&path, &layout)?;
             let offsets = psth::load_stim_offsets(&path, &layout)?;
             if let Some(off) = &offsets {
@@ -150,19 +133,35 @@ impl TtlState {
         }
     }
 
-    /// Returns true when something that belongs in the stimulus sidecar changed; a
-    /// successfully loaded file is stored in `stim_file`.
+    /// Onset strictly after `after`, closest one first (`None` if there isn't one).
+    fn next_onset(&self, after: f64) -> Option<f64> {
+        self.onsets.iter().copied().filter(|&t| t > after + 1e-9).fold(None, |best, t| {
+            Some(best.map_or(t, |b: f64| b.min(t)))
+        })
+    }
+
+    /// Onset strictly before `before`, closest one first (`None` if there isn't one).
+    fn prev_onset(&self, before: f64) -> Option<f64> {
+        self.onsets.iter().copied().filter(|&t| t < before - 1e-9).fold(None, |best, t| {
+            Some(best.map_or(t, |b: f64| b.max(t)))
+        })
+    }
+
+    /// A successfully loaded file is stored in `stim_file`. `view_start_s` is updated
+    /// in place by the "jump to TTL" buttons, centering the targeted TTL in the view.
     pub fn draw_window(
         &mut self,
         ctx: &egui::Context,
         layout_text: &mut String,
         bin_path: &Path,
         stim_file: &mut Option<PathBuf>,
-    ) -> bool {
+        view_start_s: &mut f64,
+        view_dur_s: f64,
+        total_s: f64,
+    ) {
         if !self.open {
-            return false;
+            return;
         }
-        let before = self.settings();
         let mut loaded = false;
         if let Some(rx) = &self.pick_rx {
             match rx.try_recv() {
@@ -170,7 +169,7 @@ impl TtlState {
                     self.pick_rx = None;
                     if let Some(p) = picked {
                         self.path_text = p.to_string_lossy().into_owned();
-                        loaded |= self.load(layout_text, bin_path);
+                        loaded |= self.load(layout_text);
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -208,9 +207,7 @@ impl TtlState {
                 });
 
                 ui.add_space(4.0);
-                if let Some(e) = format_editor(ui, layout_text, bin_path) {
-                    self.error = Some(e);
-                }
+                format_editor(ui, layout_text);
 
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -233,13 +230,40 @@ impl TtlState {
                 });
                 ui.horizontal(|ui| {
                     ui.label("Opacity:");
-                    ui.add(egui::Slider::new(&mut self.opacity_pct, 0.0..=100.0).suffix("%"));
+                    ui.add(egui::Slider::new(&mut self.opacity_pct, 0.0..=100.0).text("%"));
                 });
                 ui.checkbox(&mut self.show_overlay, "Show overlay");
                 ui.checkbox(&mut self.emphasize_edges, "Emphasize on/offset");
 
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Jump to TTL:");
+                    let center = *view_start_s + view_dur_s / 2.0;
+                    let prev = self.prev_onset(center);
+                    let next = self.next_onset(center);
+                    let max_start = (total_s - view_dur_s).max(0.0);
+                    if ui
+                        .add_enabled(prev.is_some(), egui::Button::new("◀"))
+                        .on_hover_text("Previous TTL")
+                        .clicked()
+                    {
+                        if let Some(t) = prev {
+                            *view_start_s = (t - view_dur_s / 2.0).clamp(0.0, max_start);
+                        }
+                    }
+                    if ui
+                        .add_enabled(next.is_some(), egui::Button::new("▶"))
+                        .on_hover_text("Next TTL")
+                        .clicked()
+                    {
+                        if let Some(t) = next {
+                            *view_start_s = (t - view_dur_s / 2.0).clamp(0.0, max_start);
+                        }
+                    }
+                });
+
                 if load {
-                    loaded |= self.load(layout_text, bin_path);
+                    loaded |= self.load(layout_text);
                 }
                 if let Some(err) = &self.error {
                     ui.colored_label(Color32::from_rgb(0xff, 0x66, 0x66), err);
@@ -254,7 +278,6 @@ impl TtlState {
         if loaded {
             *stim_file = Some(PathBuf::from(self.path_text.trim()));
         }
-        loaded || self.settings() != before
     }
 
     /// Shade every stimulus overlapping the view in `rect` (x axis = the displayed
@@ -270,7 +293,7 @@ impl TtlState {
         if !self.overlay_visible() || view_dur_s <= 0.0 {
             return;
         }
-        let [r, g, b] = crate::render::colormap_accent(cmap);
+        let [r, g, b] = cmap.spec().accent;
         let alpha = (self.opacity_pct / 100.0 * 255.0).round() as u8;
         let fill = Color32::from_rgba_unmultiplied(r, g, b, alpha);
         let edge = egui::Stroke::new(1.0_f32, Color32::from_rgb(r, g, b));
@@ -307,15 +330,13 @@ impl TtlState {
 }
 
 /// Multi-line editor for the stim-file format, shared by the PSTH and TTL windows.
-/// "Reset to default" restores the default text and removes the recording's own
-/// format file. Returns an error message if that removal failed.
-pub fn format_editor(ui: &mut Ui, text: &mut String, bin_path: &Path) -> Option<String> {
-    let mut err = None;
+/// The text is saved with the recording's settings; "Reset to default" restores the
+/// default from `config/`.
+pub fn format_editor(ui: &mut Ui, text: &mut String) {
     ui.horizontal(|ui| {
         ui.label("File format:").on_hover_text(FORMAT_HELP);
         if ui.button("Reset to default").clicked() {
             *text = psth::default_layout_text();
-            err = psth::save_layout_text(bin_path, text).err().map(|e| e.to_string());
         }
     });
     ui.add(
@@ -324,5 +345,4 @@ pub fn format_editor(ui: &mut Ui, text: &mut String, bin_path: &Path) -> Option<
             .desired_rows(5)
             .desired_width(f32::INFINITY),
     );
-    err
 }

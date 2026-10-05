@@ -159,14 +159,20 @@ pub struct PreprocConfig {
     pub avg_depths: bool,
     pub sample_rate: f64,
     /// 0-based channel indices excluded from display and from every computation
-    /// (CMR/destripe reference, depth averaging). Recording-specific, so it is
-    /// never persisted to the saved preferences.
+    /// (CMR/destripe reference, depth averaging). Recording-specific: saved with the
+    /// recording's settings (settings.rs), never in the preferences.
     #[serde(default, skip_serializing)]
     pub removed_channels: std::collections::BTreeSet<usize>,
     #[serde(default)]
     pub channel_order: crate::data::ChannelOrder,
     #[serde(default)]
     pub shank_order: crate::data::ShankOrder,
+    /// notch filters; recording-specific (saved with the recording's settings), so
+    /// never persisted to the saved preferences
+    #[serde(default, skip_serializing)]
+    pub notches: Vec<crate::notch::Notch>,
+    #[serde(default, skip_serializing)]
+    pub notch_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -190,7 +196,7 @@ impl Filters {
 // ---------------------------------------------------------------------------
 // Top-level entry point
 // Order: depth-averaging (and the ADC delay correction) happen while reading.
-// Here: DC offset -> Temporal HP -> Spatial filter, per shank.
+// Here: DC offset -> Notch -> Temporal HP -> Spatial filter, per shank.
 // ---------------------------------------------------------------------------
 
 /// Preprocess `data` (`[n_data_rows][n_samp]`) in place.
@@ -253,6 +259,12 @@ pub fn preprocess(
         // 1. DC Offset Correction
         if cfg.dc_removal {
             apply_dc_removal(shank_data, n_samp);
+        }
+        if cancel.load(Ordering::Relaxed) { return eps_used; }
+
+        // 1b. Notch filters
+        if cfg.notch_enabled && !cfg.notches.is_empty() {
+            crate::notch::apply_notches(shank_data, n_samp, &cfg.notches, cfg.sample_rate);
         }
         if cancel.load(Ordering::Relaxed) { return eps_used; }
 

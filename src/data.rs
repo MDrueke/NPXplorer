@@ -276,6 +276,13 @@ impl Meta {
             },
         };
 
+        // metadata without marked reference sites: those of the probe type
+        let reference_channels = if reference_channels.is_empty() && spec.is_some() {
+            reference_sites_of_type(im_dat_prb_type, &chan_nums)
+        } else {
+            reference_channels
+        };
+
         // --- ADC sampling delays -------------------------------------------------
         let mux_family = spec.as_ref().map(|s| s.mux).unwrap_or(MuxFamily::None);
         let shift_fraction: Vec<f32> = match mux_str.as_deref().and_then(|m| parse_mux_table(m, mux_family)) {
@@ -405,6 +412,12 @@ impl Meta {
         let sample_shift = (0..num_channels)
             .map(|ch| mux_family.sample_shift_fraction(ch) * stream_scale)
             .collect();
+        // settings.xml without missing positions: the probe type's reference sites
+        let reference_channels = if reference_channels.is_empty() && spec.is_some() {
+            reference_sites_of_type(im_dat_prb_type, &(0..num_channels).collect::<Vec<_>>())
+        } else {
+            reference_channels
+        };
 
         Ok(Meta {
             n_saved_chans: num_channels,
@@ -583,6 +596,15 @@ fn probe_type_of_spec(spec: &ProbeSpec) -> u32 {
         "NP2010" => 24,
         pn => pn.trim_start_matches("NP").parse().unwrap_or(0),
     }
+}
+
+/// Indices of the saved channels whose acquisition channel number (`chan_nums`) is a
+/// reference site of the probe type.
+fn reference_sites_of_type(prb_type: u32, chan_nums: &[usize]) -> BTreeSet<usize> {
+    let refs = probe::reference_channel_numbers(prb_type);
+    let set: BTreeSet<usize> = (0..chan_nums.len()).filter(|&i| refs.contains(&chan_nums[i])).collect();
+    // never all of them (a recording of the reference channel alone)
+    if set.len() < chan_nums.len() { set } else { BTreeSet::new() }
 }
 
 /// Trailing decimal number of a channel name ("AP12" -> 12, "LF7" -> 7, "CH3" -> 3).

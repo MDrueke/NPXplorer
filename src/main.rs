@@ -32,13 +32,18 @@ mod atlas;
 mod atlas_ui;
 mod channel_classify;
 mod channel_remove;
+mod colormap;
 mod data;
 mod geometry;
 mod mtscomp;
+mod noise;
+mod notch;
 mod preprocess;
 mod probe;
 mod psth;
 mod render;
+mod settings;
+mod spectrum;
 mod ttl;
 #[cfg(test)]
 mod realdata_tests;
@@ -156,6 +161,12 @@ impl MainApp {
         visuals.widgets.active.bg_fill = lighten(40);
         visuals.widgets.open.weak_bg_fill = lighten(40);
         visuals.widgets.open.bg_fill = lighten(40);
+
+        // selected/checked/pressed widgets (toggle buttons, checked checkboxes, the
+        // active item in a combo box, ...) default to egui's blue; a lighter grey
+        // matches the rest of this flat, monochrome widget style instead
+        visuals.selection.bg_fill = lighten(55);
+        visuals.selection.stroke = egui::Stroke::new(1.0_f32, lighten(90));
 
         ctx.set_visuals(visuals);
         ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::Dark);
@@ -369,7 +380,8 @@ impl eframe::App for MainApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let AppState::Loaded(app) = &self.state {
+        if let AppState::Loaded(app) = &mut self.state {
+            app.flush_settings();
             app.save_prefs();
         }
     }

@@ -118,6 +118,17 @@ pub fn spec_for_type(prb_type: u32) -> Option<ProbeSpec> {
     })
 }
 
+/// Acquisition channels wired to an on-shank reference site, for when the metadata
+/// doesn't mark them: on the NP 1.0 family the internal reference electrodes (192,
+/// 576 and 960) are all read through channel 191. NP 2.0 probes have no reference
+/// site among their channels; for other types (UHD, ...) none is assumed.
+pub fn reference_channel_numbers(prb_type: u32) -> &'static [usize] {
+    match prb_type {
+        0 | 1020 | 1030 | 1300 => &[191],
+        _ => &[],
+    }
+}
+
 /// Constants for a probe part number as written by Open Ephys / Imec, e.g.
 /// "PRB_1_4_0480_1" (NP 1.0), "PRB2_1_2_0640_0" (NP 2.0 single shank),
 /// "PRB2_4_2_0640_0" (NP 2.0 four shank), "NP1100", "NP2013".
@@ -149,6 +160,13 @@ pub fn spec_for_part_number(pn: &str) -> Option<ProbeSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_channel_only_on_np1() {
+        assert_eq!(reference_channel_numbers(0), &[191]);
+        assert!(reference_channel_numbers(21).is_empty());
+        assert!(reference_channel_numbers(2013).is_empty());
+    }
 
     #[test]
     fn mux_formulas_match_reference_tables() {
