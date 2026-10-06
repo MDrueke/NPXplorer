@@ -30,3 +30,6 @@ lto = true
 
 [profile.dev]
 opt-level = 1  # faster debug builds, still debuggable
+
+[build-dependencies]
+winresource = "0.1.31"

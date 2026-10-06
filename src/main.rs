@@ -28,6 +28,7 @@ macro_rules! file_log {
 }
 
 mod app;
+mod app_icon;
 mod atlas;
 mod atlas_ui;
 mod channel_classify;
@@ -398,9 +399,14 @@ fn main() -> anyhow::Result<()> {
         file_log!("=== NPXplorer debug logging started ===");
     }
 
+    #[cfg(target_os = "linux")]
+    app_icon::install_desktop_entry();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_TITLE)
+            .with_app_id(app_icon::APP_ID)
+            .with_icon(std::sync::Arc::new(app_icon::window_icon()))
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([800.0, 500.0])
             .with_decorations(false),
