@@ -30,7 +30,7 @@ pub struct ColorMap {
     pub negative: &'static [[u8; 3]],
 
     // --- colors that track the colormap outside the heatmap itself ---
-    /// representative accent: nav bar view/buffer markers, TTL overlay, PSTH traces,
+    /// representative accent: nav bar view/buffer markers, event overlay, PSTH traces,
     /// firing-rate overlay
     pub accent: [u8; 3],
     /// opacity of the firing-rate overlay; tuned for its many-triangle accumulation
@@ -127,6 +127,17 @@ colormaps! {
         label_bg: C_ZERO,
         heatmap_fg: WHITE,
     },
+    Riviera => ColorMap {
+        name: "Riviera",
+        zero: C_ZERO,
+        positive: &[rgb(0x382c2a), rgb(0x57322d), rgb(0xa05044), rgb(0xff715b)],
+        negative: &[rgb(0x1e2322), rgb(0x1b2e2c), rgb(0x18413b), rgb(0x1b645a), rgb(0x1ea896)],
+        accent: [30, 168, 150],
+        overlay_alpha: 5,
+        atlas: WHITE,
+        label_bg: C_ZERO,
+        heatmap_fg: WHITE,
+    },
     YellowMagenta => ColorMap {
         name: "Yellow-Magenta",
         zero: C_ZERO,
@@ -216,8 +227,17 @@ colormaps! {
 /// Brewer/matplotlib 11-stop diverging "Spectral" ramp, low (quiet) to high (loud);
 /// colors the power spectrum heatmap.
 const SPECTRAL: &[[u8; 3]] = &[
-    rgb(0x5e4fa2), rgb(0x3288bd), rgb(0x66c2a5), rgb(0xabdda4), rgb(0xe6f598), rgb(0xffffbf),
-    rgb(0xfee08b), rgb(0xfdae61), rgb(0xf46d43), rgb(0xd53e4f), rgb(0x9e0142),
+    rgb(0x5e4fa2),
+    rgb(0x3288bd),
+    rgb(0x66c2a5),
+    rgb(0xabdda4),
+    rgb(0xe6f598),
+    rgb(0xffffbf),
+    rgb(0xfee08b),
+    rgb(0xfdae61),
+    rgb(0xf46d43),
+    rgb(0xd53e4f),
+    rgb(0x9e0142),
 ];
 
 /// Spectral color for `t` in 0..=1.
@@ -245,7 +265,11 @@ mod tests {
     fn every_map_has_stops() {
         for c in ColorMapChoice::ALL {
             let m = c.spec();
-            assert!(!m.positive.is_empty() && !m.negative.is_empty(), "{}", m.name);
+            assert!(
+                !m.positive.is_empty() && !m.negative.is_empty(),
+                "{}",
+                m.name
+            );
         }
     }
 }

@@ -255,8 +255,14 @@ impl AtlasUi {
         std::mem::take(&mut self.prefs_dirty)
     }
 
-    fn busy(&self) -> bool {
+    pub fn busy(&self) -> bool {
         self.job_rx.is_some()
+    }
+
+    /// Stop the running load / registration; its progress window closes once the
+    /// job has noticed.
+    pub fn abort(&self) {
+        self.job_cancel.store(true, Ordering::Relaxed);
     }
 
     fn overlay_visible(&self) -> bool {
@@ -474,8 +480,10 @@ impl AtlasUi {
                 ui.add(
                     egui::ProgressBar::new(done as f32 / PROGRESS_TOTAL as f32).show_percentage(),
                 );
-                if ui.button("Abort").clicked() {
-                    self.job_cancel.store(true, Ordering::Relaxed);
+                if self.job_cancel.load(Ordering::Relaxed) {
+                    ui.label("Stopping…");
+                } else if ui.button("Abort").clicked() {
+                    self.abort();
                 }
             });
     }

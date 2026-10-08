@@ -87,6 +87,62 @@ impl SosFilter {
         ext.reverse();
         x.copy_from_slice(&ext[padlen..padlen + n]);
     }
+
+    /// `filtfilt` of every column of `x` (`[n_rows][n_cols]`, row-major), along the
+    /// rows. Same arithmetic per column, in the same order (bit-identical results), but
+    /// all columns advance together, so the inner loops run over contiguous memory and
+    /// vectorize.
+    pub fn filtfilt_columns(&self, x: &mut [f32], n_rows: usize, n_cols: usize, scratch: &mut Vec<f32>) {
+        let n = n_rows;
+        if n < 2 || n_cols == 0 {
+            return;
+        }
+        debug_assert_eq!(x.len(), n_rows * n_cols);
+        let padlen = self.padlen.min(n - 1);
+        let n_ext = n + 2 * padlen;
+        scratch.clear();
+        scratch.resize(n_ext * n_cols + 2 * n_cols, 0.0);
+        let (ext, z) = scratch.split_at_mut(n_ext * n_cols);
+        let (z0, z1) = z.split_at_mut(n_cols);
+        let row = |r: usize| r * n_cols..(r + 1) * n_cols;
+        // odd extension at both ends, as in `filtfilt`
+        for i in 0..padlen {
+            let (a, b) = (&x[row(0)], &x[row(padlen - i)]);
+            for ((e, &a), &b) in ext[row(i)].iter_mut().zip(a).zip(b) {
+                *e = 2.0 * a - b;
+            }
+        }
+        ext[padlen * n_cols..(padlen + n) * n_cols].copy_from_slice(x);
+        for i in 0..padlen {
+            let (a, b) = (&x[row(n - 1)], &x[row(n - 2 - i)]);
+            for ((e, &a), &b) in ext[row(padlen + n + i)].iter_mut().zip(a).zip(b) {
+                *e = 2.0 * a - b;
+            }
+        }
+        // forward pass from the first row, then backward from the last
+        for backward in [false, true] {
+            for (s, zi) in self.sos.iter().zip(&self.zi) {
+                let (b0, b1, b2, a1, a2) = (s.b0, s.b1, s.b2, s.a1, s.a2);
+                let start = if backward { n_ext - 1 } else { 0 };
+                for c in 0..n_cols {
+                    let x0 = ext[start * n_cols + c];
+                    z0[c] = zi[0] * x0;
+                    z1[c] = zi[1] * x0;
+                }
+                for k in 0..n_ext {
+                    let r = if backward { n_ext - 1 - k } else { k };
+                    for ((v, z0), z1) in ext[row(r)].iter_mut().zip(z0.iter_mut()).zip(z1.iter_mut()) {
+                        let xi = *v;
+                        let yi = b0 * xi + *z0;
+                        *z0 = b1 * xi - a1 * yi + *z1;
+                        *z1 = b2 * xi - a2 * yi;
+                        *v = yi;
+                    }
+                }
+            }
+        }
+        x.copy_from_slice(&ext[padlen * n_cols..(padlen + n) * n_cols]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -591,20 +647,8 @@ fn apply_kfilt(data: &mut [f32], n_samp: usize, rows: &[usize], filt: &Filters, 
                 }
             }
 
-            // Filter each column
-            let mut col = vec![0.0f32; n_padded];
-            SCRATCH.with(|s| {
-                let mut scratch = s.borrow_mut();
-                for i in 0..n_t {
-                    for r in 0..n_padded {
-                        col[r] = buf[r * n_t + i];
-                    }
-                    sos.filtfilt(&mut col, &mut scratch);
-                    for r in 0..n_padded {
-                        buf[r * n_t + i] = col[r];
-                    }
-                }
-            });
+            // filter along depth, all time samples of the block at once
+            SCRATCH.with(|s| sos.filtfilt_columns(&mut buf[..n_padded * n_t], n_padded, n_t, &mut s.borrow_mut()));
 
             // Write back row by row, restoring the gain
             for (i, &r) in rows.iter().enumerate() {
@@ -637,6 +681,23 @@ mod tests {
         let mut y: Vec<f32> = (0..500).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
         f.filtfilt(&mut y, &mut scratch);
         assert!((y[250].abs() - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn filtfilt_columns_matches_filtfilt_exactly() {
+        let f = butter_highpass(3, 0.01);
+        let (n_rows, n_cols) = (97, 13);
+        let x: Vec<f32> = (0..n_rows * n_cols).map(|i| ((i * 7919) % 1000) as f32 / 10.0 - 50.0).collect();
+        let mut by_cols = x.clone();
+        let mut scratch = Vec::new();
+        f.filtfilt_columns(&mut by_cols, n_rows, n_cols, &mut scratch);
+        for c in 0..n_cols {
+            let mut col: Vec<f32> = (0..n_rows).map(|r| x[r * n_cols + c]).collect();
+            f.filtfilt(&mut col, &mut scratch);
+            for r in 0..n_rows {
+                assert_eq!(col[r].to_bits(), by_cols[r * n_cols + c].to_bits(), "row {r} col {c}");
+            }
+        }
     }
 
     #[test]

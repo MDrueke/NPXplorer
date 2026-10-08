@@ -1,5 +1,5 @@
-// TTL window: loads stimulus on/offset times and shades them on the heatmap and
-// the waveform view. The stim-file format is the one the PSTH uses (see psth.rs).
+// Events window: loads event on/offset times and shades them on the heatmap and
+// the waveform view. The event-file format is the one the PSTH uses (see psth.rs).
 
 use egui::{Color32, Ui};
 use std::path::{Path, PathBuf};
@@ -7,28 +7,28 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::colormap::ColorMapChoice;
-use crate::psth::{self, StimLayout};
+use crate::psth::{self, EventLayout};
 
-const FORMAT_HELP: &str = "One line per line of the stimulus file (lines starting with # are ignored). \
+const FORMAT_HELP: &str = "One line per line of the event file (lines starting with # are ignored). \
 Lines without 'o' are header rows to skip. The first line with 'o' marks the onset column(s), \
 'f' the offset column(s) and 'x' columns to ignore.\n\n\
-Edits are saved with the recording's settings and used by both PSTH and TTL. \
+Edits are saved with the recording's settings and used by both PSTH and Events. \
 The default in config/ is not changed.";
 
 const DURATION_HELP: &str = "Width of each shaded area. Only used when the file format marks \
 no offset column: offset columns ('f') take precedence.";
 
-/// TTL window settings, saved per recording (see settings.rs).
+/// Events window settings, saved per recording (see settings.rs).
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
 #[serde(default)]
-pub struct TtlSettings {
+pub struct EventsWindowSettings {
     pub duration_ms: f64,
     pub opacity_pct: f32,
     pub emphasize_edges: bool,
     pub show_overlay: bool,
 }
 
-impl Default for TtlSettings {
+impl Default for EventsWindowSettings {
     fn default() -> Self {
         Self { duration_ms: 100.0, opacity_pct: 10.0, emphasize_edges: false, show_overlay: true }
     }
@@ -40,14 +40,14 @@ impl Default for TtlSettings {
 pub struct PsthSettings {
     pub start_ms: Option<f64>,
     pub end_ms: Option<f64>,
-    pub stim_t_start: Option<f64>,
-    pub stim_t_end: Option<f64>,
+    pub event_t_start: Option<f64>,
+    pub event_t_end: Option<f64>,
     pub color_mode: Option<crate::app::ColorMode>,
     pub color_pct: Option<f32>,
     pub color_uv: Option<f32>,
 }
 
-pub struct TtlState {
+pub struct EventsState {
     pub open: bool,
     path_text: String,
     pick_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
@@ -62,11 +62,11 @@ pub struct TtlState {
     error: Option<String>,
 }
 
-impl TtlState {
-    pub fn new(settings: &TtlSettings, stim_file: Option<&Path>) -> Self {
+impl EventsState {
+    pub fn new(settings: &EventsWindowSettings, event_file: Option<&Path>) -> Self {
         Self {
             open: false,
-            path_text: stim_file.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            path_text: event_file.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
             pick_rx: None,
             duration_ms: settings.duration_ms,
             opacity_pct: settings.opacity_pct,
@@ -78,8 +78,8 @@ impl TtlState {
         }
     }
 
-    pub fn settings(&self) -> TtlSettings {
-        TtlSettings {
+    pub fn settings(&self) -> EventsWindowSettings {
+        EventsWindowSettings {
             duration_ms: self.duration_ms,
             opacity_pct: self.opacity_pct,
             emphasize_edges: self.emphasize_edges,
@@ -92,23 +92,28 @@ impl TtlState {
         self.show_overlay && !self.onsets.is_empty()
     }
 
-    /// Whether a stimulus file has been loaded this session (regardless of
-    /// `show_overlay`) — gates showing the legend's Show/Hide TTL toggle.
+    /// Whether an event file has been loaded this session (regardless of
+    /// `show_overlay`) — gates showing the legend's Show/Hide events toggle.
     pub fn has_data(&self) -> bool {
         !self.onsets.is_empty()
+    }
+
+    /// The loaded on- and offset times (s), if an event file has been loaded.
+    pub fn times(&self) -> Option<(&[f64], Option<&[f64]>)> {
+        (!self.onsets.is_empty()).then(|| (self.onsets.as_slice(), self.offsets.as_deref()))
     }
 
     /// Returns whether the file was loaded.
     fn load(&mut self, layout_text: &str) -> bool {
         let path = PathBuf::from(self.path_text.trim());
         let res = (|| -> anyhow::Result<(Vec<f64>, Option<Vec<f64>>)> {
-            let layout = StimLayout::parse(layout_text)?;
-            let onsets = psth::load_stim_times(&path, &layout)?;
-            let offsets = psth::load_stim_offsets(&path, &layout)?;
+            let layout = EventLayout::parse(layout_text)?;
+            let onsets = psth::load_event_times(&path, &layout)?;
+            let offsets = psth::load_event_offsets(&path, &layout)?;
             if let Some(off) = &offsets {
                 if let Some(i) = (0..onsets.len()).find(|&i| off[i] < onsets[i]) {
                     anyhow::bail!(
-                        "stimulus {} ends before it starts (onset {} s, offset {} s). \
+                        "event {} ends before it starts (onset {} s, offset {} s). \
                          Check the 'o' and 'f' columns in the file format.",
                         i + 1,
                         onsets[i],
@@ -147,14 +152,14 @@ impl TtlState {
         })
     }
 
-    /// A successfully loaded file is stored in `stim_file`. `view_start_s` is updated
-    /// in place by the "jump to TTL" buttons, centering the targeted TTL in the view.
+    /// A successfully loaded file is stored in `event_file`. `view_start_s` is updated
+    /// in place by the "jump to event" buttons, centering the targeted event in the view.
     pub fn draw_window(
         &mut self,
         ctx: &egui::Context,
         layout_text: &mut String,
         bin_path: &Path,
-        stim_file: &mut Option<PathBuf>,
+        event_file: &mut Option<PathBuf>,
         view_start_s: &mut f64,
         view_dur_s: f64,
         total_s: f64,
@@ -180,26 +185,26 @@ impl TtlState {
         }
 
         let mut open = self.open;
-        egui::Window::new("TTL")
+        egui::Window::new("Events")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
             .default_width(460.0)
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new("Stimulus file").strong());
+                ui.label(egui::RichText::new("Event file").strong());
                 let mut load = false;
                 ui.horizontal(|ui| {
                     ui.label("File:");
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.path_text)
                             .desired_width(280.0)
-                            .hint_text("path to the stimulus-times file"),
+                            .hint_text("path to the event-times file"),
                     );
                     load |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("Browse…").clicked() && self.pick_rx.is_none() {
                         let typed = Path::new(self.path_text.trim()).parent().filter(|d| d.is_dir());
                         let dir = typed.or(bin_path.parent()).map(Path::to_path_buf);
-                        self.pick_rx = Some(crate::app::spawn_stim_picker(dir));
+                        self.pick_rx = Some(crate::app::spawn_event_picker(dir));
                     }
                     load |= ui
                         .add_enabled(!self.path_text.trim().is_empty(), egui::Button::new("Load"))
@@ -237,14 +242,14 @@ impl TtlState {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("Jump to TTL:");
+                    ui.label("Jump to event:");
                     let center = *view_start_s + view_dur_s / 2.0;
                     let prev = self.prev_onset(center);
                     let next = self.next_onset(center);
                     let max_start = (total_s - view_dur_s).max(0.0);
                     if ui
                         .add_enabled(prev.is_some(), egui::Button::new("◀"))
-                        .on_hover_text("Previous TTL")
+                        .on_hover_text("Previous event")
                         .clicked()
                     {
                         if let Some(t) = prev {
@@ -253,7 +258,7 @@ impl TtlState {
                     }
                     if ui
                         .add_enabled(next.is_some(), egui::Button::new("▶"))
-                        .on_hover_text("Next TTL")
+                        .on_hover_text("Next event")
                         .clicked()
                     {
                         if let Some(t) = next {
@@ -270,17 +275,17 @@ impl TtlState {
                 } else if !self.onsets.is_empty() {
                     ui.horizontal(|ui| {
                         ui.colored_label(Color32::from_rgb(0x55, 0xdd, 0x77), "Loaded");
-                        ui.label(format!("{} stimuli", self.onsets.len()));
+                        ui.label(format!("{} events", self.onsets.len()));
                     });
                 }
             });
         self.open = open;
         if loaded {
-            *stim_file = Some(PathBuf::from(self.path_text.trim()));
+            *event_file = Some(PathBuf::from(self.path_text.trim()));
         }
     }
 
-    /// Shade every stimulus overlapping the view in `rect` (x axis = the displayed
+    /// Shade every event overlapping the view in `rect` (x axis = the displayed
     /// time window), with optional full-opacity lines at on- and offsets.
     pub fn draw_overlay(
         &self,
@@ -307,7 +312,7 @@ impl TtlState {
                 continue;
             }
             let x0 = to_x(on).max(rect.left());
-            // at least 1 px, so short stimuli stay visible in long windows
+            // at least 1 px, so short events stay visible in long windows
             let x1 = to_x(off).min(rect.right()).max(x0 + 1.0);
             painter.rect_filled(
                 egui::Rect::from_x_y_ranges(x0..=x1, rect.y_range()),
@@ -329,7 +334,7 @@ impl TtlState {
     }
 }
 
-/// Multi-line editor for the stim-file format, shared by the PSTH and TTL windows.
+/// Multi-line editor for the event-file format, shared by the PSTH and Events windows.
 /// The text is saved with the recording's settings; "Reset to default" restores the
 /// default from `config/`.
 pub fn format_editor(ui: &mut Ui, text: &mut String) {

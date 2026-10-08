@@ -766,7 +766,7 @@ fn parse_mux_table(s: &str, family: MuxFamily) -> Option<HashMap<usize, f32>> {
 /// Search ancestor directories of `bin_path` for `structure.oebin`, then continue
 /// searching upward from there for `settings.xml` (which lives at the Record Node
 /// level, above `structure.oebin`'s experiment/recording level).
-fn find_open_ephys_meta(bin_path: &Path) -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn find_open_ephys_meta(bin_path: &Path) -> Option<(PathBuf, PathBuf)> {
     let ancestors: Vec<&Path> = bin_path.ancestors().collect();
 
     let oebin_idx = ancestors.iter().position(|dir| dir.join("structure.oebin").is_file())?;
@@ -1130,42 +1130,79 @@ impl RawData {
                 convert_rows(src, n_ch, first_sample, n_samp, rows, &meta.uv_per_bit, kernels, &mut out);
             }
             RawData::Compressed(reader) => {
-                use rayon::prelude::*;
-                let bounds = &reader.meta.chunk_bounds;
-                let n_ch = reader.meta.n_channels;
-                if bounds.len() < 2 {
-                    return out;
-                }
-                // decompress every chunk overlapping the range plus the filter halo,
-                // in parallel, and stitch them into one contiguous interleaved buffer
+                // the range plus the filter halo, decompressed into one interleaved buffer
                 let want_lo = first_sample.saturating_sub(SHIFT_HALO);
-                let want_hi = (first_sample + n_samp + SHIFT_HALO).min(*bounds.last().unwrap());
-                let n_chunks = bounds.len() - 1;
-                let c_lo = bounds.partition_point(|&b| b <= want_lo).saturating_sub(1).min(n_chunks - 1);
-                let c_hi = bounds.partition_point(|&b| b < want_hi).min(n_chunks); // exclusive
-                if c_lo >= c_hi {
+                let want_hi = first_sample + n_samp + SHIFT_HALO;
+                let Some((src, gather_start)) = gather_compressed(reader, want_lo, want_hi) else {
                     return out;
-                }
-                let gather_start = bounds[c_lo];
-                let gather_len = bounds[c_hi] - gather_start;
-                let mut src = vec![0i16; gather_len * n_ch];
-                let pieces: Vec<Option<Arc<Vec<i16>>>> = (c_lo..c_hi)
-                    .into_par_iter()
-                    .map(|c| reader.chunk(c).ok())
-                    .collect();
-                for (i, piece) in pieces.into_iter().enumerate() {
-                    if let Some(p) = piece {
-                        let off = (bounds[c_lo + i] - gather_start) * n_ch;
-                        let len = p.len().min(src.len() - off);
-                        src[off..off + len].copy_from_slice(&p[..len]);
-                    }
-                }
+                };
                 let src_offset = first_sample.saturating_sub(gather_start);
                 convert_rows(&src, n_ch, src_offset, n_samp, rows, &meta.uv_per_bit, kernels, &mut out);
             }
         }
         out
     }
+
+    /// Raw samples `[first, first + n_samp)` of the file channels `chans`, layout
+    /// `[n_samp][chans.len()]`; samples beyond the recording are 0. Used to copy
+    /// channels unchanged (the SpikeGLX sync channel) into an export.
+    pub fn read_i16(&self, first_sample: usize, n_samp: usize, meta: &Meta, chans: &[usize]) -> Vec<i16> {
+        let k = chans.len();
+        let mut out = vec![0i16; n_samp * k];
+        if n_samp == 0 || k == 0 {
+            return out;
+        }
+        let n_ch = meta.n_saved_chans;
+        let mut copy = |src: &[i16], src_offset: usize| {
+            let src_len = src.len() / n_ch;
+            for t in 0..n_samp.min(src_len.saturating_sub(src_offset)) {
+                let base = (src_offset + t) * n_ch;
+                for (j, &c) in chans.iter().enumerate() {
+                    out[t * k + j] = src[base + c];
+                }
+            }
+        };
+        match self {
+            RawData::Uncompressed(mmap) => copy(mmap_as_i16(mmap), first_sample),
+            RawData::Compressed(reader) => {
+                if let Some((src, gather_start)) = gather_compressed(reader, first_sample, first_sample + n_samp) {
+                    copy(&src, first_sample - gather_start);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Decompress every chunk overlapping samples `[want_lo, want_hi)` (in parallel) and
+/// stitch them into one interleaved buffer; returns it with its first sample, or
+/// `None` if the range lies outside the recording.
+fn gather_compressed(reader: &crate::mtscomp::MtscompReader, want_lo: usize, want_hi: usize) -> Option<(Vec<i16>, usize)> {
+    use rayon::prelude::*;
+    let bounds = &reader.meta.chunk_bounds;
+    let n_ch = reader.meta.n_channels;
+    if bounds.len() < 2 {
+        return None;
+    }
+    let want_hi = want_hi.min(*bounds.last().unwrap());
+    let n_chunks = bounds.len() - 1;
+    let c_lo = bounds.partition_point(|&b| b <= want_lo).saturating_sub(1).min(n_chunks - 1);
+    let c_hi = bounds.partition_point(|&b| b < want_hi).min(n_chunks); // exclusive
+    if c_lo >= c_hi {
+        return None;
+    }
+    let gather_start = bounds[c_lo];
+    let gather_len = bounds[c_hi] - gather_start;
+    let mut src = vec![0i16; gather_len * n_ch];
+    let pieces: Vec<Option<Arc<Vec<i16>>>> = (c_lo..c_hi).into_par_iter().map(|c| reader.chunk(c).ok()).collect();
+    for (i, piece) in pieces.into_iter().enumerate() {
+        if let Some(p) = piece {
+            let off = (bounds[c_lo + i] - gather_start) * n_ch;
+            let len = p.len().min(src.len() - off);
+            src[off..off + len].copy_from_slice(&p[..len]);
+        }
+    }
+    Some((src, gather_start))
 }
 
 /// The mapped file as i16 samples; a trailing odd byte (a file still being written)

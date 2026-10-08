@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::psth::read_text_file;
 
-/// Split a data line into fields, same convention as the PSTH stim-file reader.
+/// Split a data line into fields, same convention as the PSTH event-file reader.
 fn split_fields(line: &str) -> Vec<&str> {
     if line.contains(',') {
         line.split(',').map(|f| f.trim()).collect()
@@ -108,12 +108,12 @@ pub fn example_list(ids: &[String]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Layout file — same convention as PSTH's stims_file_layout.csv, but the
+// Layout file — same convention as PSTH's events_file_layout.csv, but the
 // marker letter is 'c' (for "channel") instead of 'o'.
 // ---------------------------------------------------------------------------
 
 /// Describes where channel numbers to remove live in a list file. Same convention
-/// as PSTH's stims_file_layout.csv: leading lines with no `o` token are header rows
+/// as PSTH's events_file_layout.csv: leading lines with no `o` token are header rows
 /// to skip; the first line containing one or more `o` tokens marks which column(s)
 /// hold channel numbers (or ranges).
 #[derive(Clone, Debug)]

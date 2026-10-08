@@ -580,6 +580,13 @@ impl NotchPanel {
         }
     }
 
+    /// Stop a running scan (the window is being closed).
+    pub fn abort(&self) {
+        if let Some(job) = &self.job {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
     pub fn scan_settings(&self) -> &ScanSettings {
         &self.settings
     }
@@ -656,7 +663,9 @@ impl NotchPanel {
                         .desired_width(220.0)
                         .text(format!("{done} / {} chunks", job.total)),
                 );
-                if ui.button("Abort").clicked() {
+                if job.cancel.load(Ordering::Relaxed) {
+                    ui.label("Stopping…");
+                } else if ui.button("Abort").clicked() {
                     job.cancel.store(true, Ordering::Relaxed);
                 }
             });

@@ -1,6 +1,6 @@
 [package]
 name = "NPXplorer"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 
 [[bin]]
@@ -23,6 +23,7 @@ flate2 = "1.1.9"
 toml = "1.1.2"
 roxmltree = "0.20"
 rustfft = "6.2"
+sha1 = "0.11.0"
 
 [profile.release]
 opt-level = 3

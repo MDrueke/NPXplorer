@@ -15,7 +15,7 @@ use crate::worker::compute_thread_count;
 /// Read a text file without assuming UTF-8. Handles UTF-8 (with/without BOM) and
 /// UTF-16 LE/BE (with BOM); anything else that isn't valid UTF-8 is decoded as
 /// Latin-1 (ISO-8859-1), which maps every byte to a char and so never fails. This
-/// keeps stimulus files exported from Excel/MATLAB/Python on any platform readable
+/// keeps event files exported from Excel/MATLAB/Python on any platform readable
 /// without adding an encoding dependency.
 pub fn read_text_file(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path)
@@ -59,20 +59,20 @@ fn split_fields(line: &str) -> Vec<&str> {
 // Layout file
 // ---------------------------------------------------------------------------
 
-/// Describes where stimulus onset (and optionally offset) times live in a stimulus file.
-/// Determined by a layout file whose lines mirror the stim file's structure:
+/// Describes where event onset (and optionally offset) times live in an event file.
+/// Determined by a layout file whose lines mirror the event file's structure:
 /// leading lines with no `o` token are header rows to skip; the first line that
 /// contains one or more `o` tokens marks which column(s) hold the onset times, and
 /// `f` tokens on that line the offset times (paired with the onsets in order).
 /// Trailing `x` markers beyond the actual number of columns are ignored.
 #[derive(Clone, Debug)]
-pub struct StimLayout {
+pub struct EventLayout {
     pub n_header_rows: usize,
     pub onset_cols: Vec<usize>,
     pub offset_cols: Vec<usize>,
 }
 
-impl StimLayout {
+impl EventLayout {
     pub fn parse(text: &str) -> Result<Self> {
         let mut n_header_rows = 0usize;
         for line in text.lines() {
@@ -104,38 +104,38 @@ impl StimLayout {
                     offset_cols.len()
                 );
             }
-            return Ok(StimLayout { n_header_rows, onset_cols, offset_cols });
+            return Ok(EventLayout { n_header_rows, onset_cols, offset_cols });
         }
         bail!(
             "the layout file contains no 'o' marker, so it does not say which column \
-             holds the stimulus onset times. Mark the onset column with 'o' (e.g. 'o,x,x')."
+             holds the event onset times. Mark the onset column with 'o' (e.g. 'o,x,x')."
         );
     }
 }
 
 // ---------------------------------------------------------------------------
-// Loading stimulus times
+// Loading event times
 // ---------------------------------------------------------------------------
 
-/// Read stimulus onset times (seconds) from `stim_path`, using `layout` to locate
+/// Read event onset times (seconds) from `event_path`, using `layout` to locate
 /// the onset column and skip header rows. Errors describe exactly how the layout
 /// disagrees with the file rather than panicking.
-pub fn load_stim_times(stim_path: &Path, layout: &StimLayout) -> Result<Vec<f64>> {
-    load_columns(stim_path, layout.n_header_rows, &layout.onset_cols, "onset")
+pub fn load_event_times(event_path: &Path, layout: &EventLayout) -> Result<Vec<f64>> {
+    load_columns(event_path, layout.n_header_rows, &layout.onset_cols, "onset")
 }
 
-/// Read stimulus offset times (seconds) from the `f` columns, in the same order as
-/// the onsets from `load_stim_times`. `None` if the layout marks no offset column.
-pub fn load_stim_offsets(stim_path: &Path, layout: &StimLayout) -> Result<Option<Vec<f64>>> {
+/// Read event offset times (seconds) from the `f` columns, in the same order as
+/// the onsets from `load_event_times`. `None` if the layout marks no offset column.
+pub fn load_event_offsets(event_path: &Path, layout: &EventLayout) -> Result<Option<Vec<f64>>> {
     if layout.offset_cols.is_empty() {
         return Ok(None);
     }
-    load_columns(stim_path, layout.n_header_rows, &layout.offset_cols, "offset").map(Some)
+    load_columns(event_path, layout.n_header_rows, &layout.offset_cols, "offset").map(Some)
 }
 
-fn load_columns(stim_path: &Path, n_header_rows: usize, cols: &[usize], what: &str) -> Result<Vec<f64>> {
-    let text = read_text_file(stim_path)?;
-    let stim_name = stim_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+fn load_columns(event_path: &Path, n_header_rows: usize, cols: &[usize], what: &str) -> Result<Vec<f64>> {
+    let text = read_text_file(event_path)?;
+    let event_name = event_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
 
     let max_col = *cols.iter().max().unwrap_or(&0);
     let mut times = Vec::new();
@@ -149,8 +149,8 @@ fn load_columns(stim_path: &Path, n_header_rows: usize, cols: &[usize], what: &s
         let fields = split_fields(trimmed);
         if max_col >= fields.len() {
             bail!(
-                "layout does not match '{stim_name}': the layout marks column {} as the \
-                 stimulus {what} time, but row {} has only {} column(s). Check the number of \
+                "layout does not match '{event_name}': the layout marks column {} as the \
+                 event {what} time, but row {} has only {} column(s). Check the number of \
                  header rows and the {what} column in the layout file.",
                 max_col + 1,
                 line_no + 1,
@@ -162,8 +162,8 @@ fn load_columns(stim_path: &Path, n_header_rows: usize, cols: &[usize], what: &s
             match tok.parse::<f64>() {
                 Ok(v) => times.push(v),
                 Err(_) => bail!(
-                    "could not read a number from '{stim_name}': the value '{tok}' in row {}, \
-                     column {} is not a valid stimulus {what} time. The layout may mark the wrong \
+                    "could not read a number from '{event_name}': the value '{tok}' in row {}, \
+                     column {} is not a valid event {what} time. The layout may mark the wrong \
                      column, or the header-row count may be off.",
                     line_no + 1,
                     c + 1
@@ -174,17 +174,11 @@ fn load_columns(stim_path: &Path, n_header_rows: usize, cols: &[usize], what: &s
 
     if times.is_empty() {
         bail!(
-            "no stimulus times were found in '{stim_name}' after skipping {} header row(s).",
+            "no event times were found in '{event_name}' after skipping {} header row(s).",
             n_header_rows
         );
     }
     Ok(times)
-}
-
-/// `stims_file_layout.csv` in the data folder, where earlier versions saved an edited
-/// stim-file format (now part of the recording's settings, see settings.rs).
-pub fn layout_sidecar_path(bin_path: &Path) -> PathBuf {
-    bin_path.with_file_name("stims_file_layout.csv")
 }
 
 /// Text of the default layout file in `config/` (the built-in default if it is missing).
@@ -214,7 +208,7 @@ pub struct PsthResult {
     /// `data_idx` indexes `data`
     pub display_rows: Vec<DisplayRow>,
     pub n_win: usize,  // number of time samples per row
-    pub data: Vec<f32>, // n_rows * n_win, row-major (µV, averaged over stimuli)
+    pub data: Vec<f32>, // n_rows * n_win, row-major (µV, averaged over events)
     pub avg_trace: Vec<f32>, // n_win, mean across the Data rows
     pub start_ms: f64,
     pub dt_ms: f64,
@@ -236,19 +230,19 @@ impl PsthResult {
     }
 }
 
-/// Compute the peri-stimulus average of the preprocessed signal. For each stimulus,
+/// Compute the peri-stimulus average of the preprocessed signal. For each event,
 /// a window (plus filter-settle padding) is read from disk, depth-averaged and
 /// preprocessed exactly as the main view, then the aligned segment is accumulated.
 /// Without a spatial filter every step is linear, so the raw windows are averaged
 /// first and the average is preprocessed once, which gives the same result.
-/// Stimuli whose full padded window falls outside the recording are skipped.
-/// `progress_total` is set to the number of stimuli used once known, and `progress`
+/// Events whose full padded window falls outside the recording are skipped.
+/// `progress_total` is set to the number of events used once known, and `progress`
 /// counts them as they are processed.
 pub fn compute_psth(
     raw: &Arc<RawData>,
     meta: &Meta,
     cfg: &PreprocConfig,
-    stim_times_s: &[f64],
+    event_times_s: &[f64],
     params: &PsthParams,
     cancel: &AtomicBool,
     progress: &AtomicUsize,
@@ -289,9 +283,9 @@ pub fn compute_psth(
         bail!("no channels left to average (all channels are removed).");
     }
 
-    // stimuli whose full padded window fits inside the recording
+    // events whose full padded window fits inside the recording
     let n_samples = meta.n_samples as i64;
-    let valid: Vec<i64> = stim_times_s
+    let valid: Vec<i64> = event_times_s
         .iter()
         .map(|t| (t * fs).round() as i64)
         .filter(|&onset| {
@@ -300,9 +294,9 @@ pub fn compute_psth(
         })
         .collect();
     let n_used = valid.len();
-    let n_skipped = stim_times_s.len() - n_used;
+    let n_skipped = event_times_s.len() - n_used;
     if n_used == 0 {
-        bail!("all {} stimuli fall too close to the recording edges for the chosen window.", stim_times_s.len());
+        bail!("all {} events fall too close to the recording edges for the chosen window.", event_times_s.len());
     }
     progress_total.store(n_used, Ordering::Relaxed);
 
@@ -315,12 +309,12 @@ pub fn compute_psth(
 
     let pad = pad as usize;
     let read_n = n_win + 2 * pad;
-    // median CMR and destripe's AGC are not linear, so they need per-stimulus preprocessing
+    // median CMR and destripe's AGC are not linear, so they need per-event preprocessing
     let linear = cfg.spatial_filter == SpatialFilter::Off;
     // linear: accumulate the whole padded window; otherwise only the aligned segment
     let (seg_off, seg_n) = if linear { (0, read_n) } else { (pad, n_win) };
     let acc_len = n_rows * seg_n;
-    // one accumulator per chunk of stimuli, so memory stays bounded by the thread count
+    // one accumulator per chunk of events, so memory stays bounded by the thread count
     let chunk = n_used.div_ceil(n_threads).max(1);
 
     let sum = pool.install(|| {
@@ -419,16 +413,16 @@ pub fn config_dir() -> PathBuf {
 }
 
 pub fn default_layout_path() -> PathBuf {
-    config_dir().join("stims_file_layout.csv")
+    config_dir().join("events_file_layout.csv")
 }
 
 const DEFAULT_LAYOUT: &str = "\
-# This file tells NPXplorer how to read a stimulus-times file.
+# This file tells NPXplorer how to read an event-times file.
 # Lines here mirror the structure of that file, one line each (comment lines
 # like this one are ignored and don't count). Lines with no 'o' are header
-# rows in the stimulus file, to be skipped. The first line containing 'o'
+# rows in the event file, to be skipped. The first line containing 'o'
 # marks which comma-separated column(s) hold the onset times (in seconds),
-# 'f' the offset times (optional, used by TTL); 'x' marks a column to ignore.
+# 'f' the offset times (optional, used by the Events window); 'x' marks a column to ignore.
 header
 o
 ";

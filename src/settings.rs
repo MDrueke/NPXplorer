@@ -2,16 +2,15 @@
 //! saved in one file next to the recording, `<recording>.npxplorer.toml`, and applied
 //! again when the recording is opened. The AP and LF files of a SpikeGLX recording
 //! share the file: band-specific settings (preprocessing, colour scale, view, ...) live
-//! in its `[ap]` / `[lf]` sections, the channel removal, stimulus and atlas settings are
+//! in its `[ap]` / `[lf]` sections, the channel removal, event and atlas settings are
 //! shared.
 //!
 //! Values missing from the file (older versions, hand edits) keep the value the app
 //! started with — the global preferences, i.e. the settings last used anywhere.
 //!
-//! Earlier versions wrote three files instead (`.npx_atlas.toml`, `.npx_stim.toml`,
-//! `<data file>.npx_notch.toml`) plus `stims_file_layout.csv` in the data folder. They
-//! are read when the new file lacks their section; the first three are deleted once
-//! their content has been written to the new file.
+//! Earlier versions wrote separate files instead (`.npx_atlas.toml`,
+//! `<data file>.npx_notch.toml`). They are read when the new file lacks their section
+//! and deleted once their content has been written to the new file.
 
 use std::path::{Path, PathBuf};
 
@@ -32,27 +31,30 @@ pub struct RecordingSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub removed_channels: Option<Vec<usize>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stim: Option<StimSettings>,
+    pub events: Option<EventSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub atlas: Option<AtlasSettings>,
+    /// options of the export window
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub export: Option<crate::export::ExportSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ap: Option<BandSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lf: Option<BandSettings>,
 }
 
-/// Stimulus file and the settings of the TTL and PSTH windows.
+/// Event file and the settings of the Events and PSTH windows.
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct StimSettings {
-    /// stimulus file last loaded in the TTL or PSTH window
+pub struct EventSettings {
+    /// event file last loaded in the Events or PSTH window
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stim_file: Option<PathBuf>,
-    /// stim-file format; `None` = the default in `config/`
+    pub event_file: Option<PathBuf>,
+    /// event-file format; `None` = the default in `config/`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layout: Option<String>,
-    pub ttl: crate::ttl::TtlSettings,
-    pub psth: crate::ttl::PsthSettings,
+    pub window: crate::events::EventsWindowSettings,
+    pub psth: crate::events::PsthSettings,
 }
 
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -232,7 +234,7 @@ pub fn save(bin_path: &Path, band: Band, settings: &RecordingSettings) -> Result
     let path = path(bin_path);
     let mut table = load_table(bin_path);
     let mine = toml::Table::try_from(settings)?;
-    for k in ["removed_channels", "stim", "atlas", band.key()] {
+    for k in ["removed_channels", "events", "atlas", "export", band.key()] {
         match mine.get(k) {
             Some(v) => table.insert(k.to_string(), v.clone()),
             None => table.remove(k),
@@ -288,27 +290,6 @@ pub fn legacy_atlas(bin_path: &Path) -> Option<AtlasSettings> {
     })
 }
 
-/// Stimulus settings from a `.npx_stim.toml` and the folder's `stims_file_layout.csv`
-/// of earlier versions.
-pub fn legacy_stim(bin_path: &Path) -> Option<StimSettings> {
-    #[derive(Deserialize, Default)]
-    #[serde(default)]
-    struct File {
-        stim_file: Option<PathBuf>,
-        ttl: crate::ttl::TtlSettings,
-        psth: crate::ttl::PsthSettings,
-    }
-    let f: Option<File> = std::fs::read_to_string(legacy_stim_path(bin_path))
-        .ok()
-        .and_then(|t| toml::from_str(&t).ok());
-    let layout = crate::psth::read_text_file(&crate::psth::layout_sidecar_path(bin_path)).ok();
-    if f.is_none() && layout.is_none() {
-        return None;
-    }
-    let f = f.unwrap_or_default();
-    Some(StimSettings { stim_file: f.stim_file, layout, ttl: f.ttl, psth: f.psth })
-}
-
 /// Notches from a `<data file>.npx_notch.toml` of an earlier version.
 pub fn legacy_notches(bin_path: &Path) -> Option<Vec<crate::notch::Notch>> {
     #[derive(Deserialize)]
@@ -324,19 +305,15 @@ fn legacy_atlas_path(bin_path: &Path) -> PathBuf {
     crate::atlas::recording_sidecar(bin_path, ".npx_atlas.toml")
 }
 
-fn legacy_stim_path(bin_path: &Path) -> PathBuf {
-    crate::atlas::recording_sidecar(bin_path, ".npx_stim.toml")
-}
-
 fn legacy_notch_path(bin_path: &Path) -> PathBuf {
     let stem = bin_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     bin_path.with_file_name(format!("{stem}.npx_notch.toml"))
 }
 
 /// Delete the per-recording files of earlier versions once the new file holds their
-/// content. The folder's `stims_file_layout.csv` stays: other recordings may use it.
+/// content.
 fn remove_legacy_files(bin_path: &Path) {
-    for p in [legacy_atlas_path(bin_path), legacy_stim_path(bin_path), legacy_notch_path(bin_path)] {
+    for p in [legacy_atlas_path(bin_path), legacy_notch_path(bin_path)] {
         if p.is_file() {
             let _ = std::fs::remove_file(p);
         }
@@ -389,7 +366,7 @@ mod tests {
         let s_ap = RecordingSettings {
             removed_channels: Some(vec![191]),
             atlas: Some(atlas(3.0)),
-            stim: Some(StimSettings { layout: Some("header\no".into()), ..Default::default() }),
+            events: Some(EventSettings { layout: Some("header\no".into()), ..Default::default() }),
             ..Default::default()
         };
         save(&ap, Band::Ap, &s_ap).unwrap();
@@ -403,7 +380,7 @@ mod tests {
         let t = load_table(&ap);
         assert_eq!(t["removed_channels"].as_array().unwrap().len(), 0);
         assert_eq!(t["ap"]["view_dur_s"].as_float(), Some(0.25));
-        assert!(t.get("stim").is_none());
+        assert!(t.get("events").is_none());
         let a: AtlasSettings = t["atlas"].clone().try_into().unwrap();
         assert!(a == atlas(2.5));
         let _ = std::fs::remove_dir_all(&dir);
@@ -442,19 +419,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join("rec_g0_t0.imec0.ap.bin");
         std::fs::write(legacy_atlas_path(&bin), "ap_mm = -2.0\ndepth_mm = 3.5\n").unwrap();
-        std::fs::write(legacy_stim_path(&bin), "stim_file = \"/d/stims.csv\"\n[ttl]\nopacity_pct = 30.0\n").unwrap();
         std::fs::write(legacy_notch_path(&bin), "[[notches]]\nfreq_hz = 50.0\nbw_hz = 1.0\n").unwrap();
 
         let a = legacy_atlas(&bin).unwrap();
         assert_eq!((a.insertion.ap_mm, a.insertion.depth_mm), (-2.0, 3.5));
-        let s = legacy_stim(&bin).unwrap();
-        assert_eq!(s.stim_file.as_deref(), Some(Path::new("/d/stims.csv")));
-        assert_eq!(s.ttl.opacity_pct, 30.0);
         assert_eq!(legacy_notches(&bin).unwrap().len(), 1);
 
         save(&bin, Band::Ap, &RecordingSettings::default()).unwrap();
         assert!(legacy_atlas(&bin).is_none() && legacy_notches(&bin).is_none());
-        assert!(!legacy_stim_path(&bin).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
