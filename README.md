@@ -1,4 +1,4 @@
-# NPXplorer v0.7.0
+# NPXplorer v0.9.0
 
 A viewer for raw Neuropixels recordings. Shows the voltage of all channels as a heatmap laid out by the probe geometry.
 
@@ -12,6 +12,7 @@ A viewer for raw Neuropixels recordings. Shows the voltage of all channels as a 
 - Atlas registration with the Allen mouse brain atlas
 - Peri-stimulus averages (PSTH)
 - Event overlay (stimuli, TTL pulses, behavioural events)
+- Spike-sorted data overlay (phy / Kilosort output)
 - Screenshots of the plot area
 - Export of the preprocessed recording (SpikeGLX or Open Ephys format) for spike sorting
 
@@ -85,7 +86,7 @@ Marks dead (magenta), noisy (red) and out-of-brain (green) channels with a color
 
 ### Atlas registration
 
-Draws the borders between brain regions of the Allen mouse atlas (CCF 2017, 10 µm) on the heatmap, from the probe's insertion coordinates. It needs a folder with `annotation_10.nrrd` from the [Allen Institute](https://download.alleninstitute.org/informatics-archive/current-release/mouse_ccf/annotation/ccf_2017/) and the structure ontology saved as `query.csv` from the [Allen API](https://api.brain-map.org/api/v2/data/query.csv?criteria=model::Structure,rma::criteria,[ontology_id$eq1],rma::options[order$eq%27structures.graph_order%27][num_rows$eqall]). On the first load, the `.nrrd` is converted once into `annotation_10_npxplorer.npy` (2.4 GB) and `annotation_10_npxplorer_ids.txt` in the same folder, which takes a while and needs write access to the folder.
+Draws the borders between brain regions of the Allen mouse atlas (CCF 2017, 10 µm) on the heatmap, from the probe's insertion coordinates. It needs a folder, set in **Preferences → Default file locations…**, with `annotation_10.nrrd` from the [Allen Institute](https://download.alleninstitute.org/informatics-archive/current-release/mouse_ccf/annotation/ccf_2017/) and the structure ontology saved as `query.csv` from the [Allen API](https://api.brain-map.org/api/v2/data/query.csv?criteria=model::Structure,rma::criteria,[ontology_id$eq1],rma::options[order$eq%27structures.graph_order%27][num_rows$eqall]). On the first load, the `.nrrd` is converted once into `annotation_10_npxplorer.npy` (2.4 GB) and `annotation_10_npxplorer_ids.txt` in the same folder, which takes a while and needs write access to the folder.
 
 - **Insertion**: AP and ML in mm from bregma (AP positive = anterior, ML positive = right). Angles as **Azimuth / elevation / rotation** (azimuth from the lambda→bregma axis, elevation from horizontal) or **Polar / azimuth / roll** (polar angle from vertical, azimuth from +ML). Rotation/roll turns the probe around its axis, which matters for multi-shank probes.
 - **Depth**: from the brain surface to the tip, along the probe; the tip offset is the distance from the tip to the first electrode row (default 195 µm).
@@ -117,7 +118,13 @@ skips one header row, reads onsets from the first column and offsets from the se
 
 Shades the events on the heatmap and the waveform view, in the color of the firing rate overlay, and lists them as **Events** in the legend. The event file is read with the same layout as the PSTH. Offsets come from the `f` column(s); without one, each area is **Duration (ms)** long. **Emphasize on/offset** draws a thin line at each onset and offset.
 
-The event file last loaded in the Events or PSTH window is saved with the recording's settings, together with the Events and PSTH settings, and filled in when the recording is opened again (it is not loaded until **Load** or **Apply/Compute** is pressed).
+The event file last loaded in the Events or PSTH window is saved with the recording's settings, together with the Events and PSTH settings, and filled in when the recording is opened again (it is not loaded until **Load** or **Apply/Compute** is pressed). Without one, the default event file from **Preferences → Default file locations…** is filled in, if it exists. With **Load on start → Events** ticked there, the event file is loaded when the recording is opened: the recording's own one, or else the default.
+
+### Spike-sorted data
+
+**Load Spikes** asks for a phy folder (the output of Kilosort, iblsorter and other sorters that write the phy format), starting in the default folder from **Preferences → Default file locations…** (`ks` next to the recording, unless changed). With **Load on start → Spike-sorted data** ticked there, the default folder is loaded when the recording is opened. Each spike is drawn as a dot on the heatmap, at its time and on the channel where its template is largest (black with a white outline; white with a black outline on Cool-Warm). The dots grow as the time window gets shorter. With more than 20,000 spikes in the view, none are drawn and the legend asks you to zoom in. The legend lists the number of units and toggles the dots with **Show spikes**/**Hide spikes**. Spikes are drawn in the LF view too.
+
+Files read: `spike_times.npy`, `spike_templates.npy`, `templates.npy`, `channel_map.npy`, `params.py` (sample rate, channel count), and if present `spike_clusters.npy` (curated clusters), `templates_ind.npy` (sparse templates) and `cluster_group.tsv` (clusters labelled `noise` are not shown). The sorting must have been run on the open file, or on a file with the same channels: a different channel count in `params.py` (e.g. an export with channels removed) is refused. Spikes on removed channels are not drawn.
 
 ### Power Spectrum
 
@@ -132,7 +139,7 @@ The event file last loaded in the Events or PSTH window is saved with the record
 
 ### Screenshot
 
-**Screenshot** (top right) opens a window listing the overlays calculated so far (events, atlas regions, firing rate, power spectrum, channel classification), plus the selected-channel lines and the scale bar; tick the ones to include. **Save…** asks for a file name and saves the plot area (the heatmap with the spectrum panel, or the waveform view) as a PNG at screen resolution, without windows, the legend or the hover readout. The window closes once the image is saved.
+**Screenshot** (top right) opens a window listing the overlays calculated so far (events, spikes, atlas regions, firing rate, power spectrum, channel classification), plus the selected-channel lines and the scale bar; tick the ones to include. **Save…** asks for a file name and saves the plot area (the heatmap with the spectrum panel, or the waveform view) as a PNG at screen resolution, without windows, the legend or the hover readout. The window closes once the image is saved.
 
 ### Export preprocessed data
 
@@ -146,7 +153,7 @@ The window offers:
 - **Event blanking**: sets the data around each event of the **Events** window to 0 (**Blank**) or bridges it with a straight line (**Interpolate**), in a window from **Start** to **End** (ms, relative to the onset). **Around offsets** adds a second window around each offset; without an offset column in the event file, the offset is the onset plus **Event length**. Blanking runs before notch, highpass and spatial filter, so they don't spread the artifact.
 - **Write probe file for Kilosort 4**, and **Open export when done**.
 
-**Export…** opens a save dialog with a proposed name: the original's with `_preprocessed` and the time range added (e.g. `run_preprocessed_120-300s_g0_t0.imec0.ap.bin`); the original can't be overwritten. While the export runs, the window is frozen and greyed out and all CPU cores are used; **Abort** stops it and removes what was written. Noise suppression is a display filter and is not exported.
+**Export…** opens a save dialog, in the export folder from **Preferences → Default file locations…** if one is set (it is created if needed) or else next to the original, with a proposed name: the original's with `_preprocessed` and the time range added (e.g. `run_preprocessed_120-300s_g0_t0.imec0.ap.bin`); the original can't be overwritten. While the export runs, the window is frozen and greyed out and all CPU cores are used; **Abort** stops it and removes what was written. Noise suppression is a display filter and is not exported.
 
 Next to the export, NPXplorer writes:
 
@@ -160,6 +167,8 @@ Next to the export, NPXplorer writes:
 Every setting made for a recording, in the main window and in the tool windows (preprocessing, colour scale, time window, removed channels, noise suppression and notches, overlays, power spectrum, classification, events, PSTH, atlas registration), is saved in `<recording>.npxplorer.toml` next to the data file and applied when the recording is opened again. The AP and LF files of a recording share it: settings that differ between the bands are kept separately, the removed channels, event and atlas settings are shared. Overlays that take a computation (power spectrum, channel classification, PSTH) are not recomputed on opening; their settings are restored. The file is written about a second after a change and when the recording is closed. Files written by earlier versions (`.npx_atlas.toml`, `.npx_notch.toml`) are read and replaced by it.
 
 Preferences are saved in `config/npxplorer_prefs.toml` next to the executable, together with the default layout files for PSTH and Remove channels. They hold the settings that are not specific to a recording (atlas folder, buffer and memory limits, recent files) and the last-used settings, which a recording opened for the first time starts with.
+
+**Default file locations…** (top of Preferences) sets where files that belong to a recording are looked for, as paths relative to the recording's folder (`..` goes up a folder, e.g. `../ks`; absolute paths work too): the **Event file**, the **Spike-sorted data** folder (default `ks`) and the **Export folder** (empty: next to the recording). For Open Ephys, the recording's folder is the one holding `continuous.dat`. **Load on start** loads the events and/or the spike-sorted data when a recording is opened. The **Atlas folder** for Atlas registration is set there too.
 
 The **Buffer** section in Preferences controls how much of the recording is preprocessed ahead of time and the memory limits at which the buffer stops growing.
 
