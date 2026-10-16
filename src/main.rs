@@ -45,6 +45,7 @@ mod psth;
 mod render;
 mod settings;
 mod spectrum;
+mod spikes;
 mod events;
 mod export;
 mod export_ui;

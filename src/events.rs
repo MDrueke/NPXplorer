@@ -103,6 +103,20 @@ impl EventsState {
         (!self.onsets.is_empty()).then(|| (self.onsets.as_slice(), self.offsets.as_deref()))
     }
 
+    /// Load `path` (Load on start); returns whether it was loaded. On failure the
+    /// window shows why.
+    pub fn load_path(&mut self, path: &Path, layout_text: &str) -> bool {
+        self.path_text = path.to_string_lossy().into_owned();
+        self.load(layout_text)
+    }
+
+    /// Fill in `path` when no event file has been chosen yet.
+    pub fn suggest_path(&mut self, path: &Path) {
+        if self.path_text.trim().is_empty() {
+            self.path_text = path.to_string_lossy().into_owned();
+        }
+    }
+
     /// Returns whether the file was loaded.
     fn load(&mut self, layout_text: &str) -> bool {
         let path = PathBuf::from(self.path_text.trim());

@@ -242,6 +242,35 @@ impl AtlasUi {
         (!d.is_empty()).then(|| d.to_string())
     }
 
+    /// Atlas folder: text field, Browse… and the files it needs (Default file locations
+    /// window).
+    pub fn dir_editor(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.dir_text)
+                    .desired_width(300.0)
+                    .hint_text("folder with the atlas files"),
+            );
+            if resp.lost_focus() {
+                self.prefs_dirty = true;
+            }
+            if ui.button("Browse…").clicked() && self.pick_rx.is_none() {
+                self.pick_rx = Some(spawn_folder_picker(self.atlas_dir().map(PathBuf::from)));
+            }
+        });
+        ui.label(
+            egui::RichText::new(format!(
+                "needs {} + {} (NTE) or {} + {} (Allen)",
+                atlas::ANNOTATION_FILE,
+                atlas::STRUCTURE_TREE_FILE,
+                atlas::NRRD_FILE,
+                atlas::ALLEN_TREE_FILE
+            ))
+            .small()
+            .color(Color32::GRAY),
+        );
+    }
+
     pub fn bregma_lambda_mm(&self) -> f64 {
         self.ins.bregma_lambda_mm
     }
@@ -559,30 +588,11 @@ impl AtlasUi {
         let busy = self.busy();
 
         ui.label(egui::RichText::new("Atlas").strong());
-        ui.horizontal(|ui| {
-            ui.label("Folder:");
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.dir_text)
-                    .desired_width(300.0)
-                    .hint_text("folder with the atlas files"),
-            );
-            if resp.lost_focus() {
-                self.prefs_dirty = true;
-            }
-            if ui.button("Browse…").clicked() && self.pick_rx.is_none() {
-                self.pick_rx = Some(spawn_folder_picker(self.atlas_dir().map(PathBuf::from)));
-            }
-        });
+        ui.label(format!("Folder: {}", self.atlas_dir().as_deref().unwrap_or("not set")));
         ui.label(
-            egui::RichText::new(format!(
-                "needs {} + {} (NTE) or {} + {} (Allen)",
-                atlas::ANNOTATION_FILE,
-                atlas::STRUCTURE_TREE_FILE,
-                atlas::NRRD_FILE,
-                atlas::ALLEN_TREE_FILE
-            ))
-            .small()
-            .color(Color32::GRAY),
+            egui::RichText::new("set in Preferences → Default file locations")
+                .small()
+                .color(Color32::GRAY),
         );
         ui.horizontal(|ui| {
             ui.label("Bregma–lambda distance:");

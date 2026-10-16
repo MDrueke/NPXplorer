@@ -45,6 +45,9 @@ pub struct ColorMap {
     /// markers drawn directly on the heatmap: shank boundaries, "shank N" labels,
     /// first selected channel, scale bar, zoom notice text
     pub heatmap_fg: [u8; 3],
+    /// dots of the spike-sorted spikes and their outline
+    pub spike_fill: [u8; 3],
+    pub spike_outline: [u8; 3],
 }
 
 impl ColorMap {
@@ -126,6 +129,8 @@ colormaps! {
         atlas: WHITE,
         label_bg: C_ZERO,
         heatmap_fg: WHITE,
+        spike_fill: BLACK,
+        spike_outline: WHITE,
     },
     Riviera => ColorMap {
         name: "Riviera",
@@ -137,6 +142,8 @@ colormaps! {
         atlas: WHITE,
         label_bg: C_ZERO,
         heatmap_fg: WHITE,
+        spike_fill: BLACK,
+        spike_outline: WHITE,
     },
     YellowMagenta => ColorMap {
         name: "Yellow-Magenta",
@@ -148,6 +155,8 @@ colormaps! {
         atlas: WHITE,
         label_bg: C_ZERO,
         heatmap_fg: WHITE,
+        spike_fill: BLACK,
+        spike_outline: WHITE,
     },
     RedBlue => ColorMap {
         name: "Red-Blue",
@@ -159,6 +168,8 @@ colormaps! {
         atlas: WHITE,
         label_bg: C_ZERO,
         heatmap_fg: WHITE,
+        spike_fill: BLACK,
+        spike_outline: WHITE,
     },
     OrangeBlue => ColorMap {
         name: "Orange-Blue",
@@ -170,6 +181,8 @@ colormaps! {
         atlas: WHITE,
         label_bg: C_ZERO,
         heatmap_fg: WHITE,
+        spike_fill: BLACK,
+        spike_outline: WHITE,
     },
     IceFire => ColorMap {
         name: "Ice-Fire",
@@ -181,6 +194,8 @@ colormaps! {
         atlas: WHITE,
         label_bg: C_ZERO,
         heatmap_fg: WHITE,
+        spike_fill: BLACK,
+        spike_outline: WHITE,
     },
     Vanimo => ColorMap {
         name: "Vanimo",
@@ -192,6 +207,8 @@ colormaps! {
         atlas: WHITE,
         label_bg: C_ZERO,
         heatmap_fg: WHITE,
+        spike_fill: BLACK,
+        spike_outline: WHITE,
     },
     GreyScale => ColorMap {
         name: "Greyscale",
@@ -203,6 +220,8 @@ colormaps! {
         atlas: WHITE,
         label_bg: C_ZERO,
         heatmap_fg: WHITE,
+        spike_fill: BLACK,
+        spike_outline: WHITE,
     },
     /// matplotlib's "coolwarm" (Moreland) colors: blue - light grey - red. Oriented
     /// like the other maps, negative (spikes) in the warm color; unlike them, zero is
@@ -217,6 +236,8 @@ colormaps! {
         atlas: BLACK,
         label_bg: WHITE,
         heatmap_fg: rgb(0x191919),
+        spike_fill: WHITE,
+        spike_outline: BLACK,
     },
 }
 

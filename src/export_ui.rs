@@ -31,6 +31,8 @@ pub struct WindowInputs<'a> {
     pub view_s: (f64, f64),
     /// the preprocessing steps that will be applied, for display
     pub steps: String,
+    /// default export folder (Preferences → Default file locations)
+    pub export_dir: Option<PathBuf>,
 }
 
 /// What the app should do after drawing.
@@ -307,7 +309,11 @@ impl ExportUi {
             });
         });
         if export_clicked && self.validate(inp) && self.pick_rx.is_none() {
-            let dst = crate::export::default_destination(inp.src, format, self.settings.range_s);
+            let mut dst = crate::export::default_destination(inp.src, format, self.settings.range_s);
+            if let (Some(dir), Some(name)) = (&inp.export_dir, dst.file_name()) {
+                let _ = std::fs::create_dir_all(dir);
+                dst = dir.join(name);
+            }
             self.pick_rx = Some(spawn_save_dialog(dst, format));
             self.pick_format = format;
         }

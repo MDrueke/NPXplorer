@@ -1,6 +1,6 @@
 use egui::{CentralPanel, TextureHandle, TextureOptions, TopBottomPanel, Ui, Vec2};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -179,6 +179,45 @@ pub struct Preferences {
     pub spectrum_time_start_s: f64,
     #[serde(default = "default_spectrum_time_end_s")]
     pub spectrum_time_end_s: f64,
+    #[serde(default)]
+    pub file_locations: FileLocations,
+}
+
+/// Where to look for files that belong to a recording, relative to its folder
+/// (Preferences → Default file locations).
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct FileLocations {
+    /// event-times file
+    #[serde(alias = "ttl")]
+    pub events: String,
+    /// phy folder with the spike-sorted data
+    pub spikes: String,
+    /// folder the export's save dialog starts in (empty: next to the recording)
+    pub export: String,
+    #[serde(alias = "load_ttl_on_start")]
+    pub load_events_on_start: bool,
+    pub load_spikes_on_start: bool,
+}
+
+impl Default for FileLocations {
+    fn default() -> Self {
+        Self {
+            events: String::new(),
+            spikes: "ks".into(),
+            export: String::new(),
+            load_events_on_start: false,
+            load_spikes_on_start: false,
+        }
+    }
+}
+
+impl FileLocations {
+    /// `rel` in the recording's folder (`None` if not set).
+    fn resolve(rel: &str, bin_path: &Path) -> Option<PathBuf> {
+        let rel = rel.trim();
+        (!rel.is_empty()).then(|| bin_path.parent().unwrap_or(Path::new("")).join(rel))
+    }
 }
 
 impl Preferences {
@@ -670,6 +709,8 @@ pub struct NPXplorerApp {
 
     // preferences
     show_preferences: bool,
+    show_file_locations: bool,
+    file_locations: FileLocations,
     spike_threshold: f32,
     show_firing_rate_overlay: bool,
     spike_overlay_scale: f32,
@@ -808,6 +849,7 @@ pub struct NPXplorerApp {
     psth: PsthState,
     atlas: crate::atlas_ui::AtlasUi,
     events: crate::events::EventsState,
+    spikes: crate::spikes::SpikesState,
     /// event-file format text shared by the PSTH and Events windows
     event_layout_text: String,
     /// event file last loaded in the Events or PSTH window (saved per recording)
@@ -837,6 +879,7 @@ const SETTINGS_SAVE_DELAY: std::time::Duration = std::time::Duration::from_secs(
 #[derive(Clone, Copy, PartialEq)]
 struct ShotOverlays {
     events: bool,
+    spikes: bool,
     atlas: bool,
     firing_rate: bool,
     spectrum: bool,
@@ -925,6 +968,7 @@ impl NPXplorerApp {
         let mut spectrum_time_restrict = false;
         let mut spectrum_time_start_s = 0.0;
         let mut spectrum_time_end_s = default_spectrum_time_end_s();
+        let mut file_locations = FileLocations::default();
 
         if let Some(p) = prefs {
             preproc_cfg = p.preproc_cfg;
@@ -947,6 +991,7 @@ impl NPXplorerApp {
             classify_outside_rule = p.classify_outside_rule;
             peak_pooling = p.peak_pooling;
             atlas_dir = p.atlas_dir;
+            file_locations = p.file_locations;
             bregma_lambda_mm = p.bregma_lambda_mm;
             atlas_min_region_channels = p.atlas_min_region_channels;
             noise = p.noise_suppression;
@@ -1045,6 +1090,8 @@ impl NPXplorerApp {
             color_uv_str: format!("{:.0}", color_uv),
             colormap_choice,
             show_preferences: false,
+            show_file_locations: false,
+            file_locations,
             spike_threshold,
             show_firing_rate_overlay,
             spike_overlay_scale,
@@ -1136,6 +1183,7 @@ impl NPXplorerApp {
             psth,
             atlas: crate::atlas_ui::AtlasUi::new(&meta_for_atlas, atlas_dir, atlas_settings, atlas_min_region_channels),
             events: crate::events::EventsState::new(&event_settings.window, event_settings.event_file.as_deref()),
+            spikes: Default::default(),
             event_layout_text: event_settings.layout.clone().unwrap_or_else(crate::psth::default_layout_text),
             event_file: event_settings.event_file.clone(),
             band,
@@ -1192,7 +1240,33 @@ impl NPXplorerApp {
         self.request_recompute();
         let meta = Arc::clone(&self.meta);
         self.atlas.register_on_open(ctx, &meta);
+        self.load_on_start(ctx);
         self.save_settings();
+    }
+
+    /// Events and spike-sorted data from their default locations (Preferences → Default
+    /// file locations). A recording's own event file takes precedence over the default.
+    fn load_on_start(&mut self, ctx: &egui::Context) {
+        let loc = self.file_locations.clone();
+        let default_events = FileLocations::resolve(&loc.events, &self.bin_path).filter(|p| p.is_file());
+        if let Some(p) = &default_events {
+            self.events.suggest_path(p);
+        }
+        if loc.load_events_on_start {
+            let saved = self.event_file.clone().filter(|p| p.is_file());
+            if let Some(p) = saved.or(default_events) {
+                if self.events.load_path(&p, &self.event_layout_text) {
+                    self.event_file = Some(p);
+                } else {
+                    self.events.open = true;
+                }
+            }
+        }
+        if loc.load_spikes_on_start {
+            if let Some(dir) = FileLocations::resolve(&loc.spikes, &self.bin_path).filter(|d| crate::spikes::is_phy_dir(d)) {
+                self.spikes.start_load(ctx, dir, &self.meta);
+            }
+        }
     }
 }
 
@@ -1432,6 +1506,7 @@ impl NPXplorerApp {
             spectrum_time_restrict: self.spectrum_time_restrict,
             spectrum_time_start_s: self.spectrum_time_start_s,
             spectrum_time_end_s: self.spectrum_time_end_s,
+            file_locations: self.file_locations.clone(),
         };
         prefs.save();
     }
@@ -1658,6 +1733,54 @@ impl NPXplorerApp {
                     self.classifying = false;
                 }
             }
+        }
+    }
+
+    /// Preferences → Default file locations: where the event file, the spike-sorted data
+    /// and exports go, relative to the recording's folder, whether events and spikes are
+    /// loaded when a recording is opened, and the atlas folder.
+    fn draw_file_locations_window(&mut self, ctx: &egui::Context) {
+        if !self.show_file_locations {
+            return;
+        }
+        let before = self.file_locations.clone();
+        let mut open = true;
+        egui::Window::new("Default file locations")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let loc = &mut self.file_locations;
+                ui.label(
+                    egui::RichText::new("relative to the recording's folder (.. goes up a folder, e.g. ../ks); absolute paths work too")
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+                egui::Grid::new("file_locations_grid").num_columns(2).show(ui, |ui| {
+                    ui.label("Event file:");
+                    ui.add(egui::TextEdit::singleline(&mut loc.events).desired_width(260.0).hint_text("e.g. events.csv"));
+                    ui.end_row();
+                    ui.label("Spike-sorted data:");
+                    ui.add(egui::TextEdit::singleline(&mut loc.spikes).desired_width(260.0).hint_text("phy folder, e.g. ks"));
+                    ui.end_row();
+                    ui.label("Export folder:");
+                    ui.add(egui::TextEdit::singleline(&mut loc.export).desired_width(260.0).hint_text("empty: next to the recording"));
+                    ui.end_row();
+                });
+
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Load on start").strong());
+                ui.checkbox(&mut loc.load_events_on_start, "Events")
+                    .on_hover_text("Loads the recording's last event file, or else the default one, with the recording's event-file format");
+                ui.checkbox(&mut loc.load_spikes_on_start, "Spike-sorted data");
+
+                ui.separator();
+                ui.label(egui::RichText::new("Atlas folder").strong());
+                self.atlas.dir_editor(ui);
+            });
+        self.show_file_locations = open;
+        if self.file_locations != before {
+            self.save_prefs();
         }
     }
 
@@ -2169,6 +2292,7 @@ impl NPXplorerApp {
     fn overlay_visibility(&self) -> ShotOverlays {
         ShotOverlays {
             events: self.events.show_overlay,
+            spikes: self.spikes.show_overlay,
             atlas: self.atlas.show_overlay,
             firing_rate: self.show_firing_rate_overlay,
             spectrum: self.spectrum_show_overlay,
@@ -2180,6 +2304,7 @@ impl NPXplorerApp {
 
     fn set_overlay_visibility(&mut self, v: ShotOverlays) {
         self.events.show_overlay = v.events;
+        self.spikes.show_overlay = v.spikes;
         self.atlas.show_overlay = v.atlas;
         if v.firing_rate != self.show_firing_rate_overlay {
             self.show_firing_rate_overlay = v.firing_rate;
@@ -2197,6 +2322,7 @@ impl NPXplorerApp {
         self.capture.as_ref().map_or(
             ShotOverlays {
                 events: true,
+                spikes: true,
                 atlas: true,
                 firing_rate: true,
                 spectrum: true,
@@ -2264,6 +2390,7 @@ impl NPXplorerApp {
                     }
                 };
                 item(ui, self.events.has_data(), &mut inc.events, "Events");
+                item(ui, !waveform && self.spikes.has_data(), &mut inc.spikes, "Spikes");
                 item(ui, !waveform && self.atlas.has_data(), &mut inc.atlas, "Atlas regions");
                 item(ui, !waveform && !self.projection_sums.is_empty(), &mut inc.firing_rate, "Firing rate");
                 item(ui, !waveform && spectrum, &mut inc.spectrum, "Power spectrum");
@@ -2338,6 +2465,7 @@ impl NPXplorerApp {
             has_events: self.events.has_data(),
             view_s: (self.view_start_s, self.view_dur_s),
             steps,
+            export_dir: FileLocations::resolve(&self.file_locations.export, &self.bin_path),
         };
         let req = self.export_ui.draw_window(ctx, &inputs);
         self.handle_export_requests(vec![req], ctx);
@@ -3113,6 +3241,15 @@ impl NPXplorerApp {
                 ui.add(egui::Separator::default().vertical().spacing(1.0));
                 if ui.button("Atlas Registration").clicked() {
                     self.atlas.open = !self.atlas.open;
+                }
+                ui.add(egui::Separator::default().vertical().spacing(1.0));
+                if ui
+                    .add_enabled(!self.spikes.loading(), egui::Button::new("Load Spikes"))
+                    .on_hover_text("Load spike-sorted data (a phy / Kilosort output folder) and show the spikes on the heatmap")
+                    .clicked()
+                {
+                    let default = FileLocations::resolve(&self.file_locations.spikes, &self.bin_path).filter(|d| d.is_dir());
+                    self.spikes.pick_and_load(default.or_else(|| self.bin_path.parent().map(Path::to_path_buf)));
                 }
                 ui.add(egui::Separator::default().vertical().spacing(1.0));
                 if ui
@@ -3951,6 +4088,8 @@ impl NPXplorerApp {
             (self.atlas.busy(), title("atlas_progress_window"), 11),
             (self.export_ui.open, title("Export preprocessed data"), 12),
             (export_result.is_some(), title(export_result.unwrap_or_default()), 13),
+            (self.show_file_locations, title("Default file locations"), 14),
+            (self.spikes.error.is_some(), title("Loading spike-sorted data failed"), 15),
         ]
         .into_iter()
         .filter(|(is_open, ..)| *is_open)
@@ -4000,7 +4139,9 @@ impl NPXplorerApp {
             10 => self.classify_cancel.store(true, Ordering::Relaxed),
             11 => self.atlas.abort(),
             12 => self.export_ui.open = false,
-            _ => self.export_ui.close_result(),
+            13 => self.export_ui.close_result(),
+            14 => self.show_file_locations = false,
+            _ => self.spikes.error = None,
         }
     }
 
@@ -4023,7 +4164,11 @@ impl NPXplorerApp {
         self.poll_spectrum(ctx);
         self.notch_panel.poll(ctx);
         self.atlas.poll(ctx);
+        let meta = Arc::clone(&self.meta);
+        self.spikes.poll(ctx, &meta);
         if !capturing {
+            self.spikes.draw_error_window(ctx);
+            self.draw_file_locations_window(ctx);
             self.draw_psth_window(ctx);
             self.draw_remove_channels_window(ctx);
             self.draw_classify_progress_window(ctx);
@@ -4063,6 +4208,10 @@ impl NPXplorerApp {
                     egui::ScrollArea::vertical()
                         .max_height(ui.ctx().screen_rect().height() - 80.0)
                         .show(ui, |ui| {
+                    if ui.button("Default file locations…").clicked() {
+                        self.show_file_locations = !self.show_file_locations;
+                    }
+                    ui.separator();
                     ui.label(egui::RichText::new("Appearance").strong());
 
                     ui.horizontal(|ui| {
@@ -5126,6 +5275,18 @@ impl NPXplorerApp {
                             &self.colormap_choice,
                         );
 
+                        // spike-sorted spikes, on top of the other overlays
+                        self.spikes.draw_overlay(
+                            &ui.painter_at(resp.rect),
+                            resp.rect,
+                            self.view_start_s,
+                            self.view_dur_s,
+                            display_rows,
+                            first_row,
+                            last_row,
+                            &self.colormap_choice,
+                        );
+
                         // legend box: one Show/Hide row per overlay that has been computed
                         // this session (Events, Atlas, firing rate, power spectrum, channel
                         // classification), pinned to the heatmap's bottom-right corner just
@@ -5134,6 +5295,7 @@ impl NPXplorerApp {
                         if self.capture.is_none()
                             && (self.channel_labels.is_some()
                                 || self.events.has_data()
+                                || self.spikes.has_data()
                                 || self.atlas.has_data()
                                 || !self.projection_sums.is_empty()
                                 || self.spectrum_result.is_some())
@@ -5184,6 +5346,35 @@ impl NPXplorerApp {
                                             }
                                             let label = if self.events.show_overlay { "Hide events" } else { "Show events" };
                                             ui.toggle_value(&mut self.events.show_overlay, label);
+                                            any_above = true;
+                                        }
+
+                                        if self.spikes.has_data() {
+                                            if any_above {
+                                                ui.add_space(4.0);
+                                            }
+                                            if self.spikes.show_overlay {
+                                                let spec = self.colormap_choice.spec();
+                                                ui.horizontal(|ui| {
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        egui::vec2(12.0, 12.0),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    let [r, g, b] = spec.spike_outline;
+                                                    ui.painter().circle(
+                                                        rect.center(),
+                                                        3.5,
+                                                        egui::Color32::from_rgb(spec.spike_fill[0], spec.spike_fill[1], spec.spike_fill[2]),
+                                                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(r, g, b)),
+                                                    );
+                                                    ui.label(format!("Spikes ({} units)", self.spikes.n_units()));
+                                                });
+                                                if let Some(n) = self.spikes.too_many() {
+                                                    ui.label(format!("{n} in view: zoom in to show them"));
+                                                }
+                                            }
+                                            let label = if self.spikes.show_overlay { "Hide spikes" } else { "Show spikes" };
+                                            ui.toggle_value(&mut self.spikes.show_overlay, label);
                                             any_above = true;
                                         }
 

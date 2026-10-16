@@ -183,14 +183,14 @@ pub struct AnnotationVolume {
     synthetic: Option<fn(usize, usize, usize) -> u16>,
 }
 
-struct NpyHeader {
-    data_offset: usize,
-    descr: String,
-    fortran_order: bool,
-    shape: Vec<usize>,
+pub(crate) struct NpyHeader {
+    pub(crate) data_offset: usize,
+    pub(crate) descr: String,
+    pub(crate) fortran_order: bool,
+    pub(crate) shape: Vec<usize>,
 }
 
-fn parse_npy_header(bytes: &[u8]) -> Result<NpyHeader> {
+pub(crate) fn parse_npy_header(bytes: &[u8]) -> Result<NpyHeader> {
     if bytes.len() < 10 || &bytes[..6] != b"\x93NUMPY" {
         bail!("not a .npy file (bad magic)");
     }
