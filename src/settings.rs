@@ -34,6 +34,9 @@ pub struct RecordingSettings {
     pub events: Option<EventSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub atlas: Option<AtlasSettings>,
+    /// spike-sorted data folder and unit filters
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spikes: Option<crate::spikes::SpikeSettings>,
     /// options of the export window
     #[serde(skip_serializing_if = "Option::is_none")]
     pub export: Option<crate::export::ExportSettings>,
@@ -234,7 +237,7 @@ pub fn save(bin_path: &Path, band: Band, settings: &RecordingSettings) -> Result
     let path = path(bin_path);
     let mut table = load_table(bin_path);
     let mine = toml::Table::try_from(settings)?;
-    for k in ["removed_channels", "events", "atlas", "export", band.key()] {
+    for k in ["removed_channels", "events", "atlas", "spikes", "export", band.key()] {
         match mine.get(k) {
             Some(v) => table.insert(k.to_string(), v.clone()),
             None => table.remove(k),
