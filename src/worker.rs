@@ -1,137 +1,389 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
+
+use rayon::prelude::*;
 
 use crate::data::{DisplayRow, Meta, RawData};
-use crate::preprocess::{Filters, PreprocConfig, preprocess};
+use crate::preprocess::{preprocess, Filters, PreprocConfig, SpatialFilter};
 
-// overlap samples used when stitching an extension chunk — gives the temporal
-// highpass enough data to settle before the new samples we actually keep
-pub const EXTENSION_OVERLAP_SAMP: usize = 2000;
+// samples read beyond each edge of a block so the filters (filtfilt) settle before
+// the samples that are kept
+pub const MIN_OVERLAP_SAMP: usize = 2000;
+const MIN_BLOCK_S: f64 = 2.0;
+// blocks are at least this many overlaps long, so the overlap costs ≤ ~10 % extra work
+const BLOCK_PER_OVERLAP: usize = 10;
+// background fill reaches this many times further ahead (scroll direction) than behind
+const BEHIND_WEIGHT: usize = 3;
+// |values| kept per block for the colour scale
+const PCT_SAMPLES_PER_BLOCK: usize = 20_000;
+// i16 storage range relative to the ADC's full range (room for CMR / filter overshoot)
+const QUANT_HEADROOM: f64 = 4.0;
+// how often an idle worker re-checks free memory (other apps may grow or shrink)
+const IDLE_RECHECK: Duration = Duration::from_secs(1);
+
+/// Percentile lookup table: vmax_pct[p] = p-th percentile of |data| (p = 0..=100.0, 0.01 steps).
+pub type PctTable = Box<[f32; 10001]>;
+
+// ---------------------------------------------------------------------------
+// Block cache
+// ---------------------------------------------------------------------------
+
+struct Block {
+    /// [row][sample], µV = value * step_uv
+    data: Vec<i16>,
+    /// sorted sample of |µV|, for the colour scale
+    abs_sample: Vec<f32>,
+}
+
+impl Block {
+    fn bytes(&self) -> usize {
+        self.data.len() * 2 + self.abs_sample.len() * 4
+    }
+}
+
+static NEXT_CACHE_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Preprocessed data for one config, in fixed-size time blocks.
+pub struct BlockCache {
+    id: u64,
+    cfg: PreprocConfig,
+    display_rows: Arc<Vec<DisplayRow>>,
+    n_rows: usize,
+    n_samples: usize,
+    block_samp: usize,
+    overlap: usize,
+    step_uv: f32,
+    /// destripe AGC floors of the first block computed — reused by every later block,
+    /// so neighbouring blocks get the same floor and no seam appears
+    agc_eps: Option<Arc<Vec<f32>>>,
+    blocks: HashMap<usize, Arc<Block>>,
+    bytes: usize,
+}
+
+impl BlockCache {
+    fn new(cfg: &PreprocConfig, meta: &Meta, filt: &Filters) -> Self {
+        let display_rows = Arc::new(meta.build_display_rows(cfg.avg_depths, &cfg.removed_channels, cfg.channel_order, cfg.shank_order));
+        let n_rows = display_rows.iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
+        let fs = meta.sample_rate;
+        let mut overlap = MIN_OVERLAP_SAMP.max((crate::notch::settle_s(cfg) * fs).ceil() as usize);
+        if cfg.spatial_filter == SpatialFilter::Destripe {
+            overlap = overlap.max(filt.kfilt_lagc);
+        }
+        let block_samp = ((MIN_BLOCK_S * fs) as usize).max(BLOCK_PER_OVERLAP * overlap);
+        let max_uv_per_bit = meta.uv_per_bit.iter().fold(0.0f32, |a, &b| a.max(b)) as f64;
+        let step_uv = (max_uv_per_bit * meta.max_int * QUANT_HEADROOM / 32767.0).max(1e-3) as f32;
+        BlockCache {
+            id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+            cfg: cfg.clone(),
+            display_rows,
+            n_rows,
+            n_samples: meta.n_samples,
+            block_samp,
+            overlap,
+            step_uv,
+            agc_eps: None,
+            blocks: HashMap::new(),
+            bytes: 0,
+        }
+    }
+
+    fn n_blocks(&self) -> usize {
+        self.n_samples.div_ceil(self.block_samp)
+    }
+
+    fn block_len(&self, b: usize) -> usize {
+        self.block_samp.min(self.n_samples - b * self.block_samp)
+    }
+
+    /// Blocks overlapping samples [first, end).
+    fn range(&self, first: usize, end: usize) -> std::ops::Range<usize> {
+        let end = end.min(self.n_samples);
+        if end <= first {
+            return 0..0;
+        }
+        first / self.block_samp..(end - 1) / self.block_samp + 1
+    }
+
+    fn block_bytes(&self) -> usize {
+        self.n_rows * self.block_samp * 2 + PCT_SAMPLES_PER_BLOCK * 4
+    }
+
+    fn insert(&mut self, b: usize, block: Block) {
+        self.bytes += block.bytes();
+        if let Some(old) = self.blocks.insert(b, Arc::new(block)) {
+            self.bytes -= old.bytes();
+        }
+    }
+
+    fn evict(&mut self, b: usize) {
+        if let Some(old) = self.blocks.remove(&b) {
+            self.bytes -= old.bytes();
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum WorkerStatus {
-    Idle,
-    Computing,
-    Done,
-}
-
-/// Percentile lookup table: vmax_pct[p] = p-th percentile of |data| (p = 0..=100.0, 0.01 steps).
-pub type PctTable = Box<[f32; 10001]>;
-
-pub struct PreprocBuffer {
-    pub first_sample: usize,
-    pub n_samp: usize,
-    /// Layout: data[row_idx * n_samp .. (row_idx+1) * n_samp], µV
-    pub data: Arc<Vec<f32>>,
+/// What the UI wants preprocessed; posted every frame it changes.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Plan {
     pub cfg: PreprocConfig,
-    pub display_rows: Arc<Vec<DisplayRow>>,
-    /// Percentile table of |data| values (0..=100.0).
-    pub vmax_pct: PctTable,
-    /// Destripe AGC floors of the full recompute this buffer grew from — reused by
-    /// every extension so stitched chunks match the rest of the buffer
-    pub agc_eps: Arc<Vec<f32>>,
+    pub view_first: usize,
+    pub view_n: usize,
+    /// last scroll direction: +1 forward, -1 backward
+    pub direction: i32,
+    /// kept preprocessed on both sides of the view, before anything else
+    pub around_samp: usize,
+    /// keep filling beyond `around_samp` until the memory budget is used
+    pub background: bool,
+    /// the cache grows to at most this share of available memory (its own size counted as available)
+    pub budget_pct: f32,
+    /// blocks are evicted when available memory drops below this
+    pub reserve_bytes: u64,
 }
 
 pub struct WorkerState {
-    pub buffer: Option<PreprocBuffer>,
-    pub status: WorkerStatus,
-    pub request: Option<WorkerRequest>,
-    pub active_request: Option<WorkerRequest>,
+    cache: Option<BlockCache>,
+    plan: Option<Plan>,
+    /// block being computed, and whether it is background fill
+    active: Option<(usize, bool)>,
+    shutdown: bool,
 }
 
 impl WorkerState {
     pub fn new() -> Self {
-        WorkerState { buffer: None, status: WorkerStatus::Idle, request: None, active_request: None }
+        WorkerState { cache: None, plan: None, active: None, shutdown: false }
     }
-}
-
-#[derive(Clone, Debug)]
-pub enum RequestKind {
-    Full { center_sample: usize, half_window: usize },
-    Extend {
-        direction: i32,
-        extension_samp: usize,
-        view_first: usize,
-        view_n: usize,
-        /// cap on total buffer size (samples) — growth stops (net-zero) once reached
-        max_buffer_samp: usize,
-        /// trigger net-zero growth early if system-available memory drops below this
-        /// percentage of total (0-100)
-        mem_pressure_pct: f32,
-        /// ...or below this absolute number of free bytes, whichever hits first
-        mem_reserve_bytes: u64,
-    },
-    /// Exit the worker thread (sent when the recording is closed), releasing its
-    /// thread pool, the buffer and the mapped file.
-    Shutdown,
-}
-
-#[derive(Clone, Debug)]
-pub struct WorkerRequest {
-    pub kind: RequestKind,
-    pub cfg: PreprocConfig,
 }
 
 pub type SharedWorkerState = Arc<(Mutex<WorkerState>, Condvar)>;
 pub type SharedCancel = Arc<AtomicBool>;
 
-// ---------------------------------------------------------------------------
-// Percentile table
-// ---------------------------------------------------------------------------
-
-/// Largest number of |values| sampled for the percentile table.
-const PCT_MAX_SAMPLES: usize = 500_000;
-
-fn compute_pct_table(data: &[f32]) -> PctTable {
-    use rayon::prelude::*;
-    let mut table = Box::new([0.0f32; 10001]);
-    if data.is_empty() {
-        return table;
+/// Hand the worker a new plan. The block being computed is cancelled if it was made
+/// for another config, or if the view now lacks a block and this one isn't it.
+pub fn post_plan(shared: &SharedWorkerState, cancel: &SharedCancel, plan: Plan) {
+    let (lock, cvar) = &**shared;
+    let mut st = lock.lock().unwrap();
+    if st.plan.as_ref() == Some(&plan) {
+        return;
     }
-    let step = (data.len() / PCT_MAX_SAMPLES).max(1);
-    let mut vals: Vec<f32> = data.iter().step_by(step).map(|v| v.abs()).collect();
-    vals.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = vals.len();
-    for p in 0..=10000usize {
-        let idx = ((p * (n - 1)) / 10000).min(n - 1);
-        table[p] = vals[idx];
+    if let (Some((b, _)), Some(c)) = (st.active, &st.cache) {
+        let view = c.range(plan.view_first, plan.view_first + plan.view_n);
+        let view_missing = view.clone().any(|v| !c.blocks.contains_key(&v));
+        if c.cfg != plan.cfg || (view_missing && !view.contains(&b)) {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
-    table
+    st.plan = Some(plan);
+    cvar.notify_one();
+}
+
+/// Ask the worker to exit; returns immediately.
+pub fn request_shutdown(shared: &SharedWorkerState, cancel: &SharedCancel) {
+    cancel.store(true, Ordering::Relaxed);
+    let (lock, cvar) = &**shared;
+    lock.lock().unwrap().shutdown = true;
+    cvar.notify_one();
+}
+
+/// True while a block the view needs (not background fill) is being computed.
+pub fn computing_foreground(shared: &SharedWorkerState) -> bool {
+    matches!(shared.0.lock().unwrap().active, Some((_, false)))
+}
+
+/// Cached extents as (first_sample, n_samp), consecutive blocks merged.
+pub fn cached_runs(shared: &SharedWorkerState) -> Vec<(usize, usize)> {
+    let st = shared.0.lock().unwrap();
+    let Some(c) = &st.cache else { return Vec::new() };
+    let mut idx: Vec<usize> = c.blocks.keys().copied().collect();
+    idx.sort_unstable();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for b in idx {
+        let (first, n) = (b * c.block_samp, c.block_len(b));
+        match runs.last_mut() {
+            Some(r) if r.0 + r.1 == first => r.1 += n,
+            _ => runs.push((first, n)),
+        }
+    }
+    runs
+}
+
+pub fn cache_display_rows(shared: &SharedWorkerState) -> Option<Arc<Vec<DisplayRow>>> {
+    shared.0.lock().unwrap().cache.as_ref().map(|c| Arc::clone(&c.display_rows))
 }
 
 // ---------------------------------------------------------------------------
-// Half-window size
+// View window
 // ---------------------------------------------------------------------------
 
-/// Half of the initial/full-recompute buffer size, in samples. `initial_buffer_s` is
-/// the total width of that buffer (view sits at its center); this also doubles as the
-/// steady-state cap that incremental extension growth is trimmed back to.
-pub fn compute_half_window(initial_buffer_s: f64, sample_rate: f64) -> usize {
-    (initial_buffer_s / 2.0 * sample_rate) as usize
+/// Contiguous f32 copy of the cached blocks around the view — what the heatmap,
+/// waveform view and overlays read. Layout: data[row * n_samp + t], µV.
+pub struct ViewWindow {
+    pub first_sample: usize,
+    pub n_samp: usize,
+    pub data: Arc<Vec<f32>>,
+    pub cfg: PreprocConfig,
+    pub display_rows: Arc<Vec<DisplayRow>>,
+    /// percentiles of |data| over the view's blocks ±1
+    pub vmax_pct: PctTable,
+    key: (u64, std::ops::Range<usize>, Vec<usize>),
+}
+
+/// Rebuild `window` if the cached blocks it should consist of have changed. It covers
+/// the view ± half a view width (at most one block), rounded out to whole blocks; with gaps, the run of
+/// cached blocks that covers most of the view. Left untouched if the cache is for
+/// another config or has nothing near the view.
+pub fn update_view_window(
+    shared: &SharedWorkerState,
+    window: &mut Option<ViewWindow>,
+    view_first: usize,
+    view_n: usize,
+    cfg: &PreprocConfig,
+) {
+    let (key, blocks, pct_blocks, cfg, display_rows, block_samp, step_uv, n_rows) = {
+        let st = shared.0.lock().unwrap();
+        let Some(c) = &st.cache else { return };
+        if c.cfg != *cfg {
+            return;
+        }
+        let view = c.range(view_first, view_first + view_n);
+        let pad = (view_n / 2).min(c.block_samp);
+        let wanted = c.range(view_first.saturating_sub(pad), view_first + view_n + pad);
+
+        // runs of cached blocks inside `wanted`; keep the one sharing most blocks with the view
+        let mut best: Option<std::ops::Range<usize>> = None;
+        let mut b = wanted.start;
+        while b < wanted.end {
+            if !c.blocks.contains_key(&b) {
+                b += 1;
+                continue;
+            }
+            let start = b;
+            while b < wanted.end && c.blocks.contains_key(&b) {
+                b += 1;
+            }
+            let shared_blocks = |r: &std::ops::Range<usize>| r.end.min(view.end).saturating_sub(r.start.max(view.start));
+            if best.as_ref().map_or(true, |r| shared_blocks(&(start..b)) > shared_blocks(r)) {
+                best = Some(start..b);
+            }
+        }
+        let Some(run) = best else { return };
+        let pct_blocks: Vec<usize> = (view.start.saturating_sub(1)..view.end + 1)
+            .filter(|b| c.blocks.contains_key(b))
+            .collect();
+        let key = (c.id, run.clone(), pct_blocks.clone());
+        if window.as_ref().is_some_and(|w| w.key == key) {
+            return;
+        }
+        let blocks: Vec<(usize, Arc<Block>)> = run.clone().map(|b| (c.block_len(b), Arc::clone(&c.blocks[&b]))).collect();
+        let pct_blocks: Vec<Arc<Block>> = pct_blocks.iter().map(|b| Arc::clone(&c.blocks[b])).collect();
+        (key, blocks, pct_blocks, c.cfg.clone(), Arc::clone(&c.display_rows), c.block_samp, c.step_uv, c.n_rows)
+    };
+
+    let first_sample = key.1.start * block_samp;
+    let n_samp: usize = blocks.iter().map(|(len, _)| len).sum();
+    let mut data = vec![0.0f32; n_rows * n_samp];
+    if n_samp > 0 {
+        data.par_chunks_mut(n_samp).enumerate().for_each(|(r, row)| {
+            let mut off = 0;
+            for (len, blk) in &blocks {
+                for (o, &v) in row[off..off + len].iter_mut().zip(&blk.data[r * len..(r + 1) * len]) {
+                    *o = v as f32 * step_uv;
+                }
+                off += len;
+            }
+        });
+    }
+
+    let mut vals: Vec<f32> = pct_blocks.iter().flat_map(|b| b.abs_sample.iter().copied()).collect();
+    vals.par_sort_unstable_by(|a, b| a.total_cmp(b));
+    let mut vmax_pct = Box::new([0.0f32; 10001]);
+    if !vals.is_empty() {
+        let n = vals.len();
+        for p in 0..=10000usize {
+            vmax_pct[p] = vals[p * (n - 1) / 10000];
+        }
+    }
+
+    *window = Some(ViewWindow { first_sample, n_samp, data: Arc::new(data), cfg, display_rows, vmax_pct, key });
 }
 
 // ---------------------------------------------------------------------------
-// Memory pressure check
+// Scheduling
 // ---------------------------------------------------------------------------
 
-/// True if system-available memory is low by either the percentage or absolute
-/// threshold. Used to decide whether buffer growth should stop (net-zero) early.
-fn memory_pressure(mem_pressure_pct: f32, mem_reserve_bytes: u64) -> bool {
-    use sysinfo::System;
-    let mut sys = System::new();
-    sys.refresh_memory();
-    let total = sys.total_memory();
-    if total == 0 {
-        return false; // can't determine — assume no pressure rather than stall growth
+/// Fill / eviction priority of block `b` (lower first): distance from the view, with
+/// distance behind the scroll direction weighted `BEHIND_WEIGHT` times.
+fn score(c: &BlockCache, p: &Plan, b: usize) -> usize {
+    let start = b * c.block_samp;
+    let end = start + c.block_len(b);
+    let view_end = p.view_first + p.view_n;
+    let (d, ahead) = if start >= view_end {
+        (start - view_end, p.direction >= 0)
+    } else if end <= p.view_first {
+        (p.view_first - end, p.direction < 0)
+    } else {
+        (0, true)
+    };
+    if ahead { d } else { d * BEHIND_WEIGHT }
+}
+
+/// Next block to compute (and whether it is background fill), evicting blocks to stay
+/// within budget. View blocks first, then the `around` margin, then background fill.
+/// The view and margin are always computed and never evicted, whatever the memory.
+fn next_block(c: &mut BlockCache, p: &Plan, available: u64) -> Option<(usize, bool)> {
+    let view = c.range(p.view_first, p.view_first + p.view_n);
+    if let Some(b) = view.clone().find(|b| !c.blocks.contains_key(b)) {
+        return Some((b, false));
     }
-    let available = sys.available_memory();
-    let pct_free = available as f64 / total as f64 * 100.0;
-    pct_free < mem_pressure_pct as f64 || available < mem_reserve_bytes
+    let protected = c.range(p.view_first.saturating_sub(p.around_samp), p.view_first + p.view_n + p.around_samp);
+    if let Some(b) = protected.clone().filter(|b| !c.blocks.contains_key(b)).min_by_key(|&b| score(c, p, b)) {
+        return Some((b, false));
+    }
+
+    let block_bytes = c.block_bytes();
+    let reserve = p.reserve_bytes as usize;
+    // memory freed by evictions here counts as available again
+    let mut avail = available as usize;
+    let cap = if p.background {
+        ((avail + c.bytes) as f64 * p.budget_pct as f64 / 100.0) as usize
+    } else {
+        // without background fill keep twice the margin, so scrolling back and forth
+        // doesn't recompute what was just evicted
+        2 * protected.len() * block_bytes
+    };
+    let farthest = |c: &BlockCache| {
+        c.blocks.keys().copied().filter(|b| !protected.contains(b)).max_by_key(|&b| score(c, p, b))
+    };
+    while c.bytes > cap || avail < reserve {
+        let Some(b) = farthest(c) else { break };
+        let before = c.bytes;
+        c.evict(b);
+        avail += before - c.bytes;
+    }
+    if !p.background {
+        return None;
+    }
+
+    // nearest missing block on each side of the margin
+    let n_blocks = c.n_blocks();
+    let after = (protected.end..n_blocks).find(|b| !c.blocks.contains_key(b));
+    let before = (0..protected.start).rev().find(|b| !c.blocks.contains_key(b));
+    let cand = [after, before].into_iter().flatten().min_by_key(|&b| score(c, p, b))?;
+    let cand_score = score(c, p, cand);
+    // make room only by dropping blocks that matter less than the candidate
+    while c.bytes + block_bytes > cap || avail < reserve + block_bytes {
+        let b = farthest(c).filter(|&b| score(c, p, b) > cand_score)?;
+        let before = c.bytes;
+        c.evict(b);
+        avail += before - c.bytes;
+    }
+    Some((cand, true))
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +398,19 @@ pub fn compute_thread_count() -> usize {
         .unwrap_or(2)
 }
 
+struct Job {
+    b: usize,
+    cache_id: u64,
+    cfg: PreprocConfig,
+    display_rows: Arc<Vec<DisplayRow>>,
+    n_rows: usize,
+    first: usize,
+    len: usize,
+    overlap: usize,
+    step_uv: f32,
+    agc_eps: Option<Arc<Vec<f32>>>,
+}
+
 pub fn spawn_worker(
     raw: Arc<RawData>,
     meta: Arc<Meta>,
@@ -155,259 +420,94 @@ pub fn spawn_worker(
     ctx: egui::Context,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let n_threads = compute_thread_count();
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
-
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(compute_thread_count()).build().unwrap();
+        let mut sys = sysinfo::System::new();
         let (lock, cvar) = &*shared;
         loop {
-            let req = {
+            let job = {
                 let mut st = lock.lock().unwrap();
                 loop {
-                    if let Some(r) = st.request.take() {
-                        if matches!(r.kind, RequestKind::Shutdown) {
-                            st.status = WorkerStatus::Idle;
-                            st.buffer = None;
-                            return;
-                        }
-                        st.status = WorkerStatus::Computing;
-                        st.active_request = Some(r.clone());
-                        break r;
+                    if st.shutdown {
+                        st.cache = None;
+                        return;
                     }
-                    st = cvar.wait(st).unwrap();
+                    if let Some(plan) = st.plan.clone() {
+                        if st.cache.as_ref().map_or(true, |c| c.cfg != plan.cfg) {
+                            let filt_g = filt.lock().unwrap().clone();
+                            st.cache = Some(BlockCache::new(&plan.cfg, &meta, &filt_g));
+                        }
+                        sys.refresh_memory();
+                        let c = st.cache.as_mut().unwrap();
+                        if let Some((b, background)) = next_block(c, &plan, sys.available_memory()) {
+                            let job = Job {
+                                b,
+                                cache_id: c.id,
+                                cfg: c.cfg.clone(),
+                                display_rows: Arc::clone(&c.display_rows),
+                                n_rows: c.n_rows,
+                                first: b * c.block_samp,
+                                len: c.block_len(b),
+                                overlap: c.overlap,
+                                step_uv: c.step_uv,
+                                agc_eps: c.agc_eps.clone(),
+                            };
+                            st.active = Some((b, background));
+                            // reset under the lock, so a cancel posted for this block isn't lost
+                            cancel.store(false, Ordering::Relaxed);
+                            break job;
+                        }
+                    }
+                    st = cvar.wait_timeout(st, IDLE_RECHECK).unwrap().0;
                 }
             };
 
-            cancel.store(false, Ordering::Relaxed);
+            let result = pool.install(|| compute_block(&job, &raw, &meta, &filt, &cancel));
 
-            pool.install(|| {
-                match req.kind.clone() {
-                    RequestKind::Full { center_sample, half_window } => {
-                        run_full(&req.cfg, center_sample, half_window, &raw, &meta, &filt, &lock, &cancel, &ctx);
+            let mut st = lock.lock().unwrap();
+            st.active = None;
+            if let (Some((block, eps)), Some(c)) = (result, st.cache.as_mut()) {
+                if c.id == job.cache_id {
+                    if job.agc_eps.is_none() && job.cfg.spatial_filter == SpatialFilter::Destripe {
+                        c.agc_eps = Some(Arc::new(eps));
                     }
-                    RequestKind::Extend { direction, extension_samp, view_first, view_n, max_buffer_samp, mem_pressure_pct, mem_reserve_bytes } => {
-                        run_extend(&req.cfg, direction, extension_samp, view_first, view_n, max_buffer_samp, mem_pressure_pct, mem_reserve_bytes, &raw, &meta, &filt, &lock, &cancel, &ctx);
-                    }
-                    RequestKind::Shutdown => unreachable!(),
+                    c.insert(job.b, block);
+                    ctx.request_repaint();
                 }
-            });
+            }
         }
     })
 }
 
-/// Ask the worker to exit; returns immediately.
-pub fn request_shutdown(shared: &SharedWorkerState, cancel: &SharedCancel, cfg: &PreprocConfig) {
-    cancel.store(true, Ordering::Relaxed);
-    let (lock, cvar) = &**shared;
-    lock.lock().unwrap().request = Some(WorkerRequest { kind: RequestKind::Shutdown, cfg: cfg.clone() });
-    cvar.notify_one();
-}
+/// Read and preprocess one block plus its overlap, keep the block, store it as i16.
+/// Returns the block and the destripe AGC floors used; None if cancelled.
+fn compute_block(job: &Job, raw: &RawData, meta: &Meta, filt: &Mutex<Filters>, cancel: &AtomicBool) -> Option<(Block, Vec<f32>)> {
+    let read_first = job.first.saturating_sub(job.overlap);
+    let read_end = (job.first + job.len + job.overlap).min(meta.n_samples);
+    let read_n = read_end - read_first;
 
-// ---------------------------------------------------------------------------
-// Full recompute
-// ---------------------------------------------------------------------------
-
-fn run_full(
-    cfg: &PreprocConfig,
-    center_sample: usize,
-    half_window: usize,
-    raw: &RawData,
-    meta: &Meta,
-    filt: &Mutex<Filters>,
-    lock: &Mutex<WorkerState>,
-    cancel: &AtomicBool,
-    ctx: &egui::Context,
-) {
-    let display_rows = Arc::new(meta.build_display_rows(cfg.avg_depths, &cfg.removed_channels, cfg.channel_order, cfg.shank_order));
-
-    let first = center_sample.saturating_sub(half_window);
-    let n_samp = (half_window * 2).min(meta.n_samples.saturating_sub(first));
-
-    let mut data = raw.read_rows(first, n_samp, meta, &display_rows, cfg.phase_shift);
+    let mut data = raw.read_rows(read_first, read_n, meta, &job.display_rows, job.cfg.phase_shift);
     if cancel.load(Ordering::Relaxed) {
-        finish_cancelled(lock);
-        return;
+        return None;
     }
-
     let filt_g = filt.lock().unwrap().clone();
-    let agc_eps = preprocess(&mut data, n_samp, cfg, &filt_g, cancel, &display_rows, None);
+    let eps = preprocess(&mut data, read_n, &job.cfg, &filt_g, cancel, &job.display_rows, job.agc_eps.as_deref().map(|v| &v[..]));
     if cancel.load(Ordering::Relaxed) {
-        finish_cancelled(lock);
-        return;
+        return None;
     }
 
-    let vmax_pct = compute_pct_table(&data);
-    let n_data_rows = display_rows.iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
-    debug_assert_eq!(data.len(), n_data_rows * n_samp);
-
-    let buf = PreprocBuffer {
-        first_sample: first,
-        n_samp,
-        data: Arc::new(data),
-        cfg: cfg.clone(),
-        display_rows,
-        vmax_pct,
-        agc_eps: Arc::new(agc_eps),
-    };
-    publish(lock, buf, ctx);
-}
-
-// ---------------------------------------------------------------------------
-// Incremental extension
-// ---------------------------------------------------------------------------
-
-fn run_extend(
-    cfg: &PreprocConfig,
-    direction: i32,
-    extension_samp: usize,
-    view_first: usize,
-    view_n: usize,
-    max_buffer_samp: usize,
-    mem_pressure_pct: f32,
-    mem_reserve_bytes: u64,
-    raw: &RawData,
-    meta: &Meta,
-    filt: &Mutex<Filters>,
-    lock: &Mutex<WorkerState>,
-    cancel: &AtomicBool,
-    ctx: &egui::Context,
-) {
-    // snapshot current buffer
-    let current = {
-        let st = lock.lock().unwrap();
-        st.buffer.as_ref().map(|b| (
-            Arc::clone(&b.data),
-            b.first_sample,
-            b.n_samp,
-            Arc::clone(&b.display_rows),
-            b.cfg.clone(),
-            Arc::clone(&b.agc_eps),
-        ))
-    };
-
-    let (old_data, old_first, old_n_samp, display_rows, _old_cfg, agc_eps) = match current {
-        Some(v) if v.4 == *cfg => v,
-        _ => {
-            // no buffer or config changed — app will issue a Full request
-            finish_cancelled(lock);
-            return;
-        }
-    };
-
-    let n_data_rows = display_rows.iter()
-        .filter(|r| matches!(r, DisplayRow::Data { .. }))
-        .count();
-
-    // small fixed safety margin — trimming never eats into this much space behind/ahead
-    // of the visible view, regardless of cap or memory pressure (correctness floor)
-    let safety_retain = EXTENSION_OVERLAP_SAMP;
-    let pressure = memory_pressure(mem_pressure_pct, mem_reserve_bytes);
-    // narrow notches need longer than the highpass to settle at the seam
-    let overlap = EXTENSION_OVERLAP_SAMP.max((crate::notch::settle_s(cfg) * meta.sample_rate).ceil() as usize);
-
-    let (read_start, read_n, clean_offset, actual_ext, drop_samp, new_first) = if direction > 0 {
-        // extend right: read [buf_end - overlap, buf_end + ext]
-        let buf_end = old_first + old_n_samp;
-        let available = meta.n_samples.saturating_sub(buf_end);
-        let ext = extension_samp.min(available);
-        if ext == 0 { finish_cancelled(lock); return; }
-
-        let rs = buf_end.saturating_sub(overlap);
-        let act_overlap = buf_end - rs;
-        let rn = act_overlap + ext;
-
-        // no trim below the cap and without memory pressure (pure growth); once over
-        // the cap or under pressure, drop enough for net-zero growth from here on
-        let over_cap = (old_n_samp + ext).saturating_sub(max_buffer_samp);
-        let target_drop = if pressure { over_cap.max(ext) } else { over_cap };
-        let headroom = (view_first as isize - old_first as isize - safety_retain as isize).max(0) as usize;
-        let drop = target_drop.min(headroom).min(old_n_samp);
-
-        (rs, rn, act_overlap, ext, drop, old_first + drop)
-    } else {
-        // extend left: read [buf_first - ext, buf_first + overlap]
-        let ext = extension_samp.min(old_first);
-        if ext == 0 { finish_cancelled(lock); return; }
-
-        let rs = old_first - ext;
-        let act_overlap = overlap.min(old_n_samp);
-        let rn = ext + act_overlap;
-
-        let over_cap = (old_n_samp + ext).saturating_sub(max_buffer_samp);
-        let target_drop = if pressure { over_cap.max(ext) } else { over_cap };
-        let view_end = view_first + view_n;
-        let buf_end = old_first + old_n_samp;
-        let headroom = (buf_end as isize - view_end as isize - safety_retain as isize).max(0) as usize;
-        let drop = target_drop.min(headroom).min(old_n_samp);
-
-        (rs, rn, 0usize, ext, drop, rs)
-    };
-
-    // read and preprocess the extension + overlap chunk
-    let mut ext_proc = raw.read_rows(read_start, read_n, meta, &display_rows, cfg.phase_shift);
-    if cancel.load(Ordering::Relaxed) { finish_cancelled(lock); return; }
-
-    let filt_g = filt.lock().unwrap().clone();
-    preprocess(&mut ext_proc, read_n, cfg, &filt_g, cancel, &display_rows, Some(&agc_eps));
-    if cancel.load(Ordering::Relaxed) { finish_cancelled(lock); return; }
-
-    // stitch: shift old buffer + append clean new samples
-    let keep_old = old_n_samp - drop_samp;
-    let new_n_samp = keep_old + actual_ext;
-    let mut new_data = vec![0.0f32; n_data_rows * new_n_samp];
-
-    for r in 0..n_data_rows {
-        let new_row = r * new_n_samp;
-        if direction > 0 {
-            // old (shifted left) | new ext
-            let old_src = r * old_n_samp + drop_samp;
-            new_data[new_row..new_row + keep_old]
-                .copy_from_slice(&old_data[old_src..old_src + keep_old]);
-            let ext_src = r * read_n + clean_offset;
-            new_data[new_row + keep_old..new_row + new_n_samp]
-                .copy_from_slice(&ext_proc[ext_src..ext_src + actual_ext]);
-        } else {
-            // new ext | old (minus right drop)
-            let ext_src = r * read_n + clean_offset;
-            new_data[new_row..new_row + actual_ext]
-                .copy_from_slice(&ext_proc[ext_src..ext_src + actual_ext]);
-            let old_src = r * old_n_samp;
-            new_data[new_row + actual_ext..new_row + new_n_samp]
-                .copy_from_slice(&old_data[old_src..old_src + keep_old]);
-        }
+    let (off, len) = (job.first - read_first, job.len);
+    let inv = 1.0 / job.step_uv;
+    let mut q = vec![0i16; job.n_rows * len];
+    if len > 0 {
+        q.par_chunks_mut(len).enumerate().for_each(|(r, row)| {
+            let src = &data[r * read_n + off..r * read_n + off + len];
+            for (o, &v) in row.iter_mut().zip(src) {
+                *o = (v * inv).round().clamp(-32768.0, 32767.0) as i16;
+            }
+        });
     }
-    drop(ext_proc);
-    drop(old_data);
-
-    let vmax_pct = compute_pct_table(&new_data);
-    let buf = PreprocBuffer {
-        first_sample: new_first,
-        n_samp: new_n_samp,
-        data: Arc::new(new_data),
-        cfg: cfg.clone(),
-        display_rows,
-        vmax_pct,
-        agc_eps,
-    };
-    publish(lock, buf, ctx);
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn finish_cancelled(lock: &Mutex<WorkerState>) {
-    let mut st = lock.lock().unwrap();
-    st.status = WorkerStatus::Idle;
-    st.active_request = None;
-}
-
-/// Install a finished buffer. It is always published — it carries its own config
-/// and extent, so the app can judge whether it fits — even if a newer request is
-/// already waiting; that request is then picked up right away.
-fn publish(lock: &Mutex<WorkerState>, buf: PreprocBuffer, ctx: &egui::Context) {
-    let mut st = lock.lock().unwrap();
-    st.active_request = None;
-    st.buffer = Some(buf);
-    st.status = if st.request.is_some() { WorkerStatus::Idle } else { WorkerStatus::Done };
-    ctx.request_repaint();
+    let step = (q.len() / PCT_SAMPLES_PER_BLOCK).max(1);
+    let mut abs_sample: Vec<f32> = q.iter().step_by(step).map(|&v| (v as f32 * job.step_uv).abs()).collect();
+    abs_sample.sort_unstable_by(|a, b| a.total_cmp(b));
+    Some((Block { data: q, abs_sample }, eps))
 }

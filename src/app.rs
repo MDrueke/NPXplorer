@@ -10,8 +10,7 @@ use crate::preprocess::{Filters, PreprocConfig, SpatialFilter};
 use crate::psth::{compute_psth, load_event_times, PsthParams, PsthResult, EventLayout};
 use crate::render::{build_heatmap_into, build_psth_heatmap_into};
 use crate::worker::{
-    compute_half_window, request_shutdown, spawn_worker, RequestKind, SharedCancel,
-    SharedWorkerState, WorkerRequest, WorkerState, WorkerStatus,
+    request_shutdown, spawn_worker, Plan, SharedCancel, SharedWorkerState, ViewWindow, WorkerState,
 };
 
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -22,14 +21,11 @@ pub enum ColorMode {
 
 use crate::colormap::ColorMapChoice;
 
-fn default_initial_buffer_s() -> f64 {
-    30.0
+fn default_around_s() -> f64 {
+    10.0
 }
-fn default_extension_margin_s() -> f64 {
-    5.0
-}
-fn default_mem_pressure_pct() -> f32 {
-    15.0
+fn default_mem_budget_pct() -> f32 {
+    50.0
 }
 fn default_mem_reserve_mb() -> f64 {
     1500.0
@@ -65,33 +61,6 @@ fn default_spectrum_time_end_s() -> f64 {
     60.0
 }
 
-/// Largest buffer duration (s) that fits in currently-available system memory, minus
-/// `mem_reserve_mb`. Used both to clamp saved preferences at load time and to bound
-/// the "Initial buffer size" slider live in the Preferences window.
-fn max_feasible_buffer_s(n_data_rows: usize, sample_rate: f64, mem_reserve_mb: f64) -> f64 {
-    use sysinfo::System;
-    let mut sys = System::new();
-    sys.refresh_memory();
-    let available = sys.available_memory() as f64;
-    let usable = (available - mem_reserve_mb * 1e6).max(0.0);
-    let bytes_per_sample_all_rows = (n_data_rows.max(1) as f64) * 4.0; // f32
-    (usable / bytes_per_sample_all_rows / sample_rate).max(1.0)
-}
-
-/// Largest extension margin (s) that can't oscillate against itself.
-///
-/// Once the buffer is at its `initial_buffer_s` (B) cap, extending by margin M on one
-/// side trims the same M from the opposite side (net-zero growth). Right before that
-/// fires, the far margin is at worst `B - view_n - M`; after the trim it drops by
-/// another M, to `B - view_n - 2M`. For that not to already be below M (and
-/// immediately trigger an extension back the other way), we need:
-///   B - view_n - 2M >= M   =>   M <= (B - view_n) / 3
-/// A 0.9 safety factor keeps clear of the exact boundary (float rounding, view_n
-/// changes, etc.).
-fn max_extension_margin_s(initial_buffer_s: f64, view_dur_s: f64) -> f64 {
-    (((initial_buffer_s - view_dur_s).max(0.0) / 3.0) * 0.9).max(0.5)
-}
-
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Preferences {
     pub preproc_cfg: PreprocConfig,
@@ -121,16 +90,15 @@ pub struct Preferences {
     /// heatmap: show each pixel column's extreme sample instead of its mean
     #[serde(default)]
     pub peak_pooling: bool,
-    /// total size (s) of the buffer loaded on initial load / full recompute; also the
-    /// steady-state cap that incremental extension growth settles back to
-    #[serde(default = "default_initial_buffer_s")]
-    pub initial_buffer_s: f64,
-    /// how close (s) the view can get to the edge of the preprocessed buffer before
-    /// an extension is triggered; also the size of each extension step
-    #[serde(default = "default_extension_margin_s")]
-    pub extension_margin_s: f64,
-    #[serde(default = "default_mem_pressure_pct")]
-    pub mem_pressure_pct: f32,
+    /// seconds kept preprocessed on each side of the view
+    #[serde(default = "default_around_s")]
+    pub around_s: f64,
+    /// keep preprocessing beyond `around_s` until the memory budget is used
+    #[serde(default)]
+    pub background_fill: bool,
+    /// share (%) of available memory the preprocessed cache may use
+    #[serde(default = "default_mem_budget_pct")]
+    pub mem_budget_pct: f32,
     #[serde(default = "default_mem_reserve_mb")]
     pub mem_reserve_mb: f64,
     #[serde(default)]
@@ -812,11 +780,15 @@ pub struct NPXplorerApp {
     // async worker
     worker_state: SharedWorkerState,
     worker_cancel: SharedCancel,
-    worker_half_window: usize,
-    initial_buffer_s: f64,
-    extension_margin_s: f64,
-    mem_pressure_pct: f32,
+    around_s: f64,
+    background_fill: bool,
+    mem_budget_pct: f32,
     mem_reserve_mb: f64,
+    /// contiguous copy of the preprocessed blocks around the view
+    view_window: Option<ViewWindow>,
+    /// last scroll direction (+1 / -1) and the view position it was taken from
+    scroll_dir: i32,
+    last_view_first: usize,
     _worker_handle: std::thread::JoinHandle<()>,
 
     // rendering
@@ -826,7 +798,8 @@ pub struct NPXplorerApp {
     last_rendered_cfg: Option<PreprocConfig>,
     last_rendered_n: usize,
     last_rendered_size: Option<[usize; 2]>,
-    last_rendered_buf: Option<(usize, usize)>,
+    /// data pointer of the view window last drawn (rebuilt windows also carry a new colour scale)
+    last_rendered_buf: Option<usize>,
     last_rendered_rows: Option<(usize, usize)>,
 
     // rectangle zoom
@@ -835,7 +808,6 @@ pub struct NPXplorerApp {
     zoom_drag_start: Option<egui::Pos2>,
 
     // UI state
-    pending_cfg_recompute: bool,
     pub file_dialog_request: bool,
     /// set by the toolbar's "Recent files" menu; polled by MainApp to switch recordings
     pub open_recent_request: Option<PathBuf>,
@@ -948,9 +920,9 @@ impl NPXplorerApp {
         let mut show_firing_rate_overlay = true;
         let mut spike_overlay_scale = default_spike_overlay_scale();
         let mut spike_smoothing_sigma = default_spike_smoothing_sigma();
-        let mut initial_buffer_s = default_initial_buffer_s();
-        let mut extension_margin_s = default_extension_margin_s();
-        let mut mem_pressure_pct = default_mem_pressure_pct();
+        let mut around_s = default_around_s();
+        let mut background_fill = false;
+        let mut mem_budget_pct = default_mem_budget_pct();
         let mut mem_reserve_mb = default_mem_reserve_mb();
         let mut recent_files: Vec<PathBuf> = Vec::new();
         let mut n_classify_chunks = default_n_classify_chunks();
@@ -986,9 +958,9 @@ impl NPXplorerApp {
             show_firing_rate_overlay = p.show_firing_rate_overlay;
             spike_overlay_scale = p.spike_overlay_scale;
             spike_smoothing_sigma = p.spike_smoothing_sigma;
-            initial_buffer_s = p.initial_buffer_s;
-            extension_margin_s = p.extension_margin_s;
-            mem_pressure_pct = p.mem_pressure_pct;
+            around_s = p.around_s;
+            background_fill = p.background_fill;
+            mem_budget_pct = p.mem_budget_pct;
             mem_reserve_mb = p.mem_reserve_mb;
             recent_files = p.recent_files.iter().map(PathBuf::from).collect();
             n_classify_chunks = p.n_classify_chunks;
@@ -1058,7 +1030,7 @@ impl NPXplorerApp {
         let filters = Arc::new(Mutex::new(Filters::new(&preproc_cfg)));
         let shared: SharedWorkerState = Arc::new((Mutex::new(WorkerState::new()), Condvar::new()));
         let cancel: SharedCancel = Arc::new(AtomicBool::new(false));
-        // the first request is sent by `start`, once the settings are applied
+        // the first plan is posted by the first frame, once the settings are applied
         let handle = spawn_worker(
             Arc::clone(&raw),
             Arc::clone(&meta),
@@ -1162,11 +1134,13 @@ impl NPXplorerApp {
             spectrum_view_changed_at: std::time::Instant::now(),
             worker_state: shared,
             worker_cancel: cancel,
-            worker_half_window: compute_half_window(initial_buffer_s, fs),
-            initial_buffer_s,
-            extension_margin_s,
-            mem_pressure_pct,
+            around_s,
+            background_fill,
+            mem_budget_pct,
             mem_reserve_mb,
+            view_window: None,
+            scroll_dir: 1,
+            last_view_first: 0,
             _worker_handle: handle,
             heatmap_texture: None,
             pixel_buf: Vec::new(),
@@ -1178,7 +1152,6 @@ impl NPXplorerApp {
             last_rendered_rows: None,
             zoom: None,
             zoom_drag_start: None,
-            pending_cfg_recompute: false,
             file_dialog_request: false,
             open_recent_request: None,
             recent_files,
@@ -1220,33 +1193,11 @@ impl NPXplorerApp {
         Ok(app)
     }
 
-    /// Clamp the buffer settings, start preprocessing, and load the atlas if its
-    /// overlay was shown last time. Writes the settings file, so a recording opened
-    /// once keeps its settings even when the preferences change later.
+    /// Set up the filters and load the atlas if its overlay was shown last time.
+    /// Preprocessing starts with the first frame. Writes the settings file, so a
+    /// recording opened once keeps its settings even when the preferences change later.
     fn start(&mut self, ctx: &egui::Context) {
-        let fs = self.meta.sample_rate;
-        // defensively re-clamp in case prefs were saved on a machine with more RAM,
-        // or with an initial_buffer_s/view_dur_s combination that no longer satisfies
-        // the no-oscillation bound
-        let n_data_rows = self
-            .meta
-            .build_display_rows(
-                self.preproc_cfg.avg_depths,
-                &self.preproc_cfg.removed_channels,
-                self.preproc_cfg.channel_order,
-                self.preproc_cfg.shank_order,
-            )
-            .iter()
-            .filter(|r| matches!(r, DisplayRow::Data { .. }))
-            .count();
-        self.initial_buffer_s =
-            self.initial_buffer_s.min(max_feasible_buffer_s(n_data_rows, fs, self.mem_reserve_mb));
-        self.extension_margin_s =
-            self.extension_margin_s.min(max_extension_margin_s(self.initial_buffer_s, self.view_dur_s));
-        self.worker_half_window = compute_half_window(self.initial_buffer_s, fs);
-
         *self.preproc_filters.lock().unwrap() = Filters::new(&self.preproc_cfg);
-        self.request_recompute();
         let meta = Arc::clone(&self.meta);
         self.atlas.register_on_open(ctx, &meta);
         self.load_on_start(ctx);
@@ -1284,7 +1235,7 @@ impl Drop for NPXplorerApp {
     /// changes are written first.
     fn drop(&mut self) {
         self.flush_settings();
-        request_shutdown(&self.worker_state, &self.worker_cancel, &self.preproc_cfg);
+        request_shutdown(&self.worker_state, &self.worker_cancel);
     }
 }
 
@@ -1490,9 +1441,9 @@ impl NPXplorerApp {
             n_classify_chunks: self.classify_n_chunks,
             classify_outside_rule: self.classify_outside_rule,
             peak_pooling: self.peak_pooling,
-            initial_buffer_s: self.initial_buffer_s,
-            extension_margin_s: self.extension_margin_s,
-            mem_pressure_pct: self.mem_pressure_pct,
+            around_s: self.around_s,
+            background_fill: self.background_fill,
+            mem_budget_pct: self.mem_budget_pct,
             mem_reserve_mb: self.mem_reserve_mb,
             last_dir,
             recent_files: self
@@ -1521,33 +1472,6 @@ impl NPXplorerApp {
         prefs.save();
     }
 
-    fn request_recompute(&mut self) {
-        let fs = self.meta.sample_rate;
-        // use same formula as update() to avoid off-by-one from float rounding
-        let view_first = (self.view_start_s * fs) as usize;
-        let view_n = (self.view_dur_s * fs) as usize;
-        let center = view_first + view_n / 2;
-        file_log!(
-            "UI: request_recompute center={} view_first={} view_n={} cfg={:?}",
-            center,
-            view_first,
-            view_n,
-            self.preproc_cfg
-        );
-        // cancel any in-flight computation
-        self.worker_cancel.store(true, Ordering::Relaxed);
-        let req = WorkerRequest {
-            kind: RequestKind::Full {
-                center_sample: center,
-                half_window: self.worker_half_window,
-            },
-            cfg: self.preproc_cfg.clone(),
-        };
-        let (lock, cvar) = &*self.worker_state;
-        lock.lock().unwrap().request = Some(req);
-        cvar.notify_one();
-    }
-
     // -----------------------------------------------------------------------
     // Channel removal
     // -----------------------------------------------------------------------
@@ -1563,7 +1487,6 @@ impl NPXplorerApp {
         }
         self.preproc_cfg.removed_channels = set;
         self.heatmap_texture = None;
-        self.pending_cfg_recompute = true;
     }
 
     /// Parse `remove_channels_text` and apply it, or set an error message on failure.
@@ -1977,7 +1900,6 @@ impl NPXplorerApp {
                         self.preproc_cfg.notch_enabled = !notches.is_empty();
                         self.preproc_cfg.notches = notches;
                         self.heatmap_texture = None;
-                        self.pending_cfg_recompute = true;
                     }
                 });
             });
@@ -3132,7 +3054,6 @@ impl NPXplorerApp {
             let mut dc = self.preproc_cfg.dc_removal;
             if ui.checkbox(&mut dc, "DC").changed() {
                 self.preproc_cfg.dc_removal = dc;
-                self.pending_cfg_recompute = true;
             }
 
             ui.separator();
@@ -3140,7 +3061,6 @@ impl NPXplorerApp {
             let mut phase = self.preproc_cfg.phase_shift;
             if ui.checkbox(&mut phase, "Phase Shift").changed() {
                 self.preproc_cfg.phase_shift = phase;
-                self.pending_cfg_recompute = true;
             }
 
             ui.separator();
@@ -3155,7 +3075,6 @@ impl NPXplorerApp {
                     .changed()
                 {
                     self.preproc_cfg.notch_enabled = on;
-                    self.pending_cfg_recompute = true;
                 }
                 ui.separator();
             }
@@ -3168,7 +3087,6 @@ impl NPXplorerApp {
                 .changed()
             {
                 self.preproc_cfg.highpass = hp;
-                self.pending_cfg_recompute = true;
             }
 
             ui.separator();
@@ -3198,7 +3116,6 @@ impl NPXplorerApp {
                     *f = Filters::new(&self.preproc_cfg);
                 }
                 self.heatmap_texture = None;
-                self.pending_cfg_recompute = true;
             }
 
             ui.separator();
@@ -3208,7 +3125,6 @@ impl NPXplorerApp {
             if ui.checkbox(&mut avg, "Avg adjacent chans").changed() {
                 self.preproc_cfg.avg_depths = avg;
                 self.heatmap_texture = None;
-                self.pending_cfg_recompute = true;
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3288,14 +3204,7 @@ impl NPXplorerApp {
                 }
             });
 
-            let display_rows_arc = {
-                let (lock, _) = &*self.worker_state;
-                lock.lock()
-                    .unwrap()
-                    .buffer
-                    .as_ref()
-                    .map(|b| Arc::clone(&b.display_rows))
-            };
+            let display_rows_arc = crate::worker::cache_display_rows(&self.worker_state);
 
             let mut ch1_visible = false;
             let mut ch2_visible = false;
@@ -3368,11 +3277,7 @@ impl NPXplorerApp {
 
     fn draw_status_bar(&self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            let status = {
-                let (lock, _) = &*self.worker_state;
-                lock.lock().unwrap().status.clone()
-            };
-            if status == WorkerStatus::Computing {
+            if crate::worker::computing_foreground(&self.worker_state) {
                 ui.spinner();
                 ui.label("Computing…");
             }
@@ -3412,16 +3317,8 @@ impl NPXplorerApp {
 
         let [ar, ag, ab] = self.colormap_choice.spec().accent;
 
-        // preprocessed-buffer extent, drawn first so it sits beneath the view marker
-        let buf_extent = {
-            let (lock, _) = &*self.worker_state;
-            lock.lock()
-                .unwrap()
-                .buffer
-                .as_ref()
-                .map(|b| (b.first_sample, b.n_samp))
-        };
-        if let Some((first, n_samp)) = buf_extent {
+        // preprocessed extents, drawn first so they sit beneath the view marker
+        for (first, n_samp) in crate::worker::cached_runs(&self.worker_state) {
             let buf_frac = (first as f64 / self.meta.sample_rate / total_s) as f32;
             let buf_w_frac = (n_samp as f64 / self.meta.sample_rate / total_s) as f32;
             let buf_rect = egui::Rect::from_min_size(
@@ -4268,7 +4165,6 @@ impl NPXplorerApp {
                         if co != self.preproc_cfg.channel_order {
                             self.preproc_cfg.channel_order = co;
                             self.heatmap_texture = None;
-                            self.pending_cfg_recompute = true;
                             self.save_prefs();
                         }
                     });
@@ -4288,7 +4184,6 @@ impl NPXplorerApp {
                         if so != self.preproc_cfg.shank_order {
                             self.preproc_cfg.shank_order = so;
                             self.heatmap_texture = None;
-                            self.pending_cfg_recompute = true;
                             self.save_prefs();
                         }
                     });
@@ -4375,56 +4270,27 @@ impl NPXplorerApp {
                     });
 
                     ui.separator();
-                    ui.label(egui::RichText::new("Buffer").strong());
-
-                    let n_data_rows = self.meta.build_display_rows(self.preproc_cfg.avg_depths, &self.preproc_cfg.removed_channels, self.preproc_cfg.channel_order, self.preproc_cfg.shank_order)
-                        .iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
-                    let max_feasible = max_feasible_buffer_s(n_data_rows, self.meta.sample_rate, self.mem_reserve_mb);
+                    ui.label(egui::RichText::new("Performance").strong());
 
                     ui.horizontal(|ui| {
-                        ui.label("Initial buffer size (s):");
-                        if ui.add(
-                            egui::DragValue::new(&mut self.initial_buffer_s)
-                                .speed(0.5).range(1.0..=max_feasible)
-                        ).changed() {
-                            let fs = self.meta.sample_rate;
-                            self.worker_half_window = compute_half_window(self.initial_buffer_s, fs);
-                            let max_margin = max_extension_margin_s(self.initial_buffer_s, self.view_dur_s);
-                            self.extension_margin_s = self.extension_margin_s.min(max_margin);
-                            self.pending_cfg_recompute = true;
+                        ui.label("Preprocess around view (s):");
+                        if ui.add(egui::DragValue::new(&mut self.around_s).speed(0.5).range(0.0..=600.0)).changed() {
                             self.save_prefs();
                         }
                     });
-                    ui.label(
-                        egui::RichText::new(format!("(max given available memory: {:.1} s)", max_feasible))
-                            .small().color(egui::Color32::GRAY)
-                    );
-
-                    let max_margin = max_extension_margin_s(self.initial_buffer_s, self.view_dur_s);
-                    ui.horizontal(|ui| {
-                        ui.label("Extension margin (s):");
-                        if ui.add(
-                            egui::DragValue::new(&mut self.extension_margin_s)
-                                .speed(0.1).range(0.5..=max_margin)
-                        ).changed() {
-                            self.save_prefs();
-                        }
-                    });
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "distance from the buffer edge that triggers (and size of) each extension — capped at {:.1} s to prevent the buffer from ping-ponging between edges",
-                            max_margin
-                        )).small().color(egui::Color32::GRAY)
-                    );
-
-                    ui.horizontal(|ui| {
-                        ui.label("Memory pressure threshold (%):");
-                        if ui.add(
-                            egui::DragValue::new(&mut self.mem_pressure_pct)
-                                .speed(1.0).range(1.0..=90.0)
-                        ).changed() {
-                            self.save_prefs();
-                        }
+                    if ui.checkbox(&mut self.background_fill, "Background preprocessing")
+                        .on_hover_text("Keep preprocessing further from the view (mostly in the scroll direction) while nothing else needs computing, until the memory budget is used. Pauses while Power spectrum, Classification, PSTH or Export run.")
+                        .changed()
+                    {
+                        self.save_prefs();
+                    }
+                    ui.add_enabled_ui(self.background_fill, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Memory budget (% of available):");
+                            if ui.add(egui::DragValue::new(&mut self.mem_budget_pct).speed(1.0).range(1.0..=95.0)).changed() {
+                                self.save_prefs();
+                            }
+                        });
                     });
                     ui.horizontal(|ui| {
                         ui.label("Memory reserve (MB):");
@@ -4436,7 +4302,7 @@ impl NPXplorerApp {
                         }
                     });
                     ui.label(
-                        egui::RichText::new("buffer growth stops once free memory drops below either threshold")
+                        egui::RichText::new("preprocessed data beyond the view's surroundings is dropped once free memory falls below the reserve")
                             .small().color(egui::Color32::GRAY)
                     );
                         });
@@ -4546,46 +4412,26 @@ impl NPXplorerApp {
                 let fs = self.meta.sample_rate;
                 let view_first = (self.view_start_s * fs) as usize;
                 let view_n = (self.view_dur_s * fs) as usize;
-                let center = view_first + view_n / 2;
+                if view_first != self.last_view_first {
+                    self.scroll_dir = if view_first > self.last_view_first { 1 } else { -1 };
+                    self.last_view_first = view_first;
+                }
 
-                // === single snapshot of worker state for all reads this frame ===
-                let (
-                    w_status, w_has_request,
-                    buf_first, buf_n_samp, buf_data, buf_cfg, buf_display_rows,
-                    matches_view, matches_cfg,
-                    req_center_cfg, act_center_cfg,
-                ) = {
-                    let (lock, _) = &*self.worker_state;
-                    let st = lock.lock().unwrap();
-                    let status = st.status.clone();
-                    let has_req = st.request.is_some();
-                    let req_cc = st.request.as_ref().and_then(|r| {
-                        if let RequestKind::Full { center_sample, half_window } = &r.kind {
-                            Some((*center_sample, *half_window, r.cfg.clone()))
-                        } else { None }
-                    });
-                    let act_cc = st.active_request.as_ref().and_then(|r| {
-                        if let RequestKind::Full { center_sample, half_window } = &r.kind {
-                            Some((*center_sample, *half_window, r.cfg.clone()))
-                        } else { None }
-                    });
-
-                    if let Some(buf) = &st.buffer {
-                        let buf_end = buf.first_sample + buf.n_samp;
-                        let max_view_n = self.meta.n_samples.saturating_sub(view_first);
-                        let expected_end = view_first + view_n.min(max_view_n);
-                        let m_view = buf.first_sample <= view_first && expected_end <= buf_end;
-                        let m_cfg = buf.cfg == self.preproc_cfg;
-
-                        (status, has_req,
-                         buf.first_sample, buf.n_samp,
-                         Some(Arc::clone(&buf.data)), Some(buf.cfg.clone()),
-                         Some(Arc::clone(&buf.display_rows)),
-                         m_view, m_cfg, req_cc, act_cc)
-                    } else {
-                        (status, has_req, 0, 0, None, None, None, false, false, req_cc, act_cc)
-                    }
-                };
+                crate::worker::update_view_window(&self.worker_state, &mut self.view_window, view_first, view_n, &self.preproc_cfg);
+                let (buf_first, buf_n_samp, buf_data, buf_cfg, buf_display_rows, matches_view, matches_cfg) =
+                    match &self.view_window {
+                        Some(w) => {
+                            let expected_end = view_first + view_n.min(self.meta.n_samples.saturating_sub(view_first));
+                            (
+                                w.first_sample, w.n_samp,
+                                Some(Arc::clone(&w.data)), Some(w.cfg.clone()),
+                                Some(Arc::clone(&w.display_rows)),
+                                w.first_sample <= view_first && expected_end <= w.first_sample + w.n_samp,
+                                w.cfg == self.preproc_cfg,
+                            )
+                        }
+                        None => (0, 0, None, None, None, false, false),
+                    };
 
                 // what the heatmap and waveform view draw (noise-filtered or not)
                 let (src_data, src_first, src_n) = if matches_cfg {
@@ -4594,27 +4440,23 @@ impl NPXplorerApp {
                     (buf_data.clone(), buf_first, buf_n_samp)
                 };
 
-                // request repaint while worker is busy (moved here from top to use snapshot)
-                if w_status == WorkerStatus::Computing || w_has_request {
+                // the worker repaints when a block arrives; this only catches up after
+                // a missed one while the view isn't covered yet
+                if !matches_view || !matches_cfg {
                     ctx.request_repaint_after(std::time::Duration::from_millis(50));
                 }
 
                 // colour range from current UI settings — valid whenever cfg matches,
-                // regardless of exact time coverage (percentile table covers whatever's
-                // currently in the buffer). With peak pooling the %ile is taken from the
+                // regardless of exact time coverage (percentile table covers the view's
+                // blocks ±1). With peak pooling the %ile is taken from the
                 // pooled values on screen instead: pooled extremes sit well above the raw
                 // samples' percentiles, so a raw-sample range would saturate the map.
                 let vmax = if matches_cfg {
                     if self.color_mode == ColorMode::Percentile && self.peak_pooling {
                         0.0 // unused: ColorScale::ViewPercentile below
                     } else if self.color_mode == ColorMode::Percentile {
-                        // need percentile table — quick lock just for the lookup
-                        let (lock, _) = &*self.worker_state;
-                        let st = lock.lock().unwrap();
-                        if let Some(buf) = &st.buffer {
-                            let pct_idx = (self.color_pct * 100.0).round() as usize;
-                            buf.vmax_pct[pct_idx.min(10000)].max(1.0)
-                        } else { 250.0 }
+                        let pct_idx = (self.color_pct * 100.0).round() as usize;
+                        self.view_window.as_ref().map_or(250.0, |w| w.vmax_pct[pct_idx.min(10000)].max(1.0))
                     } else {
                         self.color_uv.max(1.0)
                     }
@@ -4629,7 +4471,7 @@ impl NPXplorerApp {
                     let pos_changed = self.last_rendered_first != view_first;
                     let cfg_changed = self.last_rendered_cfg.as_ref() != Some(&self.preproc_cfg);
                     let size_changed = self.last_rendered_size != Some([pw, ph]);
-                    let buf_changed = self.last_rendered_buf != Some((buf_first, buf_n_samp));
+                    let buf_changed = self.last_rendered_buf != buf_data.as_ref().map(|d| Arc::as_ptr(d) as usize);
 
                     let need_rebuild = self.heatmap_texture.is_none()
                         || pos_changed || view_n != self.last_rendered_n
@@ -4760,89 +4602,28 @@ impl NPXplorerApp {
                             self.last_rendered_n = view_n;
                             self.last_rendered_cfg = buf_cfg;
                             self.last_rendered_size = Some([pw, ph]);
-                            self.last_rendered_buf = Some((buf_first, buf_n_samp));
+                            self.last_rendered_buf = buf_data.as_ref().map(|d| Arc::as_ptr(d) as usize);
                             self.last_rendered_rows = Some((first_row, last_row));
                             self.last_rendered_noise = Some(self.noise.clone());
                         }
                     }
                 }
 
-                // request new background computation if needed (uses snapshot for checks, locks only for writes)
-                let mut requested_new = false;
-                if !matches_view || !matches_cfg || self.pending_cfg_recompute {
-                    // a queued or running full recompute is good enough if it has the
-                    // current config and buffer size and its window covers the view plus
-                    // the extension margin — re-requesting on every scroll frame would
-                    // cancel it each time and nothing would ever finish
-                    let fs = self.meta.sample_rate;
-                    let margin = (self.extension_margin_s * fs) as usize;
-                    let need_lo = view_first.saturating_sub(margin);
-                    let need_hi = (view_first + view_n + margin).min(self.meta.n_samples);
-                    let adequate = |c: usize, hw: usize, cfg: &PreprocConfig| {
-                        *cfg == self.preproc_cfg
-                            && hw == self.worker_half_window
-                            && c.saturating_sub(hw) <= need_lo
-                            && (c + hw).min(self.meta.n_samples) >= need_hi
-                    };
-                    let already_requested = req_center_cfg.as_ref().map_or(false, |(c, hw, cfg)| adequate(*c, *hw, cfg))
-                        || act_center_cfg.as_ref().map_or(false, |(c, hw, cfg)| adequate(*c, *hw, cfg));
-
-                    if !already_requested {
-                        file_log!("UI: Requesting recompute. matches_view={}, matches_cfg={}, pending_cfg={}, center={}", matches_view, matches_cfg, self.pending_cfg_recompute, center);
-                        file_log!("UI: buf first={}, n={}, view_first={}, view_n={}", buf_first, buf_n_samp, view_first, view_n);
-                        self.request_recompute();
-                        requested_new = true;
-                    }
-                }
-
-                if matches_view && matches_cfg && !requested_new {
-                    let fs = self.meta.sample_rate;
-                    let buf_end = buf_first + buf_n_samp;
-                    let target_margin = (self.extension_margin_s * fs) as usize;
-
-                    // spatial, direction-agnostic: whichever side the view is closest to
-                    // the buffer edge on is (by construction) the side being scrolled toward,
-                    // so this re-fires every frame the worker is idle until margin is restored —
-                    // no need to track scroll direction explicitly, and it doesn't depend on a
-                    // scroll event having fired this exact frame (unlike the old proximity check)
-                    let left_margin = view_first.saturating_sub(buf_first);
-                    let right_margin = buf_end.saturating_sub(view_first + view_n);
-                    let left_needs = left_margin < target_margin && buf_first > 0;
-                    let right_needs = right_margin < target_margin && buf_end < self.meta.n_samples;
-
-                    let extend_dir: i32 = if left_needs && (!right_needs || left_margin <= right_margin) {
-                        -1
-                    } else if right_needs {
-                        1
-                    } else {
-                        0
-                    };
-
-                    if extend_dir != 0 {
-                        // only submit if the worker is free (Idle or Done — Done is the
-                        // steady-state after any successful compute, so it must count as
-                        // free too) and never cancel in-progress work
-                        let (lock, cvar) = &*self.worker_state;
-                        let mut st = lock.lock().unwrap();
-                        if st.status != WorkerStatus::Computing && st.request.is_none() {
-                            st.request = Some(WorkerRequest {
-                                kind: RequestKind::Extend {
-                                    direction: extend_dir,
-                                    extension_samp: target_margin,
-                                    view_first,
-                                    view_n,
-                                    max_buffer_samp: (self.initial_buffer_s * fs) as usize,
-                                    mem_pressure_pct: self.mem_pressure_pct,
-                                    mem_reserve_bytes: (self.mem_reserve_mb * 1e6) as u64,
-                                },
-                                cfg: self.preproc_cfg.clone(),
-                            });
-                            cvar.notify_one();
-                        }
-                    }
-                }
-
-                self.pending_cfg_recompute = false;
+                // heavy jobs get the CPU to themselves; background fill waits for them
+                let busy = self.psth.computing
+                    || self.classify_rx.is_some()
+                    || self.spectrum_rx.is_some()
+                    || self.export_ui.is_running();
+                crate::worker::post_plan(&self.worker_state, &self.worker_cancel, Plan {
+                    cfg: self.preproc_cfg.clone(),
+                    view_first,
+                    view_n,
+                    direction: self.scroll_dir,
+                    around_samp: (self.around_s * fs) as usize,
+                    background: self.background_fill && !busy,
+                    budget_pct: self.mem_budget_pct,
+                    reserve_bytes: (self.mem_reserve_mb * 1e6) as u64,
+                });
 
                 // power spectrum, current-view scope: recomputed once "Calculate" has been
                 // pressed, whenever the result no longer matches the view/settings — but

@@ -180,7 +180,7 @@ Preferences are saved in `config/npxplorer_prefs.toml` next to the executable, t
 
 **Default file locations…** (top of Preferences) sets where files that belong to a recording are looked for, as paths relative to the recording's folder (`..` goes up a folder, e.g. `../ks`; absolute paths work too): the **Event file**, the **Spike-sorted data** folder (default `ks`) and the **Export folder** (empty: next to the recording). For Open Ephys, the recording's folder is the one holding `continuous.dat`. **Load on start** loads the events and/or the spike-sorted data when a recording is opened. The **Atlas folder** for Atlas registration is set there too.
 
-The **Buffer** section in Preferences controls how much of the recording is preprocessed ahead of time and the memory limits at which the buffer stops growing.
+The **Performance** section in Preferences controls how much of the recording is kept preprocessed. **Preprocess around view (s)** (default 10 s) is computed on both sides of the view first. **Background preprocessing** (off by default) keeps going while nothing else needs computing, about three times further in the scroll direction than behind, until the cache uses **Memory budget** (default 50 %) of the available memory; it pauses while Power spectrum, Classification, PSTH or Export run. Below **Memory reserve** (default 1500 MB) of free memory, the data farthest from the view is dropped. Preprocessed data is kept as 16-bit values, about 0.15 µV per step for NP1 (finer than the ADC), about 11.5 MB per second of NP1 AP data with averaged channels (twice that without).
 
 ## Known limitations
 

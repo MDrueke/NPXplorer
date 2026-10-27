@@ -23,7 +23,7 @@ pub struct ChannelGeom {
 }
 
 /// One row in the display (after depth-averaging).
-/// `data_idx` is the row index into the PreprocBuffer data array (None for gaps).
+/// `data_idx` is the row index into the preprocessed data array (None for gaps).
 #[derive(Clone, Debug)]
 pub enum DisplayRow {
     Data { data_idx: usize, channels: Vec<usize>, first_ch: usize, x_um: f32, y_um: f32, shank: u32 },
@@ -74,6 +74,8 @@ pub struct Meta {
     pub n_samples: usize,
     /// µV per raw integer, one per signal channel in file order
     pub uv_per_bit: Vec<f32>,
+    /// largest raw integer the ADC produces (SpikeGLX `imMaxInt`; 32768 for Open Ephys)
+    pub max_int: f64,
     pub im_dat_prb_type: u32,
     pub channel_geom: Vec<ChannelGeom>,
     /// channel identifier per saved signal channel, as named by the acquisition
@@ -298,6 +300,7 @@ impl Meta {
             sample_rate,
             n_samples,
             uv_per_bit,
+            max_int,
             im_dat_prb_type,
             channel_geom,
             channel_ids,
@@ -425,6 +428,7 @@ impl Meta {
             sample_rate,
             n_samples,
             uv_per_bit,
+            max_int: 32768.0,
             im_dat_prb_type,
             channel_geom,
             channel_ids: (0..num_channels)

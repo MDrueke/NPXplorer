@@ -1114,6 +1114,7 @@ id,atlas_id,name,acronym,st_level,ontology_id,hemisphere_id,weight,parent_struct
             sample_rate: 30000.0,
             n_samples: 0,
             uv_per_bit: vec![1.0; 3],
+            max_int: 512.0,
             im_dat_prb_type: 0,
             sample_shift: vec![0.0; 3],
             warnings: Vec::new(),

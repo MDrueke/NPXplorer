@@ -656,7 +656,7 @@ pub(crate) fn run(job: &Job, p: &Progress, cancel: &AtomicBool, labels_out: &mut
     // margins thrown away on both sides of every chunk: enough for the highpass and
     // notches to settle, destripe's AGC window, and any blanking window to fit
     let longest_blank = intervals.iter().map(|iv| iv.1 - iv.0).max().unwrap_or(0);
-    let margin = crate::worker::EXTENSION_OVERLAP_SAMP
+    let margin = crate::worker::MIN_OVERLAP_SAMP
         .max((crate::notch::settle_s(&cfg) * fs).ceil() as usize)
         .max(if cfg.spatial_filter == SpatialFilter::Destripe { filters.kfilt_lagc / 2 + 1 } else { 0 })
         .max(longest_blank + 16);
