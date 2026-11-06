@@ -1541,6 +1541,10 @@ fn provenance(info: &ExportInfo, t0: f64, t1: f64) -> Result<String> {
             Filters::new(cfg).kfilt_lagc,
             info.eps.unwrap_or(&[]),
         )),
+        SpatialFilter::Csd => step("spatial_filter", format!(
+            "current source density along depth: {}second derivative, ends mirrored",
+            if cfg.csd.smoothing { format!("Gaussian σ {} µm, ", cfg.csd.sigma_um) } else { String::new() }
+        )),
     }
     if !info.plan.interpolated.is_empty() {
         step("interpolate_bad_channels", format!(
@@ -1659,6 +1663,7 @@ mod tests {
             shank_order: Default::default(),
             notches: vec![crate::notch::Notch { freq_hz: 50.0, bw_hz: 2.0 }],
             notch_enabled: true,
+            csd: Default::default(),
         }
     }
 

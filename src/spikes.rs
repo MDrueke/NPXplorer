@@ -647,9 +647,9 @@ impl SpikesState {
                 ui.horizontal(|ui| {
                     let loaded = self.data.as_ref().is_some_and(|d| d.dir == Path::new(self.path_text.trim()));
                     let label = if loaded { "Apply" } else { "Load" };
-                    apply = ui
-                        .add_enabled(!self.loading() && !self.path_text.trim().is_empty(), egui::Button::new(label))
-                        .clicked();
+                    let enabled = !self.loading() && !self.path_text.trim().is_empty();
+                    let enter = crate::app::enter_applies(ui) && enabled;
+                    apply = ui.add_enabled(enabled, egui::Button::new(label)).clicked() || enter;
                     if self.loading() {
                         ui.spinner();
                         ui.label("Loading…");

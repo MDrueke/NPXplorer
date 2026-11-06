@@ -56,6 +56,9 @@ pub struct ProbeSpec {
     /// staggered layouts (NP 1.0 checkerboard)
     pub even_row_x0_um: f32,
     pub odd_row_x0_um: f32,
+    /// shank tip to the first electrode row (µm; ProbeTable `tip_length_um`) — the
+    /// default "Tip to first electrode row" of the atlas registration
+    pub tip_length_um: f64,
 }
 
 const fn np1(part_number: &'static str, pitch_h: f32, pitch_v: f32, even_x0: f32, odd_x0: f32) -> ProbeSpec {
@@ -70,6 +73,7 @@ const fn np1(part_number: &'static str, pitch_h: f32, pitch_v: f32, even_x0: f32
         pitch_v_um: pitch_v,
         even_row_x0_um: even_x0,
         odd_row_x0_um: odd_x0,
+        tip_length_um: 209.0,
     }
 }
 
@@ -85,6 +89,7 @@ const fn np2(part_number: &'static str, adc_bits: u32, ai_range_max_v: f64, gain
         pitch_v_um: 15.0,
         even_row_x0_um: 27.0,
         odd_row_x0_um: 27.0,
+        tip_length_um: 206.0,
     }
 }
 
@@ -93,15 +98,15 @@ const fn np2(part_number: &'static str, adc_bits: u32, ai_range_max_v: f64, gain
 pub fn spec_for_type(prb_type: u32) -> Option<ProbeSpec> {
     Some(match prb_type {
         0 => np1("NP1000", 32.0, 20.0, 27.0, 11.0),
-        1020 => np1("NP1020", 87.0, 20.0, 27.0, 11.0),
-        1030 => np1("NP1030", 87.0, 20.0, 27.0, 11.0),
-        1100 => np1("NP1100", 6.0, 6.0, 14.0, 14.0),
-        1110 => np1("NP1110", 6.0, 6.0, 15.5, 15.5),
-        1120 => np1("NP1120", 4.5, 4.5, 6.75, 6.75),
-        1121 => np1("NP1121", 0.0, 3.0, 6.25, 6.25),
-        1122 => np1("NP1122", 3.0, 3.0, 12.5, 12.5),
-        1123 => np1("NP1123", 4.5, 4.5, 10.25, 10.25),
-        1200 => ProbeSpec { mux: MuxFamily::None, ..np1("NP1200", 32.0, 31.0, 56.5, 36.5) },
+        1020 => ProbeSpec { tip_length_um: 373.0, ..np1("NP1020", 87.0, 20.0, 27.0, 11.0) },
+        1030 => ProbeSpec { tip_length_um: 373.0, ..np1("NP1030", 87.0, 20.0, 27.0, 11.0) },
+        1100 => ProbeSpec { tip_length_um: 206.5, ..np1("NP1100", 6.0, 6.0, 14.0, 14.0) },
+        1110 => ProbeSpec { tip_length_um: 203.5, ..np1("NP1110", 6.0, 6.0, 15.5, 15.5) },
+        1120 => ProbeSpec { tip_length_um: 205.75, ..np1("NP1120", 4.5, 4.5, 6.75, 6.75) },
+        1121 => ProbeSpec { tip_length_um: 205.25, ..np1("NP1121", 0.0, 3.0, 6.25, 6.25) },
+        1122 => ProbeSpec { tip_length_um: 205.25, ..np1("NP1122", 3.0, 3.0, 12.5, 12.5) },
+        1123 => ProbeSpec { tip_length_um: 205.75, ..np1("NP1123", 4.5, 4.5, 10.25, 10.25) },
+        1200 => ProbeSpec { mux: MuxFamily::None, tip_length_um: 372.0, ..np1("NP1200", 32.0, 31.0, 56.5, 36.5) },
         1300 => np1("NP1300", 48.0, 20.0, 11.0, 11.0),
         21 => np2("NP2000", 14, 0.5, 80.0),
         24 => np2("NP2010", 14, 0.5, 80.0),
@@ -111,9 +116,9 @@ pub fn spec_for_type(prb_type: u32) -> Option<ProbeSpec> {
         2014 => np2("NP2014", 12, 0.62, 100.0),
         2020 => np2("NP2020", 12, 0.62, 100.0),
         2021 => np2("NP2021", 12, 0.62, 100.0),
-        3010 => np2("NP3010", 12, 0.67, 100.0),
-        3020 => np2("NP3020", 12, 0.67, 100.0),
-        3022 => np2("NP3022", 12, 0.67, 100.0),
+        3010 => ProbeSpec { tip_length_um: 203.0, ..np2("NP3010", 12, 0.67, 100.0) },
+        3020 => ProbeSpec { tip_length_um: 204.0, ..np2("NP3020", 12, 0.67, 100.0) },
+        3022 => ProbeSpec { tip_length_um: 204.0, ..np2("NP3022", 12, 0.67, 100.0) },
         _ => return None,
     })
 }

@@ -33,6 +33,8 @@ pub struct WindowInputs<'a> {
     pub steps: String,
     /// default export folder (Preferences → Default file locations)
     pub export_dir: Option<PathBuf>,
+    /// the spatial filter is CSD, which is not exported
+    pub csd: bool,
 }
 
 /// What the app should do after drawing.
@@ -302,7 +304,7 @@ impl ExportUi {
                 self.free_bytes.map(|f| format!(" · {:.0} GB free", f as f64 / 1e9)).unwrap_or_default()
             ));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                export_clicked = ui.button("Export…").clicked();
+                export_clicked = ui.button("Export…").clicked() || crate::app::enter_applies(ui);
                 if ui.button("Cancel").clicked() {
                     self.open = false;
                 }
@@ -331,6 +333,9 @@ impl ExportUi {
         self.errors.clear();
         self.events_missing = false;
         let s = &self.settings;
+        if inp.csd {
+            self.errors.push("CSD is a display transform and isn't exported: choose another spatial filter.".into());
+        }
         if self.to_s <= self.from_s {
             self.errors.push("The time range is empty: To must be after From.".into());
         }

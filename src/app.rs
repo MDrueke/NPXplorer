@@ -477,6 +477,10 @@ fn view_rows(display_rows: &[DisplayRow], zoom: Option<&Zoom>) -> (usize, usize)
 
 /// Smallest ± voltage range (µV) of the waveform view.
 const WAVEFORM_MIN_RANGE_UV: f32 = 1.0;
+// display ranges while CSD is on (mV/mm²)
+const CSD_PCT_MIN: f32 = 80.0;
+const CSD_SCALE_RANGE: (f32, f32) = (0.1, 1000.0);
+const CSD_WAVEFORM_MIN_RANGE: f32 = 0.01;
 
 /// Smallest drag (px, in each direction) that zooms; anything less stays a click.
 const ZOOM_MIN_DRAG_PX: f32 = 4.0;
@@ -592,6 +596,69 @@ fn channel_at_heatmap_y(result: &PsthResult, heat_rect: egui::Rect, y: f32) -> O
     }
 }
 
+const ENTER_TARGET: &str = "npx_enter_target";
+const ENTER_WINDOWS: &str = "npx_enter_windows";
+const ENTER_BLOCKED: &str = "npx_enter_blocked";
+
+/// Enter applies the main action of one tool window: the window holding the keyboard
+/// focus, otherwise the topmost window (if it has a main action). Decided at the start of the frame, before widgets
+/// move the focus (a text field gives it up on Enter); the windows that asked for Enter
+/// last frame are the candidates. Nothing happens while a popup is open, a field
+/// outside such a window has the focus, or a multi-line text field has it.
+fn route_enter(ctx: &egui::Context) {
+    use egui::{Id, LayerId};
+    let windows: Vec<LayerId> = ctx.data_mut(|d| d.remove_temp(Id::new(ENTER_WINDOWS))).unwrap_or_default();
+    let blocked = ctx.data_mut(|d| d.remove_temp::<bool>(Id::new(ENTER_BLOCKED))).unwrap_or(false);
+    let pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.is_none());
+    let target = if pressed && !blocked && !ctx.memory(|m| m.any_popup_open()) {
+        let focus_layer = ctx.memory(|m| m.focused()).and_then(|id| ctx.read_response(id)).map(|r| r.layer_id);
+        match focus_layer {
+            Some(l) => windows.contains(&l).then_some(l),
+            // the topmost window, if it has a main action (windows are the Middle layers)
+            None => ctx.memory(|m| {
+                m.layer_ids()
+                    .filter(|l| l.order == egui::Order::Middle && m.areas().visible_last_frame(l))
+                    .last()
+                    .filter(|l| windows.contains(l))
+            }),
+        }
+    } else {
+        None
+    };
+    ctx.data_mut(|d| match target {
+        Some(l) => d.insert_temp(Id::new(ENTER_TARGET), l),
+        None => d.remove::<LayerId>(Id::new(ENTER_TARGET)),
+    });
+}
+
+/// Call next to a window's main button: true when Enter should trigger it this frame.
+pub(crate) fn enter_applies(ui: &egui::Ui) -> bool {
+    let layer = ui.layer_id();
+    let id = egui::Id::new(ENTER_WINDOWS);
+    ui.ctx().data_mut(|d| {
+        let w = d.get_temp_mut_or_default::<Vec<egui::LayerId>>(id);
+        if !w.contains(&layer) {
+            w.push(layer);
+        }
+    });
+    ui.ctx().data(|d| d.get_temp::<egui::LayerId>(egui::Id::new(ENTER_TARGET))) == Some(layer)
+}
+
+/// For a multi-line text field: while it has the focus, Enter types a new line instead.
+pub(crate) fn enter_types_newline(resp: &egui::Response) {
+    if resp.has_focus() {
+        resp.ctx.data_mut(|d| d.insert_temp(egui::Id::new(ENTER_BLOCKED), true));
+    }
+}
+
+/// Options CSD needs: one row per depth, and its bandpass in place of the 300 Hz highpass.
+fn enforce_csd_options(c: &mut PreprocConfig) {
+    c.avg_depths = true;
+    if c.csd.bandpass {
+        c.highpass = false;
+    }
+}
+
 /// The preprocessing steps `cfg` applies, in order, for display.
 fn preprocessing_summary(cfg: &PreprocConfig) -> String {
     let mut steps = Vec::new();
@@ -612,6 +679,13 @@ fn preprocessing_summary(cfg: &PreprocConfig) -> String {
         SpatialFilter::GlobalCmr => steps.push("Global CMR".to_string()),
         SpatialFilter::LocalCmr => steps.push("Local CMR".to_string()),
         SpatialFilter::Destripe => steps.push("Destripe".to_string()),
+        SpatialFilter::Csd => {
+            let p = &cfg.csd;
+            if p.bandpass {
+                steps.push(format!("Bandpass {}–{} Hz", p.low_hz, p.high_hz));
+            }
+            steps.push(if p.smoothing { format!("CSD (σ {} µm)", p.sigma_um) } else { "CSD".to_string() });
+        }
     }
     steps.join(" · ")
 }
@@ -701,6 +775,12 @@ pub struct NPXplorerApp {
     waveform_y_range_uv: f32,
     /// voltage at the middle of the waveform view: 0, except when zoomed into a range
     waveform_y_center_uv: f32,
+    /// the colour / waveform values of the unit system not shown now (CSD mV/mm² vs µV);
+    /// swapped with the active ones when CSD switches on or off
+    display_stash: crate::settings::CsdDisplay,
+    display_is_csd: bool,
+    /// colour-scale percentile cache: (window data, from, to, percentile) → value
+    pct_cache: ((usize, usize, usize, u32), f32),
     /// rectangle zoom in the waveform view (left-drag); Esc returns to `WaveformZoom`'s
     /// view before closing the waveform view
     waveform_zoom: Option<WaveformZoom>,
@@ -731,6 +811,10 @@ pub struct NPXplorerApp {
     // noise suppression (visual filter on the view only); the window edits the draft,
     // Apply copies it to `noise`
     noise_open: bool,
+    /// CSD window: the parameters being edited (applied with Apply / Enter)
+    csd_edit: Option<crate::preprocess::CsdParams>,
+    /// "Avg adjacent chans" and the 300 Hz HP as they were before CSD switched them
+    csd_restore: Option<(bool, bool)>,
     /// "Notch filters" section of the noise window (scan + notch list)
     notch_panel: crate::notch::NotchPanel,
     noise: crate::noise::NoiseSuppression,
@@ -909,6 +993,7 @@ impl NPXplorerApp {
             shank_order: Default::default(),
             notches: Vec::new(),
             notch_enabled: false,
+            csd: Default::default(),
         };
 
         let mut view_dur_s = 0.5;
@@ -1014,7 +1099,12 @@ impl NPXplorerApp {
             crate::settings::overlay(&crate::export::ExportSettings::default(), settings_file.get("export"));
         let export_ui = crate::export_ui::ExportUi::new(export_settings, meta.n_samples as f64 / meta.sample_rate);
         let atlas_default = crate::settings::AtlasSettings {
-            insertion: crate::atlas::Insertion { bregma_lambda_mm, ..Default::default() },
+            insertion: crate::atlas::Insertion {
+                bregma_lambda_mm,
+                tip_offset_um: crate::probe::spec_for_type(meta.im_dat_prb_type)
+                    .map_or(crate::atlas::DEFAULT_TIP_OFFSET_UM, |s| s.tip_length_um),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let atlas_settings = match settings_file.get("atlas") {
@@ -1084,6 +1174,9 @@ impl NPXplorerApp {
             waveform_channel: None,
             waveform_y_range_uv: 200.0,
             waveform_y_center_uv: 0.0,
+            display_stash: Default::default(),
+            display_is_csd: false,
+            pct_cache: ((0, 0, 0, 0), 0.0),
             waveform_zoom: None,
             show_remove_channels: false,
             remove_channels_text,
@@ -1101,6 +1194,8 @@ impl NPXplorerApp {
             peak_pooling,
             classify_run_total: 0,
             noise_open: false,
+            csd_edit: None,
+            csd_restore: None,
             notch_panel,
             noise_draft: noise.clone(),
             noise,
@@ -1250,16 +1345,18 @@ impl NPXplorerApp {
             (None, Some(z)) => (z.prev_start_s, z.prev_dur_s),
             (None, None) => (self.view_start_s, self.view_dur_s),
         };
+        let (raw, csd) = self.display_sets();
         BandSettings {
             view_start_s,
             view_dur_s,
             scroll_fine: self.scroll_speed_fine,
             color_mode: self.color_mode.clone(),
-            color_pct: self.color_pct,
-            color_uv: self.color_uv,
+            color_pct: raw.color_pct,
+            color_uv: raw.color_scale,
             colormap: self.colormap_choice.clone(),
             peak_pooling: self.peak_pooling,
-            waveform_y_range_uv: self.waveform_zoom.as_ref().map_or(self.waveform_y_range_uv, |z| z.prev_y_range_uv),
+            waveform_y_range_uv: raw.waveform_range,
+            csd_display: csd,
             preproc: PreprocSettings {
                 dc_removal: c.dc_removal,
                 phase_shift: c.phase_shift,
@@ -1270,6 +1367,7 @@ impl NPXplorerApp {
                 shank_order: c.shank_order,
                 notch_enabled: c.notch_enabled,
                 notches: c.notches.clone(),
+                csd: c.csd.clone(),
             },
             firing_rate: FiringRateSettings {
                 show: self.show_firing_rate_overlay,
@@ -1317,6 +1415,15 @@ impl NPXplorerApp {
         self.colormap_choice = s.colormap;
         self.peak_pooling = s.peak_pooling;
         self.waveform_y_range_uv = s.waveform_y_range_uv.clamp(WAVEFORM_MIN_RANGE_UV, 2000.0);
+        // the µV values are active now; the next frame swaps in the CSD ones if needed
+        let d = s.csd_display;
+        self.display_stash = crate::settings::CsdDisplay {
+            color_pct: d.color_pct.clamp(CSD_PCT_MIN, 100.0),
+            color_scale: d.color_scale.clamp(CSD_SCALE_RANGE.0, CSD_SCALE_RANGE.1),
+            waveform_range: d.waveform_range.clamp(CSD_WAVEFORM_MIN_RANGE, 2000.0),
+        };
+        self.display_is_csd = false;
+        self.waveform_zoom = None;
 
         let c = &mut self.preproc_cfg;
         c.dc_removal = s.preproc.dc_removal;
@@ -1329,6 +1436,10 @@ impl NPXplorerApp {
         c.shank_order = s.preproc.shank_order;
         c.notch_enabled = s.preproc.notch_enabled && !s.preproc.notches.is_empty();
         c.notches = s.preproc.notches;
+        c.csd = s.preproc.csd;
+        if c.spatial_filter == SpatialFilter::Csd {
+            enforce_csd_options(c);
+        }
         self.notch_panel = crate::notch::NotchPanel::new(&self.preproc_cfg.notches, s.notch_scan);
 
         self.show_firing_rate_overlay = s.firing_rate.show;
@@ -1431,8 +1542,8 @@ impl NPXplorerApp {
             // a zoomed window length is not a sensible default for the next session
             view_dur_s: self.zoom.as_ref().map_or(self.view_dur_s, |z| z.prev_dur_s),
             color_mode: self.color_mode.clone(),
-            color_pct: self.color_pct,
-            color_uv: self.color_uv,
+            color_pct: self.display_sets().0.color_pct,
+            color_uv: self.display_sets().0.color_scale,
             colormap_choice: self.colormap_choice.clone(),
             spike_threshold: self.spike_threshold,
             show_firing_rate_overlay: self.show_firing_rate_overlay,
@@ -1569,7 +1680,8 @@ impl NPXplorerApp {
                         .desired_width(250.0)
                         .hint_text(format!("e.g. {example}")),
                 );
-                if resp.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let enter = enter_applies(ui);
+                if resp.lost_focus() || enter {
                     self.apply_remove_channels_text();
                 }
 
@@ -1749,7 +1861,8 @@ impl NPXplorerApp {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.colored_label(egui::Color32::from_rgb(0xff, 0x66, 0x66), &err);
-                    if ui.button("OK").clicked() {
+                    let enter = enter_applies(ui);
+                    if ui.button("OK").clicked() || enter {
                         dismiss = true;
                     }
                 });
@@ -1862,7 +1975,8 @@ impl NPXplorerApp {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.colored_label(egui::Color32::from_rgb(0xff, 0x66, 0x66), &err);
-                    if ui.button("OK").clicked() {
+                    let enter = enter_applies(ui);
+                    if ui.button("OK").clicked() || enter {
                         dismiss = true;
                     }
                 });
@@ -1951,6 +2065,68 @@ impl NPXplorerApp {
         let out = Arc::new(out);
         self.noise_view = Some(NoiseView { key, settings: self.noise.clone(), data: Arc::clone(&out), first: lo, n });
         (Some(out), lo, n)
+    }
+
+    /// CSD settings, opened by the "CSD" spatial filter. Apply (or Enter) switches CSD on
+    /// with them; Cancel (or Esc) leaves everything as it was.
+    fn draw_csd_window(&mut self, ctx: &egui::Context) {
+        let Some(mut p) = self.csd_edit.clone() else { return };
+        let nyq = self.meta.sample_rate / 2.0;
+        let valid = !p.bandpass || p.high_hz > p.low_hz;
+        let (mut apply, mut cancel) = (false, false);
+        egui::Window::new("CSD").collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut p.smoothing, "Gaussian smoothing, σ:").on_hover_text(
+                    "Smoothing along depth before the second derivative, which strongly amplifies noise that differs from row to row. For LFP, 40–80 µm; below ~30 µm the result is mostly noise.",
+                );
+                ui.add_enabled(p.smoothing, egui::DragValue::new(&mut p.sigma_um).speed(1.0).range(1.0..=300.0).suffix(" µm"));
+            });
+            ui.checkbox(&mut p.bandpass, "Bandpass before CSD").on_hover_text(
+                "Zero-phase Butterworth, order 3 at each edge; replaces the 300 Hz highpass. For LFP sinks and sources use e.g. 1–300 Hz. NP 1.0 AP data is usually highpassed in hardware (last imro field), so it has little signal below 300 Hz; NP 2.0 AP data is wideband.",
+            );
+            ui.add_enabled_ui(p.bandpass, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut p.low_hz).speed(0.5).range(0.1..=nyq * 0.9).suffix(" Hz"));
+                    ui.label("to");
+                    ui.add(egui::DragValue::new(&mut p.high_hz).speed(5.0).range(1.0..=nyq * 0.95).suffix(" Hz"));
+                });
+            });
+            if !valid {
+                ui.colored_label(egui::Color32::from_rgb(0xff, 0x66, 0x66), "The upper cutoff must be above the lower one.");
+            }
+            ui.label(
+                egui::RichText::new("Shown as −∂²φ/∂z² in mV/mm² (no tissue conductivity assumed); sinks are negative. Without a bandpass, AP data gives a spike-band Laplacian rather than an LFP CSD.")
+                    .small()
+                    .color(egui::Color32::GRAY),
+            );
+            ui.horizontal(|ui| {
+                let enter = enter_applies(ui);
+                if ui.add_enabled(valid, egui::Button::new("Apply")).clicked() || (enter && valid) {
+                    apply = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if apply {
+            let c = &mut self.preproc_cfg;
+            if c.spatial_filter != SpatialFilter::Csd {
+                self.csd_restore = Some((c.avg_depths, c.highpass));
+                c.spatial_filter = SpatialFilter::Csd;
+            }
+            c.csd = p;
+            // the 300 Hz HP comes back when the bandpass is switched off
+            if let (false, Some((_, hp))) = (c.csd.bandpass, self.csd_restore) {
+                c.highpass = hp;
+            }
+            enforce_csd_options(c);
+            *self.preproc_filters.lock().unwrap() = Filters::new(c);
+            self.heatmap_texture = None;
+            self.csd_edit = None;
+        } else {
+            self.csd_edit = (!cancel).then_some(p);
+        }
     }
 
     /// Settings window opened by the "Power Spectrum" toolbar button.
@@ -2187,7 +2363,8 @@ impl NPXplorerApp {
                     }
                 } else {
                     ui.horizontal(|ui| {
-                        if ui.button("Calculate").clicked() {
+                        let enter = enter_applies(ui);
+                        if ui.button("Calculate").clicked() || enter {
                             self.spectrum_show_overlay = true;
                             match self.spectrum_time_scope {
                                 SpectrumTimeScope::WholeRecordingChunks => self.dispatch_spectrum(ui.ctx()),
@@ -2334,7 +2511,9 @@ impl NPXplorerApp {
                     ui.label(egui::RichText::new("no overlays calculated").color(egui::Color32::GRAY));
                 }
                 ui.add_space(4.0);
-                if ui.add_enabled(self.screenshot.pick_rx.is_none(), egui::Button::new("Save…")).clicked() {
+                let enter = enter_applies(ui);
+                let can_save = self.screenshot.pick_rx.is_none();
+                if ui.add_enabled(can_save, egui::Button::new("Save…")).clicked() || (enter && can_save) {
                     self.screenshot.error = None;
                     self.screenshot.pick_rx = Some(spawn_png_saver(
                         self.bin_path.parent().map(|p| p.to_path_buf()),
@@ -2398,6 +2577,7 @@ impl NPXplorerApp {
             view_s: (self.view_start_s, self.view_dur_s),
             steps,
             export_dir: FileLocations::resolve(&self.file_locations.export, &self.bin_path),
+            csd: self.preproc_cfg.spatial_filter == SpatialFilter::Csd,
         };
         let req = self.export_ui.draw_window(ctx, &inputs);
         self.handle_export_requests(vec![req], ctx);
@@ -2519,7 +2699,7 @@ impl NPXplorerApp {
         let painter = ui.painter_at(rect);
 
         // vertical axis: ±half_range around the centre voltage
-        let half_range = self.waveform_y_range_uv.max(WAVEFORM_MIN_RANGE_UV);
+        let half_range = self.waveform_y_range_uv.max(self.waveform_min_range());
         let center_uv = self.waveform_y_center_uv;
         let mid_y = rect.center().y;
         let half_h = rect.height() * 0.5 - 4.0;
@@ -2554,7 +2734,7 @@ impl NPXplorerApp {
                     self.view_start_s = t0.clamp(0.0, (total_s - self.view_dur_s).max(0.0));
                     self.window_dur_str = format!("{:.3}", self.view_dur_s);
                     self.waveform_y_center_uv = (v_lo + v_hi) / 2.0;
-                    self.waveform_y_range_uv = ((v_hi - v_lo) / 2.0).max(WAVEFORM_MIN_RANGE_UV);
+                    self.waveform_y_range_uv = ((v_hi - v_lo) / 2.0).max(self.waveform_min_range());
                     ui.ctx().request_repaint();
                 }
             } else {
@@ -2648,10 +2828,11 @@ impl NPXplorerApp {
                         ));
 
                         let hint = if self.capture.is_some() { "" } else { " (Alt+scroll to rescale, drag to zoom)" };
+                        let (unit, p) = (self.unit(), if self.display_is_csd { 2 } else { 0 });
                         let range = if center_uv == 0.0 {
-                            format!("±{half_range:.0} µV")
+                            format!("±{half_range:.p$} {unit}")
                         } else {
-                            format!("{:.1} to {:.1} µV", center_uv - half_range, center_uv + half_range)
+                            format!("{:.p1$} to {:.p1$} {unit}", center_uv - half_range, center_uv + half_range, p1 = p + 1)
                         };
                         painter.text(
                             egui::pos2(rect.left() + 6.0, rect.top() + 4.0),
@@ -2668,17 +2849,18 @@ impl NPXplorerApp {
                                 &painter,
                                 rect,
                                 format!(
-                                    "{id}  t = {:.4}–{:.4} s  {:.1} to {:.1} µV",
+                                    "{id}  t = {:.4}–{:.4} s  {:.p$} to {:.p$} {unit}",
                                     t_at(sel.left()),
                                     t_at(sel.right()),
                                     uv_at(sel.bottom()),
-                                    uv_at(sel.top())
+                                    uv_at(sel.top()),
+                                    p = p + 1
                                 ),
                             ),
                             (None, Some((i, pt))) => {
                                 painter.circle_filled(pt, line_width + 2.0, line_color);
                                 let t = (ov_start + i) as f64 / self.meta.sample_rate;
-                                draw_readout(&painter, rect, format!("{id}  t = {t:.4} s  {:.1} µV", samples[i]));
+                                draw_readout(&painter, rect, format!("{id}  t = {t:.4} s  {:.p$} {unit}", samples[i], p = p + 1));
                             }
                             (None, None) => {}
                         }
@@ -2722,6 +2904,46 @@ impl NPXplorerApp {
     }
 
     /// Return to the waveform view from before the zoom; false if not zoomed.
+    /// Display values (µV ones, CSD ones), whichever set is active.
+    fn display_sets(&self) -> (crate::settings::CsdDisplay, crate::settings::CsdDisplay) {
+        let active = crate::settings::CsdDisplay {
+            color_pct: self.color_pct,
+            color_scale: self.color_uv,
+            waveform_range: self.waveform_zoom.as_ref().map_or(self.waveform_y_range_uv, |z| z.prev_y_range_uv),
+        };
+        if self.display_is_csd {
+            (self.display_stash.clone(), active)
+        } else {
+            (active, self.display_stash.clone())
+        }
+    }
+
+    /// Swap in the colour / waveform values of the unit system CSD needs (mV/mm²), or
+    /// back to µV, when CSD has been switched since the last frame.
+    fn sync_display_units(&mut self) {
+        let csd = self.preproc_cfg.spatial_filter == SpatialFilter::Csd;
+        if csd == self.display_is_csd {
+            return;
+        }
+        self.leave_waveform_zoom();
+        let s = &mut self.display_stash;
+        std::mem::swap(&mut self.color_pct, &mut s.color_pct);
+        std::mem::swap(&mut self.color_uv, &mut s.color_scale);
+        std::mem::swap(&mut self.waveform_y_range_uv, &mut s.waveform_range);
+        self.color_pct_str = format!("{:.2}", self.color_pct);
+        self.color_uv_str = format!("{:.0}", self.color_uv);
+        self.display_is_csd = csd;
+        self.heatmap_texture = None;
+    }
+
+    fn unit(&self) -> &'static str {
+        if self.display_is_csd { "mV/mm²" } else { "µV" }
+    }
+
+    fn waveform_min_range(&self) -> f32 {
+        if self.display_is_csd { CSD_WAVEFORM_MIN_RANGE } else { WAVEFORM_MIN_RANGE_UV }
+    }
+
     fn leave_waveform_zoom(&mut self) -> bool {
         let Some(z) = self.waveform_zoom.take() else { return false };
         self.view_start_s = z.prev_start_s;
@@ -2999,27 +3221,42 @@ impl NPXplorerApp {
 
             // Color scale controls
             ui.label("Color scale:");
+            let unit_label = format!("±{}", self.unit());
 
             if ui
                 .radio_value(&mut self.color_mode, ColorMode::Percentile, "%ile")
                 .changed()
                 || ui
-                    .radio_value(&mut self.color_mode, ColorMode::Voltage, "±µV")
+                    .radio_value(&mut self.color_mode, ColorMode::Voltage, unit_label)
                     .changed()
             {
                 self.heatmap_texture = None;
             }
 
+            let csd = self.display_is_csd;
             if self.color_mode == ColorMode::Percentile {
+                let (min, step) = if csd { (CSD_PCT_MIN, 0.5) } else { (95.0, 0.1) };
                 if ui
                     .add(
-                        egui::Slider::new(&mut self.color_pct, 95.0..=100.0)
-                            .step_by(0.1)
+                        egui::Slider::new(&mut self.color_pct, min..=100.0)
+                            .step_by(step)
                             .text("%"),
                     )
                     .changed()
                 {
                     self.color_pct_str = format!("{:.2}", self.color_pct);
+                    self.heatmap_texture = None;
+                }
+            } else if csd {
+                if ui
+                    .add(
+                        egui::Slider::new(&mut self.color_uv, CSD_SCALE_RANGE.0..=CSD_SCALE_RANGE.1)
+                            .logarithmic(true)
+                            .max_decimals(2)
+                            .text("mV/mm²"),
+                    )
+                    .changed()
+                {
                     self.heatmap_texture = None;
                 }
             } else {
@@ -3079,11 +3316,13 @@ impl NPXplorerApp {
                 ui.separator();
             }
 
-            let hp_enabled = self.preproc_cfg.spatial_filter != SpatialFilter::Destripe;
+            let is_csd = self.preproc_cfg.spatial_filter == SpatialFilter::Csd;
+            let csd_bandpass = is_csd && self.preproc_cfg.csd.bandpass;
+            let hp_enabled = self.preproc_cfg.spatial_filter != SpatialFilter::Destripe && !csd_bandpass;
             let mut hp = self.preproc_cfg.highpass;
             if ui
                 .add_enabled(hp_enabled, egui::Checkbox::new(&mut hp, "300 Hz HP"))
-                .on_disabled_hover_text("Included in destripe")
+                .on_disabled_hover_text(if csd_bandpass { "Replaced by the CSD bandpass" } else { "Included in destripe" })
                 .changed()
             {
                 self.preproc_cfg.highpass = hp;
@@ -3105,8 +3344,23 @@ impl NPXplorerApp {
                 || ui
                     .radio_value(&mut spatial, SpatialFilter::Destripe, "Destripe")
                     .changed();
+            // CSD is chosen in its window (opened here), which applies it
+            if ui
+                .radio(is_csd, "CSD")
+                .on_hover_text("Current source density along depth. Opens its settings; Enter applies.")
+                .clicked()
+            {
+                self.csd_edit = Some(self.preproc_cfg.csd.clone());
+            }
 
             if changed {
+                // leaving CSD: give back the options it switched
+                if is_csd {
+                    if let Some((avg, hp)) = self.csd_restore.take() {
+                        self.preproc_cfg.avg_depths = avg;
+                        self.preproc_cfg.highpass = hp;
+                    }
+                }
                 if spatial == SpatialFilter::Destripe {
                     self.preproc_cfg.highpass = true;
                 }
@@ -3122,7 +3376,11 @@ impl NPXplorerApp {
 
             // depth averaging checkbox
             let mut avg = self.preproc_cfg.avg_depths;
-            if ui.checkbox(&mut avg, "Avg adjacent chans").changed() {
+            if ui
+                .add_enabled(!is_csd, egui::Checkbox::new(&mut avg, "Avg adjacent chans"))
+                .on_disabled_hover_text("CSD needs one row per depth")
+                .changed()
+            {
                 self.preproc_cfg.avg_depths = avg;
                 self.heatmap_texture = None;
             }
@@ -3510,12 +3768,14 @@ impl NPXplorerApp {
                 ui.separator();
 
                 // Apply: commit the staged settings and recompute
+                let enabled = self.psth.event_path.is_some() && !self.psth.computing;
+                let enter = enter_applies(ui);
                 let apply = ui.add_enabled(
-                    self.psth.event_path.is_some() && !self.psth.computing,
+                    enabled,
                     egui::Button::new(egui::RichText::new("Apply/Compute").color(c_zero))
                         .fill(accent_50),
                 );
-                if apply.clicked() {
+                if apply.clicked() || (enter && enabled) {
                     self.psth.apply_requested = true;
                 }
             });
@@ -3526,8 +3786,10 @@ impl NPXplorerApp {
                 changed |= ui
                     .radio_value(&mut self.psth.color_mode, ColorMode::Percentile, "%ile")
                     .changed();
+                let csd = self.psth.result.as_ref().is_some_and(|r| r.csd);
+                let unit = if csd { "mV/mm²" } else { "µV" };
                 changed |= ui
-                    .radio_value(&mut self.psth.color_mode, ColorMode::Voltage, "±µV")
+                    .radio_value(&mut self.psth.color_mode, ColorMode::Voltage, format!("±{unit}"))
                     .changed();
                 if self.psth.color_mode == ColorMode::Percentile {
                     changed |= ui
@@ -3538,8 +3800,9 @@ impl NPXplorerApp {
                         )
                         .changed();
                 } else {
+                    let min = if csd { 0.01 } else { 1.0 };
                     changed |= ui
-                        .add(egui::Slider::new(&mut self.psth.color_uv, 1.0..=200.0).text("µV"))
+                        .add(egui::Slider::new(&mut self.psth.color_uv, min..=200.0).logarithmic(csd).text(unit))
                         .changed();
                 }
                 if changed {
@@ -3636,8 +3899,8 @@ impl NPXplorerApp {
                     self.psth.color_pct = (self.psth.color_pct - ticks * 0.1).clamp(95.0, 100.0);
                 } else {
                     // multiplicative, so the step suits both 2 µV and 200 µV
-                    self.psth.color_uv =
-                        (self.psth.color_uv * 1.1f32.powf(-ticks)).clamp(1.0, 200.0);
+                    let min = if self.psth.result.as_ref().is_some_and(|r| r.csd) { 0.01 } else { 1.0 };
+                    self.psth.color_uv = (self.psth.color_uv * 1.1f32.powf(-ticks)).clamp(min, 200.0);
                 }
                 self.psth.tex_dirty = true;
             }
@@ -3906,14 +4169,14 @@ impl NPXplorerApp {
         painter.text(
             egui::pos2(rect.left() + 2.0, sel_mid),
             egui::Align2::LEFT_CENTER,
-            "chan µV",
+            if result.csd { "chan mV/mm²" } else { "chan µV" },
             fid.clone(),
             txt,
         );
         painter.text(
             egui::pos2(rect.left() + 2.0, avg_mid),
             egui::Align2::LEFT_CENTER,
-            "mean µV",
+            if result.csd { "mean mV/mm²" } else { "mean µV" },
             fid.clone(),
             txt,
         );
@@ -3996,6 +4259,7 @@ impl NPXplorerApp {
             (export_result.is_some(), title(export_result.unwrap_or_default()), 13),
             (self.show_file_locations, title("Default file locations"), 14),
             (self.spikes.open, title("Spike-sorted data"), 15),
+            (self.csd_edit.is_some(), title("CSD"), 16),
         ]
         .into_iter()
         .filter(|(is_open, ..)| *is_open)
@@ -4047,7 +4311,8 @@ impl NPXplorerApp {
             12 => self.export_ui.open = false,
             13 => self.export_ui.close_result(),
             14 => self.show_file_locations = false,
-            _ => self.spikes.open = false,
+            15 => self.spikes.open = false,
+            _ => self.csd_edit = None,
         }
     }
 
@@ -4064,6 +4329,8 @@ impl NPXplorerApp {
         let capturing = self.capture.is_some();
         self.atlas.no_hover = capturing;
         self.close_top_window_on_escape(ctx);
+        route_enter(ctx);
+        self.sync_display_units();
         self.poll_and_maybe_dispatch_psth(ctx);
         self.poll_remove_channels_picker(ctx);
         self.poll_classify(ctx);
@@ -4080,6 +4347,7 @@ impl NPXplorerApp {
             self.draw_classify_progress_window(ctx);
             self.draw_spectrum_error_window(ctx);
             self.draw_spectrum_window(ctx);
+            self.draw_csd_window(ctx);
             self.draw_noise_window(ctx);
             self.draw_channel_context_menu(ctx);
             self.atlas
@@ -4338,10 +4606,14 @@ impl NPXplorerApp {
             if self.waveform_channel.is_some() {
                 // proportional steps, so the scale stays usable when zoomed to a few µV
                 self.waveform_y_range_uv = (self.waveform_y_range_uv * 1.05f32.powf(-ticks))
-                    .clamp(WAVEFORM_MIN_RANGE_UV, 2000.0);
+                    .clamp(self.waveform_min_range(), 2000.0);
             } else if self.color_mode == ColorMode::Percentile {
-                self.color_pct = (self.color_pct - ticks * 0.1).clamp(95.0, 100.0);
+                let (min, step) = if self.display_is_csd { (CSD_PCT_MIN, 0.5) } else { (95.0, 0.1) };
+                self.color_pct = (self.color_pct - ticks * step).clamp(min, 100.0);
                 self.color_pct_str = format!("{:.2}", self.color_pct);
+                self.heatmap_texture = None;
+            } else if self.display_is_csd {
+                self.color_uv = (self.color_uv * 1.1f32.powf(-ticks)).clamp(CSD_SCALE_RANGE.0, CSD_SCALE_RANGE.1);
                 self.heatmap_texture = None;
             } else {
                 self.color_uv = (self.color_uv - ticks * 5.0).clamp(10.0, 300.0);
@@ -4417,7 +4689,8 @@ impl NPXplorerApp {
                     self.last_view_first = view_first;
                 }
 
-                crate::worker::update_view_window(&self.worker_state, &mut self.view_window, view_first, view_n, &self.preproc_cfg);
+                let pad = (fs as usize).max(view_n);
+                crate::worker::update_view_window(&self.worker_state, &mut self.view_window, view_first, view_n, pad, &self.preproc_cfg);
                 let (buf_first, buf_n_samp, buf_data, buf_cfg, buf_display_rows, matches_view, matches_cfg) =
                     match &self.view_window {
                         Some(w) => {
@@ -4447,18 +4720,30 @@ impl NPXplorerApp {
                 }
 
                 // colour range from current UI settings — valid whenever cfg matches,
-                // regardless of exact time coverage (percentile table covers the view's
-                // blocks ±1). With peak pooling the %ile is taken from the
+                // regardless of exact time coverage. With peak pooling the %ile is taken from the
                 // pooled values on screen instead: pooled extremes sit well above the raw
                 // samples' percentiles, so a raw-sample range would saturate the map.
                 let vmax = if matches_cfg {
                     if self.color_mode == ColorMode::Percentile && self.peak_pooling {
                         0.0 // unused: ColorScale::ViewPercentile below
                     } else if self.color_mode == ColorMode::Percentile {
-                        let pct_idx = (self.color_pct * 100.0).round() as usize;
-                        self.view_window.as_ref().map_or(250.0, |w| w.vmax_pct[pct_idx.min(10000)].max(1.0))
+                        // over ±1 s around the view, or the view if it is longer
+                        let floor = if self.display_is_csd { 1e-4 } else { 1.0 };
+                        let center = view_first + view_n / 2;
+                        let half = (view_n / 2).max(fs as usize);
+                        match &self.view_window {
+                            Some(w) => {
+                                let key = (Arc::as_ptr(&w.data) as usize, center.saturating_sub(half), center + half, self.color_pct.to_bits());
+                                if self.pct_cache.0 != key {
+                                    let v = crate::worker::window_percentile(w, key.1, key.2, self.color_pct).unwrap_or(250.0);
+                                    self.pct_cache = (key, v);
+                                }
+                                self.pct_cache.1.max(floor)
+                            }
+                            None => 250.0,
+                        }
                     } else {
-                        self.color_uv.max(1.0)
+                        self.color_uv.max(if self.display_is_csd { 1e-4 } else { 1.0 })
                     }
                 } else { 250.0 };
 
@@ -4506,7 +4791,12 @@ impl NPXplorerApp {
                                 || self.proj_rows != Some((first_row, last_row))
                                 || buf_changed;
 
-                            if proj_stale && self.show_firing_rate_overlay {
+                            // a µV spike threshold means nothing on CSD values
+                            let csd = self.preproc_cfg.spatial_filter == SpatialFilter::Csd;
+                            if csd {
+                                self.projection_sums.clear();
+                            }
+                            if proj_stale && self.show_firing_rate_overlay && !csd {
                                 let visible = &display_rows[first_row..=last_row];
                                 let mut sums = vec![0.0f32; visible.len()];
 
@@ -5313,7 +5603,8 @@ impl NPXplorerApp {
                                 } else { None }
                             } else { None };
 
-                            let volt_str = voltage_uv.map(|v| format!("  {:.1} µV", v)).unwrap_or_default();
+                            let p = if self.display_is_csd { 3 } else { 1 };
+                            let volt_str = voltage_uv.map(|v| format!("  {:.p$} {}", v, self.unit())).unwrap_or_default();
                             let mut label = format!("{}t = {:.4} s{}", ch_str, t, volt_str);
                             // while dragging a zoom rectangle: the channel and time ranges it covers
                             if let Some(start) = self.zoom_drag_start {

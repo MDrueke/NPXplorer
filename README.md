@@ -1,8 +1,8 @@
-# NPXplorer v0.9.0
+# NPXplorer v0.9.2
 
 A viewer for raw Neuropixels recordings. Shows the voltage of all channels as a heatmap laid out by the probe geometry.
 
-- Fast scrolling through the whole recording, with preprocessing (DC, phase shift, highpass, CMR, destripe) applied on the fly
+- Fast scrolling through the whole recording, with preprocessing (DC, phase shift, highpass, CMR, destripe, CSD) applied on the fly
 - Single-channel waveform view
 - Firing rate overlay
 - Power spectrum overlay (per-channel PSD)
@@ -37,6 +37,7 @@ Channels are named as in the recording's metadata (e.g. `AP12` for SpikeGLX, `CH
 - **Arrow keys** or **A/D**: jump half a window.
 - **Navigation bar** (bottom): click to jump. The solid marker shows the displayed window, the shaded area the part that is already preprocessed.
 - **Left-drag** on the heatmap: draw a rectangle to zoom into its channels and time range (the readout at the bottom left shows both while dragging). You can zoom again inside the zoomed view.
+- **Enter**: applies the main action of the window you are typing in, or else of the topmost window (Apply, Apply/Compute, Calculate, Save…, Export…, Load, OK); in a multi-line text field it starts a new line.
 - **Esc**: closes the topmost open window, one per press, aborting what it is calculating (in a progress window, Esc is Abort; while exporting, it aborts the export); with no window open, it leaves the waveform view's zoom, then the waveform view, then the heatmap's zoom (returning to the full view and the previous time window).
 
 ### Selecting channels
@@ -57,6 +58,7 @@ When a recording is opened for the first time, the list starts with the probe's 
 - **Notch (n)**: the notch filters set up in the Noise Suppression window (shown once there are any). Applied after DC removal, before the highpass.
 - **300 Hz HP**: zero-phase highpass filter (always on with Destripe).
 - **Spatial**: **Global CMR** (subtract the median of all channels of the shank), **Local CMR** (median of nearby channels), or **Destripe** (IBL-style). Destripe's spatial filter runs along physical depth over each stretch of neighbouring electrodes — it never mixes channels across a gap in the layout (drawn as a dotted line) or across shanks, whatever the display order.
+- **CSD**: current source density along depth, for AP and LF files. Choosing it opens a small window (**Apply** or Enter switches it on, Esc cancels): optional **Gaussian smoothing** along depth with **σ** (default on, 40 µm; for LFP 40–80 µm, below ~30 µm the result is mostly noise) before the second derivative, and an optional zero-phase **Bandpass** (Butterworth, order 3 at each edge; default on, 5–150 Hz as in the Allen Brain Observatory Neuropixels CSD; lower the low cut to ~1 Hz for slow oscillations) that replaces the 300 Hz HP. The derivative uses the actual spacing of the rows (removed channels leave gaps), is computed per stretch of neighbouring electrodes and per shank, and mirrors the end rows (Vaknin). Values are shown as −∂²φ/∂z² in **mV/mm²** (no tissue conductivity assumed; multiply by σ ≈ 0.3 S/m for µA/mm³), so sinks are negative. While CSD is on, the colour scale, the hover readout, the waveform view and the PSTH use mV/mm², and CSD keeps its own colour settings (percentile 80–100 %, default 95 %; fixed range 0.1–1000 mV/mm², default ±10), so switching CSD off brings the µV ones back. A strong sink/source pair (e.g. at the brain surface) can still leave the rest dark: lower the percentile, or remove the channels outside the brain. CSD switches **Avg adjacent chans** on (one row per depth) and, with the bandpass, the 300 Hz HP off; choosing another spatial filter restores both. For LFP sinks and sources use the bandpass; without it, AP data gives a spike-band Laplacian. NP 1.0 AP data was usually highpassed in hardware (last field of each `~imroTbl` entry in the meta file), NP 2.0 AP data is wideband. While CSD is on, the firing-rate overlay is hidden and export is refused.
 - **Avg adjacent chans**: average channels at the same depth into one row.
 
 ### Noise suppression
@@ -73,7 +75,7 @@ Voltages are scaled per channel from the metadata: SpikeGLX gains from `~imroTbl
 
 ### Color scale
 
-- **%ile**: the color range follows a percentile of the displayed voltages; **±µV**: a fixed range. **Alt + scroll** adjusts either.
+- **%ile**: the color range follows a percentile of the values within ±1 s of the view's centre (the whole view, if it is longer); **±µV**: a fixed range. **Alt + scroll** adjusts either.
 - **Peak pooling** (Preferences, off by default): when a pixel column covers many samples (long windows), it shows the sample with the largest magnitude instead of the mean, so spikes keep their amplitude at any window length. In **%ile** mode the colour range then follows the values on screen. Off gives a smoother, mean-based picture (better for LFP).
 
 ### Firing rate overlay
@@ -89,7 +91,7 @@ Marks dead (magenta), noisy (red) and out-of-brain (green) channels with a color
 Draws the borders between brain regions of the Allen mouse atlas (CCF 2017, 10 µm) on the heatmap, from the probe's insertion coordinates. It needs a folder, set in **Preferences → Default file locations…**, with `annotation_10.nrrd` from the [Allen Institute](https://download.alleninstitute.org/informatics-archive/current-release/mouse_ccf/annotation/ccf_2017/) and the structure ontology saved as `query.csv` from the [Allen API](https://api.brain-map.org/api/v2/data/query.csv?criteria=model::Structure,rma::criteria,[ontology_id$eq1],rma::options[order$eq%27structures.graph_order%27][num_rows$eqall]). On the first load, the `.nrrd` is converted once into `annotation_10_npxplorer.npy` (2.4 GB) and `annotation_10_npxplorer_ids.txt` in the same folder, which takes a while and needs write access to the folder.
 
 - **Insertion**: AP and ML in mm from bregma (AP positive = anterior, ML positive = right). Angles as **Azimuth / elevation / rotation** (azimuth from the lambda→bregma axis, elevation from horizontal) or **Polar / azimuth / roll** (polar angle from vertical, azimuth from +ML). Rotation/roll turns the probe around its axis, which matters for multi-shank probes.
-- **Depth**: from the brain surface to the tip, along the probe; the tip offset is the distance from the tip to the first electrode row (default 195 µm).
+- **Depth**: from the brain surface to the tip, along the probe; the tip offset is the distance from the tip to the first electrode row (default from the probe type: 209 µm for NP 1.0, 206 µm for NP 2.0).
 - **Bregma–lambda distance** (default 4.1 mm) scales the atlas to the animal.
 
 Hover a region label for its full name; the hovered channel's region also appears in the readout at the bottom left. With channels ordered by ID, borders and labels are hidden. Regions with fewer channels than set in **Skip drawing regions with less than … channels** (default 4; 0 draws all) are not drawn on their own: their channels are split between the neighboring regions. The readout and **Save** still use the exact regions. To match the borders to the data:

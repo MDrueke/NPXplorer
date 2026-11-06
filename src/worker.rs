@@ -17,15 +17,12 @@ const MIN_BLOCK_S: f64 = 2.0;
 const BLOCK_PER_OVERLAP: usize = 10;
 // background fill reaches this many times further ahead (scroll direction) than behind
 const BEHIND_WEIGHT: usize = 3;
-// |values| kept per block for the colour scale
-const PCT_SAMPLES_PER_BLOCK: usize = 20_000;
+// values sampled for the colour-scale percentile
+const PCT_MAX_SAMPLES: usize = 200_000;
 // i16 storage range relative to the ADC's full range (room for CMR / filter overshoot)
 const QUANT_HEADROOM: f64 = 4.0;
 // how often an idle worker re-checks free memory (other apps may grow or shrink)
 const IDLE_RECHECK: Duration = Duration::from_secs(1);
-
-/// Percentile lookup table: vmax_pct[p] = p-th percentile of |data| (p = 0..=100.0, 0.01 steps).
-pub type PctTable = Box<[f32; 10001]>;
 
 // ---------------------------------------------------------------------------
 // Block cache
@@ -34,13 +31,11 @@ pub type PctTable = Box<[f32; 10001]>;
 struct Block {
     /// [row][sample], µV = value * step_uv
     data: Vec<i16>,
-    /// sorted sample of |µV|, for the colour scale
-    abs_sample: Vec<f32>,
 }
 
 impl Block {
     fn bytes(&self) -> usize {
-        self.data.len() * 2 + self.abs_sample.len() * 4
+        self.data.len() * 2
     }
 }
 
@@ -68,7 +63,8 @@ impl BlockCache {
         let display_rows = Arc::new(meta.build_display_rows(cfg.avg_depths, &cfg.removed_channels, cfg.channel_order, cfg.shank_order));
         let n_rows = display_rows.iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
         let fs = meta.sample_rate;
-        let mut overlap = MIN_OVERLAP_SAMP.max((crate::notch::settle_s(cfg) * fs).ceil() as usize);
+        let settle_s = crate::notch::settle_s(cfg).max(crate::preprocess::bandpass_settle_s(cfg));
+        let mut overlap = MIN_OVERLAP_SAMP.max((settle_s * fs).ceil() as usize);
         if cfg.spatial_filter == SpatialFilter::Destripe {
             overlap = overlap.max(filt.kfilt_lagc);
         }
@@ -108,7 +104,7 @@ impl BlockCache {
     }
 
     fn block_bytes(&self) -> usize {
-        self.n_rows * self.block_samp * 2 + PCT_SAMPLES_PER_BLOCK * 4
+        self.n_rows * self.block_samp * 2
     }
 
     fn insert(&mut self, b: usize, block: Block) {
@@ -221,39 +217,39 @@ pub fn cache_display_rows(shared: &SharedWorkerState) -> Option<Arc<Vec<DisplayR
 // View window
 // ---------------------------------------------------------------------------
 
-/// Contiguous f32 copy of the cached blocks around the view — what the heatmap,
-/// waveform view and overlays read. Layout: data[row * n_samp + t], µV.
+/// Contiguous f32 copy of the cached data around the view, in display units (µV, or
+/// mV/mm² for CSD) — what the heatmap, waveform view and overlays read.
+/// Layout: data[row * n_samp + t].
 pub struct ViewWindow {
     pub first_sample: usize,
     pub n_samp: usize,
     pub data: Arc<Vec<f32>>,
     pub cfg: PreprocConfig,
     pub display_rows: Arc<Vec<DisplayRow>>,
-    /// percentiles of |data| over the view's blocks ±1
-    pub vmax_pct: PctTable,
-    key: (u64, std::ops::Range<usize>, Vec<usize>),
+    cache_id: u64,
 }
 
-/// Rebuild `window` if the cached blocks it should consist of have changed. It covers
-/// the view ± half a view width (at most one block), rounded out to whole blocks; with gaps, the run of
-/// cached blocks that covers most of the view. Left untouched if the cache is for
-/// another config or has nothing near the view.
+/// Keep `window` covering the view ± `pad` samples, as far as the cached blocks allow
+/// (with gaps: the run of cached blocks that covers most of the view). Rebuilt when the
+/// view comes within half of `pad` of its edge, or when more of that range is cached.
+/// Left untouched if the cache is for another config or has nothing near the view.
 pub fn update_view_window(
     shared: &SharedWorkerState,
     window: &mut Option<ViewWindow>,
     view_first: usize,
     view_n: usize,
+    pad: usize,
     cfg: &PreprocConfig,
 ) {
-    let (key, blocks, pct_blocks, cfg, display_rows, block_samp, step_uv, n_rows) = {
+    let (lo, hi, blocks, cfg, display_rows, cache_id, block_samp, scale, n_rows) = {
         let st = shared.0.lock().unwrap();
         let Some(c) = &st.cache else { return };
         if c.cfg != *cfg {
             return;
         }
-        let view = c.range(view_first, view_first + view_n);
-        let pad = (view_n / 2).min(c.block_samp);
-        let wanted = c.range(view_first.saturating_sub(pad), view_first + view_n + pad);
+        let view_end = view_first + view_n;
+        let view = c.range(view_first, view_end);
+        let wanted = c.range(view_first.saturating_sub(pad), view_end + pad);
 
         // runs of cached blocks inside `wanted`; keep the one sharing most blocks with the view
         let mut best: Option<std::ops::Range<usize>> = None;
@@ -273,44 +269,62 @@ pub fn update_view_window(
             }
         }
         let Some(run) = best else { return };
-        let pct_blocks: Vec<usize> = (view.start.saturating_sub(1)..view.end + 1)
-            .filter(|b| c.blocks.contains_key(b))
-            .collect();
-        let key = (c.id, run.clone(), pct_blocks.clone());
-        if window.as_ref().is_some_and(|w| w.key == key) {
+        let run_lo = run.start * c.block_samp;
+        let run_hi = (run.end * c.block_samp).min(c.n_samples);
+        let clip = |lo: usize, hi: usize| (lo.max(run_lo), hi.min(run_hi));
+
+        // still good: covers the view ± pad/2, as far as cached
+        let (need_lo, need_hi) = clip(view_first.saturating_sub(pad / 2), view_end + pad / 2);
+        if let Some(w) = window.as_ref() {
+            if w.cache_id == c.id && w.first_sample <= need_lo && w.first_sample + w.n_samp >= need_hi {
+                return;
+            }
+        }
+        let (lo, hi) = clip(view_first.saturating_sub(pad), view_end + pad);
+        if lo >= hi {
             return;
         }
-        let blocks: Vec<(usize, Arc<Block>)> = run.clone().map(|b| (c.block_len(b), Arc::clone(&c.blocks[&b]))).collect();
-        let pct_blocks: Vec<Arc<Block>> = pct_blocks.iter().map(|b| Arc::clone(&c.blocks[b])).collect();
-        (key, blocks, pct_blocks, c.cfg.clone(), Arc::clone(&c.display_rows), c.block_samp, c.step_uv, c.n_rows)
+        let blocks: Vec<(usize, Arc<Block>)> = c.range(lo, hi).map(|b| (b, Arc::clone(&c.blocks[&b]))).collect();
+        let scale = c.step_uv * crate::preprocess::csd_to_mv_per_mm2(&c.cfg);
+        (lo, hi, blocks, c.cfg.clone(), Arc::clone(&c.display_rows), c.id, c.block_samp, scale, c.n_rows)
     };
 
-    let first_sample = key.1.start * block_samp;
-    let n_samp: usize = blocks.iter().map(|(len, _)| len).sum();
+    let n_samp = hi - lo;
     let mut data = vec![0.0f32; n_rows * n_samp];
-    if n_samp > 0 {
-        data.par_chunks_mut(n_samp).enumerate().for_each(|(r, row)| {
-            let mut off = 0;
-            for (len, blk) in &blocks {
-                for (o, &v) in row[off..off + len].iter_mut().zip(&blk.data[r * len..(r + 1) * len]) {
-                    *o = v as f32 * step_uv;
-                }
-                off += len;
+    data.par_chunks_mut(n_samp).enumerate().for_each(|(r, row)| {
+        for (b, blk) in &blocks {
+            let b_first = b * block_samp;
+            let len = blk.data.len() / n_rows;
+            // overlap of this block with [lo, hi)
+            let (s, e) = (b_first.max(lo), (b_first + len).min(hi));
+            if s >= e {
+                continue;
             }
-        });
-    }
-
-    let mut vals: Vec<f32> = pct_blocks.iter().flat_map(|b| b.abs_sample.iter().copied()).collect();
-    vals.par_sort_unstable_by(|a, b| a.total_cmp(b));
-    let mut vmax_pct = Box::new([0.0f32; 10001]);
-    if !vals.is_empty() {
-        let n = vals.len();
-        for p in 0..=10000usize {
-            vmax_pct[p] = vals[p * (n - 1) / 10000];
+            let src = &blk.data[r * len + (s - b_first)..r * len + (e - b_first)];
+            for (o, &v) in row[s - lo..e - lo].iter_mut().zip(src) {
+                *o = v as f32 * scale;
+            }
         }
-    }
+    });
 
-    *window = Some(ViewWindow { first_sample, n_samp, data: Arc::new(data), cfg, display_rows, vmax_pct, key });
+    *window = Some(ViewWindow { first_sample: lo, n_samp, data: Arc::new(data), cfg, display_rows, cache_id });
+}
+
+/// `pct`-th percentile (0–100) of |values| in samples [lo, hi) of `w` (clipped to it),
+/// from an evenly strided sample of at most `PCT_MAX_SAMPLES` values.
+pub fn window_percentile(w: &ViewWindow, lo: usize, hi: usize, pct: f32) -> Option<f32> {
+    let (lo, hi) = (lo.max(w.first_sample), hi.min(w.first_sample + w.n_samp));
+    if lo >= hi || w.n_samp == 0 {
+        return None;
+    }
+    let (off, n) = (lo - w.first_sample, hi - lo);
+    let n_rows = w.data.len() / w.n_samp;
+    let step = (n_rows * n / PCT_MAX_SAMPLES).max(1);
+    let mut vals: Vec<f32> = (0..n_rows)
+        .flat_map(|r| w.data[r * w.n_samp + off..r * w.n_samp + off + n].iter().step_by(step).map(|v| v.abs()))
+        .collect();
+    let k = ((pct as f64 / 100.0 * (vals.len() - 1) as f64).round() as usize).min(vals.len() - 1);
+    Some(*vals.select_nth_unstable_by(k, |a, b| a.total_cmp(b)).1)
 }
 
 // ---------------------------------------------------------------------------
@@ -506,8 +520,5 @@ fn compute_block(job: &Job, raw: &RawData, meta: &Meta, filt: &Mutex<Filters>, c
             }
         });
     }
-    let step = (q.len() / PCT_SAMPLES_PER_BLOCK).max(1);
-    let mut abs_sample: Vec<f32> = q.iter().step_by(step).map(|&v| (v as f32 * job.step_uv).abs()).collect();
-    abs_sample.sort_unstable_by(|a, b| a.total_cmp(b));
-    Some((Block { data: q, abs_sample }, eps))
+    Some((Block { data: q }, eps))
 }

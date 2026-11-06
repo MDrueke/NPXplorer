@@ -30,7 +30,7 @@ const CCF_10UM_SHAPE: [usize; 3] = [1320, 800, 1140];
 
 /// Average stereotaxic bregma-lambda distance (mm) the CCF corresponds to (NTE's value).
 pub const REFERENCE_BREGMA_LAMBDA_MM: f64 = 4.1;
-pub const DEFAULT_TIP_OFFSET_UM: f64 = 195.0;
+pub const DEFAULT_TIP_OFFSET_UM: f64 = 209.0;
 /// Physical length of a Neuropixels shank — only used for sanity warnings.
 pub const SHANK_LENGTH_UM: f64 = 10_000.0;
 /// Center-to-center spacing of shanks on multi-shank probes.

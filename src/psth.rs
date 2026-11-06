@@ -208,7 +208,9 @@ pub struct PsthResult {
     /// `data_idx` indexes `data`
     pub display_rows: Vec<DisplayRow>,
     pub n_win: usize,  // number of time samples per row
-    pub data: Vec<f32>, // n_rows * n_win, row-major (µV, averaged over events)
+    pub data: Vec<f32>, // n_rows * n_win, row-major (µV, or mV/mm² for CSD; averaged over events)
+    /// computed on CSD: values in mV/mm²
+    pub csd: bool,
     pub avg_trace: Vec<f32>, // n_win, mean across the Data rows
     pub start_ms: f64,
     pub dt_ms: f64,
@@ -273,6 +275,7 @@ pub fn compute_psth(
     } else {
         0.0
     };
+    let pad_s = pad_s.max(crate::preprocess::bandpass_settle_s(cfg));
     // narrow notches ring for longer than any of the above
     let pad_s = pad_s.max(crate::notch::settle_s(cfg));
     let pad = (pad_s * fs).round() as i64;
@@ -369,6 +372,12 @@ pub fn compute_psth(
         mean
     };
 
+    let mut data = data;
+    let unit = crate::preprocess::csd_to_mv_per_mm2(cfg);
+    if unit != 1.0 {
+        data.iter_mut().for_each(|v| *v *= unit);
+    }
+
     // average across rows at each time sample
     let mut avg_trace = vec![0.0f32; n_win];
     for r in 0..n_rows {
@@ -395,6 +404,7 @@ pub fn compute_psth(
         n_used,
         n_skipped,
         abs_sorted,
+        csd: cfg.spatial_filter == SpatialFilter::Csd,
     })
 }
 

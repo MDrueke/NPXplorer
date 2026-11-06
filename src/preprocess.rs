@@ -150,6 +150,15 @@ impl SosFilter {
 // ---------------------------------------------------------------------------
 
 pub fn butter_highpass_sos(n: usize, wn: f64) -> Vec<Sos> {
+    butter_sos_f64(n, wn, false)
+        .into_iter()
+        .map(|[b0, b1, b2, a1, a2]| Sos { b0: b0 as f32, b1: b1 as f32, b2: b2 as f32, a1: a1 as f32, a2: a2 as f32 })
+        .collect()
+}
+
+/// Butterworth highpass or lowpass of order `n`, cutoff `wn` (fraction of Nyquist), as
+/// `[b0, b1, b2, a1, a2]` sections (bilinear transform with prewarping).
+fn butter_sos_f64(n: usize, wn: f64, lowpass: bool) -> Vec<[f64; 5]> {
     use std::f64::consts::PI;
     let wd = 2.0 * (PI * wn / 2.0).tan();
     let ni = n as i32;
@@ -163,26 +172,16 @@ pub fn butter_highpass_sos(n: usize, wn: f64) -> Vec<Sos> {
         if lp_im.abs() < 1e-10 {
             let pr = wd * lp_re;
             let d = 2.0 - pr;
-            sections.push(Sos {
-                b0: (2.0 / d) as f32,
-                b1: (-2.0 / d) as f32,
-                b2: 0.0,
-                a1: ((-2.0 - pr) / d) as f32,
-                a2: 0.0,
-            });
+            let (b0, b1) = if lowpass { (-pr / d, -pr / d) } else { (2.0 / d, -2.0 / d) };
+            sections.push([b0, b1, 0.0, (-2.0 - pr) / d, 0.0]);
         } else if lp_im > 0.0 {
             let pr = wd * lp_re;
             let pi_v = wd * lp_im;
             let a_c = -2.0 * pr;
             let b_c = pr * pr + pi_v * pi_v;
             let d = 4.0 + 2.0 * a_c + b_c;
-            sections.push(Sos {
-                b0: ( 4.0 / d) as f32,
-                b1: (-8.0 / d) as f32,
-                b2: ( 4.0 / d) as f32,
-                a1: ((-8.0 + 2.0 * b_c) / d) as f32,
-                a2: (( 4.0 - 2.0 * a_c + b_c) / d) as f32,
-            });
+            let (b0, b1, b2) = if lowpass { (b_c / d, 2.0 * b_c / d, b_c / d) } else { (4.0 / d, -8.0 / d, 4.0 / d) };
+            sections.push([b0, b1, b2, (-8.0 + 2.0 * b_c) / d, (4.0 - 2.0 * a_c + b_c) / d]);
         }
     }
     sections
@@ -202,6 +201,53 @@ pub enum SpatialFilter {
     GlobalCmr,
     LocalCmr,
     Destripe,
+    /// current source density along depth (`CsdParams`)
+    Csd,
+}
+
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CsdParams {
+    /// Gaussian smoothing along depth before the second derivative, with σ (µm)
+    pub smoothing: bool,
+    pub sigma_um: f32,
+    /// zero-phase Butterworth bandpass before the CSD; replaces the 300 Hz highpass
+    pub bandpass: bool,
+    pub low_hz: f64,
+    pub high_hz: f64,
+}
+
+impl Default for CsdParams {
+    fn default() -> Self {
+        CsdParams { smoothing: true, sigma_um: 40.0, bandpass: true, low_hz: 5.0, high_hz: 150.0 }
+    }
+}
+
+/// CSD output is −∂²φ/∂z² · (CSD_REF_UM² + σ²): µV-like values whatever the smoothing,
+/// so they keep the resolution of the cache's i16 steps. `csd_to_mv_per_mm2` converts.
+const CSD_REF_UM: f64 = 20.0;
+
+/// Factor from preprocessed values to display units: mV/mm² for CSD, 1 (µV) otherwise.
+pub fn csd_to_mv_per_mm2(cfg: &PreprocConfig) -> f32 {
+    if cfg.spatial_filter != SpatialFilter::Csd {
+        return 1.0;
+    }
+    let sigma = if cfg.csd.smoothing { cfg.csd.sigma_um as f64 } else { 0.0 };
+    // µV/µm² → mV/mm²: × 1e6 / 1e3
+    (1000.0 / (CSD_REF_UM * CSD_REF_UM + sigma * sigma)) as f32
+}
+
+/// Order of each half (highpass, lowpass) of the CSD bandpass.
+const CSD_BANDPASS_ORDER: usize = 3;
+
+/// Seconds the CSD bandpass needs to settle at the edge of a chunk (about 6 time
+/// constants of its slowest pole, at the low cutoff); 0 when it is off.
+pub fn bandpass_settle_s(cfg: &PreprocConfig) -> f64 {
+    if cfg.spatial_filter == SpatialFilter::Csd && cfg.csd.bandpass {
+        2.0 / cfg.csd.low_hz.max(0.01)
+    } else {
+        0.0
+    }
 }
 
 #[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
@@ -229,6 +275,8 @@ pub struct PreprocConfig {
     pub notches: Vec<crate::notch::Notch>,
     #[serde(default, skip_serializing)]
     pub notch_enabled: bool,
+    #[serde(default)]
+    pub csd: CsdParams,
 }
 
 #[derive(Clone)]
@@ -324,9 +372,12 @@ pub fn preprocess(
         }
         if cancel.load(Ordering::Relaxed) { return eps_used; }
 
-        // 2. Highpass Filter
+        // 2. Highpass Filter (or the CSD bandpass, which replaces it)
         if cfg.highpass {
             apply_temporal_hp(shank_data, n_samp, &filt.hp);
+        }
+        if cfg.spatial_filter == SpatialFilter::Csd && cfg.csd.bandpass {
+            apply_bandpass(shank_data, n_samp, &cfg.csd, cfg.sample_rate);
         }
         if cancel.load(Ordering::Relaxed) { return eps_used; }
 
@@ -342,6 +393,13 @@ pub fn preprocess(
                     if cancel.load(Ordering::Relaxed) { return eps_used; }
                     let reuse = agc_eps.and_then(|e| e.get(eps_used.len())).copied();
                     eps_used.push(apply_kfilt(shank_data, n_samp, &block, filt, reuse));
+                }
+            }
+            SpatialFilter::Csd => {
+                // one depth profile per run of neighbouring rows, never across a gap
+                for block in contiguous_depth_blocks(shank_data_rows) {
+                    let sigma = if cfg.csd.smoothing { cfg.csd.sigma_um } else { 0.0 };
+                    apply_csd(shank_data, n_samp, &block, shank_data_rows, sigma);
                 }
             }
         }
@@ -459,6 +517,113 @@ fn apply_local_cmr(data: &mut [f32], n_samp: usize, data_rows: &[&DisplayRow]) {
             }
         });
     });
+}
+
+// ---------------------------------------------------------------------------
+// CSD
+// ---------------------------------------------------------------------------
+
+fn apply_bandpass(data: &mut [f32], n_samp: usize, p: &CsdParams, fs: f64) {
+    let nyq = fs / 2.0;
+    let mut sos = Vec::new();
+    if p.low_hz > 0.0 && p.low_hz < nyq {
+        sos.extend(butter_sos_f64(CSD_BANDPASS_ORDER, p.low_hz / nyq, false));
+    }
+    if p.high_hz > p.low_hz && p.high_hz < nyq {
+        sos.extend(butter_sos_f64(CSD_BANDPASS_ORDER, p.high_hz / nyq, true));
+    }
+    crate::notch::filtfilt_rows_f64(data, n_samp, &sos);
+}
+
+/// Current source density of one run of neighbouring rows (`rows`, indices into
+/// `data_rows`, sorted by depth): Gaussian smoothing along depth (σ µm), then the
+/// second derivative with the rows' actual spacing (removed channels leave uneven
+/// gaps), the end rows mirrored (Vaknin et al. 1988). Output −∂²φ/∂z² · (CSD_REF_UM² +
+/// σ²); sinks are negative.
+fn apply_csd(data: &mut [f32], n_samp: usize, rows: &[usize], data_rows: &[&DisplayRow], sigma_um: f32) {
+    let n = rows.len();
+    let y: Vec<f64> = rows
+        .iter()
+        .map(|&r| match data_rows[r] {
+            DisplayRow::Data { y_um, .. } => *y_um as f64,
+            _ => 0.0,
+        })
+        .collect();
+    let h: Vec<f64> = y.windows(2).map(|w| w[1] - w[0]).collect();
+    let mut h_sorted = h.clone();
+    h_sorted.sort_by(|a, b| a.total_cmp(b));
+    let h_med = h_sorted.get(h_sorted.len() / 2).copied().unwrap_or(0.0);
+    if n < 2 || h_med < 0.1 {
+        // a single row (or rows at one depth) has no depth profile
+        for &r in rows {
+            data[r * n_samp..(r + 1) * n_samp].fill(0.0);
+        }
+        return;
+    }
+
+    let sigma = sigma_um as f64;
+    let mut g = vec![0.0f64; n * n];
+    for i in 0..n {
+        if sigma <= 0.0 {
+            g[i * n + i] = 1.0;
+            continue;
+        }
+        let mut sum = 0.0;
+        for j in 0..n {
+            let d = y[j] - y[i];
+            if d.abs() <= 3.0 * sigma {
+                let w = (-d * d / (2.0 * sigma * sigma)).exp();
+                g[i * n + j] = w;
+                sum += w;
+            }
+        }
+        for j in 0..n {
+            g[i * n + j] /= sum;
+        }
+    }
+
+    // second difference; a mirrored row beyond each end has the end row's value
+    let mut d2 = vec![0.0f64; n * n];
+    for i in 0..n {
+        let hm = if i > 0 { h[i - 1] } else { h[0] };
+        let hp = if i < n - 1 { h[i] } else { h[n - 2] };
+        if hm < 0.1 || hp < 0.1 {
+            continue;
+        }
+        let cm = 2.0 / (hm * (hm + hp));
+        let cp = 2.0 / (hp * (hm + hp));
+        d2[i * n + i] -= cm + cp;
+        d2[i * n + if i > 0 { i - 1 } else { i }] += cm;
+        d2[i * n + if i < n - 1 { i + 1 } else { i }] += cp;
+    }
+
+    // combined operator −(ref² + σ²)·D·G, kept sparse (a few taps per row)
+    let scale = -(CSD_REF_UM * CSD_REF_UM + sigma * sigma);
+    let m: Vec<Vec<(usize, f32)>> = (0..n)
+        .map(|i| {
+            (0..n)
+                .filter_map(|j| {
+                    let v: f64 = (0..n).map(|k| d2[i * n + k] * g[k * n + j]).sum::<f64>() * scale;
+                    (v.abs() > 1e-9).then_some((j, v as f32))
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut out = vec![0.0f32; n * n_samp];
+    {
+        let src: Vec<&[f32]> = rows.iter().map(|&r| &data[r * n_samp..(r + 1) * n_samp]).collect();
+        out.par_chunks_mut(n_samp).zip(&m).for_each(|(o, taps)| {
+            for &(j, w) in taps {
+                for (o, &s) in o.iter_mut().zip(src[j]) {
+                    *o += w * s;
+                }
+            }
+        });
+    }
+    for (i, &r) in rows.iter().enumerate() {
+        data[r * n_samp..(r + 1) * n_samp].copy_from_slice(&out[i * n_samp..(i + 1) * n_samp]);
+    }
 }
 
 // ---------------------------------------------------------------------------

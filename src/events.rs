@@ -30,7 +30,7 @@ pub struct EventsWindowSettings {
 
 impl Default for EventsWindowSettings {
     fn default() -> Self {
-        Self { duration_ms: 100.0, opacity_pct: 10.0, emphasize_edges: false, show_overlay: true }
+        Self { duration_ms: 100.0, opacity_pct: 1.0, emphasize_edges: false, show_overlay: true }
     }
 }
 
@@ -249,7 +249,14 @@ impl EventsState {
                 });
                 ui.horizontal(|ui| {
                     ui.label("Opacity:");
-                    ui.add(egui::Slider::new(&mut self.opacity_pct, 0.0..=100.0).text("%"));
+                    // logarithmic: the useful range is the low percents; 0.4 % ≈ one step of the 8-bit alpha
+                    ui.add(
+                        egui::Slider::new(&mut self.opacity_pct, 0.0..=100.0)
+                            .logarithmic(true)
+                            .smallest_positive(0.4)
+                            .max_decimals(1)
+                            .text("%"),
+                    );
                 });
                 ui.checkbox(&mut self.show_overlay, "Show overlay");
                 ui.checkbox(&mut self.emphasize_edges, "Emphasize on/offset");
@@ -358,10 +365,11 @@ pub fn format_editor(ui: &mut Ui, text: &mut String) {
             *text = psth::default_layout_text();
         }
     });
-    ui.add(
+    let resp = ui.add(
         egui::TextEdit::multiline(text)
             .code_editor()
             .desired_rows(5)
             .desired_width(f32::INFINITY),
     );
+    crate::app::enter_types_newline(&resp);
 }

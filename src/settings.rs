@@ -89,6 +89,8 @@ pub struct BandSettings {
     pub peak_pooling: bool,
     /// ± range of the single-channel waveform view
     pub waveform_y_range_uv: f32,
+    /// colour scale and waveform range used while CSD is on (mV/mm²)
+    pub csd_display: CsdDisplay,
     pub preproc: PreprocSettings,
     pub firing_rate: FiringRateSettings,
     pub classification: ClassificationSettings,
@@ -97,6 +99,21 @@ pub struct BandSettings {
     pub noise: crate::noise::NoiseSuppression,
     /// settings of the noise-peak scan (Notch filters)
     pub notch_scan: crate::notch::ScanSettings,
+}
+
+/// Display values of one unit system: the colour percentile and fixed range, and the
+/// waveform view's ± range.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct CsdDisplay {
+    pub color_pct: f32,
+    pub color_scale: f32,
+    pub waveform_range: f32,
+}
+
+impl Default for CsdDisplay {
+    fn default() -> Self {
+        CsdDisplay { color_pct: 95.0, color_scale: 10.0, waveform_range: 20.0 }
+    }
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -110,6 +127,7 @@ pub struct PreprocSettings {
     pub shank_order: crate::data::ShankOrder,
     pub notch_enabled: bool,
     pub notches: Vec<crate::notch::Notch>,
+    pub csd: crate::preprocess::CsdParams,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]

@@ -105,11 +105,18 @@ fn filtfilt(x: &mut [f32], sos: &[[f64; 5]], zi: &[[f64; 2]], scratch: &mut Vec<
 /// Notch every row of `data` (`[rows][n_samp]`) in place.
 pub fn apply_notches(data: &mut [f32], n_samp: usize, notches: &[Notch], fs: f64) {
     let sos: Vec<[f64; 5]> = notches.iter().filter_map(|n| design(n, fs)).collect();
+    filtfilt_rows_f64(data, n_samp, &sos);
+}
+
+/// Zero-phase filter every row of `data` (`[rows][n_samp]`) with `sos` (`[b0, b1, b2,
+/// a1, a2]` per section), in f64 — for filters with poles too close to the unit circle
+/// for f32 (narrow notches, low highpass cutoffs).
+pub(crate) fn filtfilt_rows_f64(data: &mut [f32], n_samp: usize, sos: &[[f64; 5]]) {
     if sos.is_empty() || n_samp == 0 {
         return;
     }
-    let zi = sos_zi(&sos);
-    data.par_chunks_mut(n_samp).for_each_init(Vec::new, |scratch, x| filtfilt(x, &sos, &zi, scratch));
+    let zi = sos_zi(sos);
+    data.par_chunks_mut(n_samp).for_each_init(Vec::new, |scratch, x| filtfilt(x, sos, &zi, scratch));
 }
 
 /// Seconds the enabled notches need to settle at the edge of a chunk (4 time
@@ -821,10 +828,12 @@ impl NotchPanel {
         let mut out = None;
         ui.horizontal(|ui| {
             let changed = self.draft != cfg.notches;
+            let enter = crate::app::enter_applies(ui) && changed;
             if ui
                 .add_enabled(changed, egui::Button::new("Apply notches"))
                 .on_disabled_hover_text("Nothing to apply: the list is the one already in use.")
                 .clicked()
+                || enter
             {
                 self.draft.sort_by(|a, b| a.freq_hz.total_cmp(&b.freq_hz));
                 out = Some(self.draft.clone());
@@ -953,6 +962,7 @@ mod tests {
             shank_order: crate::data::ShankOrder::Id,
             notches: Vec::new(),
             notch_enabled: false,
+            csd: Default::default(),
         }
     }
 

@@ -492,7 +492,8 @@ pub fn draw_settings(ui: &mut egui::Ui, draft: &mut NoiseSuppression, applied: &
     ui.separator();
     let mut action = Action::None;
     ui.horizontal(|ui| {
-        if ui.add_enabled(draft != applied, egui::Button::new("Apply")).clicked() {
+        let enter = crate::app::enter_applies(ui) && draft != applied;
+        if ui.add_enabled(draft != applied, egui::Button::new("Apply")).clicked() || enter {
             action = Action::Apply;
         }
         if ui

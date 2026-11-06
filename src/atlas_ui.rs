@@ -774,7 +774,8 @@ impl AtlasUi {
         );
 
         ui.horizontal(|ui| {
-            if ui.add_enabled(!busy, egui::Button::new("Apply")).clicked() {
+            let enter = crate::app::enter_applies(ui);
+            if ui.add_enabled(!busy, egui::Button::new("Apply")).clicked() || (enter && !busy) {
                 self.dispatch(ui.ctx(), meta);
             }
             let mut show = self.show_overlay;
