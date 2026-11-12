@@ -31,6 +31,7 @@ mod app;
 mod app_icon;
 mod atlas;
 mod atlas_ui;
+mod blosc;
 mod channel_classify;
 mod channel_remove;
 mod colormap;
@@ -38,6 +39,7 @@ mod data;
 mod geometry;
 mod mtscomp;
 mod noise;
+mod nwb;
 mod notch;
 mod preprocess;
 mod probe;
@@ -52,6 +54,7 @@ mod export_ui;
 #[cfg(test)]
 mod realdata_tests;
 mod worker;
+mod zarr;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -62,14 +65,25 @@ use std::sync::mpsc;
 /// winit's event loop, which on Linux (GTK/portal-backed dialogs) can prevent the
 /// dialog itself from ever gaining focus. Running it off-thread and polling the
 /// channel keeps the UI event loop pumping while the dialog is open.
-fn spawn_file_picker(last_dir: Option<PathBuf>) -> mpsc::Receiver<Option<PathBuf>> {
+///
+/// `folder`: pick a folder instead (a Zarr recording is a folder, not a file).
+fn spawn_file_picker(last_dir: Option<PathBuf>, folder: bool) -> mpsc::Receiver<Option<PathBuf>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
+        if folder {
+            let mut dlg = rfd::FileDialog::new().set_title("Open Zarr folder");
+            if let Some(dir) = last_dir {
+                dlg = dlg.set_directory(dir);
+            }
+            let _ = tx.send(dlg.pick_folder());
+            return;
+        }
         let mut dlg = rfd::FileDialog::new()
-            .add_filter("Recordings", &["bin", "cbin", "dat"])
+            .add_filter("Recordings", &["bin", "cbin", "dat", "nwb"])
             .add_filter("SpikeGLX uncompressed", &["bin"])
             .add_filter("Compressed (SpikeGLX or Open Ephys)", &["cbin"])
-            .add_filter("Open Ephys uncompressed", &["dat"]);
+            .add_filter("Open Ephys uncompressed", &["dat"])
+            .add_filter("NWB", &["nwb"]);
         if let Some(dir) = last_dir {
             dlg = dlg.set_directory(dir);
         }
@@ -102,7 +116,8 @@ fn draw_recent_files_menu(ui: &mut egui::Ui, recent: &[PathBuf]) -> Option<PathB
 #[derive(Parser)]
 #[command(name = "npxplorer", about = "Neuropixels raw data viewer")]
 struct Args {
-    /// Path to a SpikeGLX .ap.bin/.ap.cbin file, or an Open Ephys continuous.dat/.cbin
+    /// Path to a SpikeGLX .ap.bin/.ap.cbin file, an Open Ephys continuous.dat/.cbin,
+    /// a Zarr folder written by SpikeInterface, or an .nwb file
     #[arg(short, long)]
     file: Option<PathBuf>,
 
@@ -304,7 +319,14 @@ impl eframe::App for MainApp {
                             if ui.button("Open").clicked() {
                                 if self.pending_pick.is_none() {
                                     self.pending_pick =
-                                        Some(spawn_file_picker(self.last_dir.clone()));
+                                        Some(spawn_file_picker(self.last_dir.clone(), false));
+                                }
+                                ui.close_menu();
+                            }
+                            if ui.button("Open Zarr folder…").clicked() {
+                                if self.pending_pick.is_none() {
+                                    self.pending_pick =
+                                        Some(spawn_file_picker(self.last_dir.clone(), true));
                                 }
                                 ui.close_menu();
                             }
@@ -345,16 +367,18 @@ impl eframe::App for MainApp {
                         );
                     }
                     if response.clicked() && self.pending_pick.is_none() {
-                        self.pending_pick = Some(spawn_file_picker(self.last_dir.clone()));
+                        self.pending_pick = Some(spawn_file_picker(self.last_dir.clone(), false));
                     }
                 });
             }
             AppState::Loaded(app) => {
                 app.update(ctx);
-                if app.file_dialog_request {
+                if app.file_dialog_request || app.folder_dialog_request {
+                    let folder = app.folder_dialog_request;
                     app.file_dialog_request = false;
+                    app.folder_dialog_request = false;
                     if self.pending_pick.is_none() {
-                        self.pending_pick = Some(spawn_file_picker(self.last_dir.clone()));
+                        self.pending_pick = Some(spawn_file_picker(self.last_dir.clone(), folder));
                     }
                 }
                 if let Some(path) = app.open_recent_request.take() {

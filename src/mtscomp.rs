@@ -36,13 +36,17 @@ impl MtscompMeta {
 }
 
 /// Small LRU of decompressed chunks (most recently used at the back).
-struct ChunkCache {
+pub(crate) struct ChunkCache {
     entries: VecDeque<(usize, Arc<Vec<i16>>)>,
     bytes: usize,
 }
 
 impl ChunkCache {
-    fn get(&mut self, idx: usize) -> Option<Arc<Vec<i16>>> {
+    pub(crate) fn new() -> Self {
+        Self { entries: VecDeque::new(), bytes: 0 }
+    }
+
+    pub(crate) fn get(&mut self, idx: usize) -> Option<Arc<Vec<i16>>> {
         let pos = self.entries.iter().position(|(i, _)| *i == idx)?;
         let entry = self.entries.remove(pos)?;
         let data = Arc::clone(&entry.1);
@@ -50,7 +54,7 @@ impl ChunkCache {
         Some(data)
     }
 
-    fn insert(&mut self, idx: usize, data: Arc<Vec<i16>>) {
+    pub(crate) fn insert(&mut self, idx: usize, data: Arc<Vec<i16>>) {
         if self.entries.iter().any(|(i, _)| *i == idx) {
             return; // another thread decompressed the same chunk meanwhile
         }
@@ -105,7 +109,7 @@ impl MtscompReader {
         Ok(Self {
             meta,
             file,
-            cache: Mutex::new(ChunkCache { entries: VecDeque::new(), bytes: 0 }),
+            cache: Mutex::new(ChunkCache::new()),
         })
     }
 
@@ -192,6 +196,20 @@ impl MtscompReader {
         }
 
         Ok(out)
+    }
+}
+
+impl crate::data::ChunkSource for MtscompReader {
+    fn n_channels(&self) -> usize {
+        self.meta.n_channels
+    }
+
+    fn chunk_bounds(&self) -> &[usize] {
+        &self.meta.chunk_bounds
+    }
+
+    fn chunk(&self, idx: usize) -> Result<Arc<Vec<i16>>> {
+        MtscompReader::chunk(self, idx)
     }
 }
 

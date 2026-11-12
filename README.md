@@ -1,196 +1,540 @@
 # NPXplorer v0.9.2
 
-A viewer for raw Neuropixels recordings. Shows the voltage of all channels as a heatmap laid out by the probe geometry.
+NPXplorer is a viewer for raw Neuropixels recordings. It shows the voltage of all channels as a heatmap, laid out by the probe geometry.
 
-- Fast scrolling through the whole recording, with preprocessing (DC, phase shift, highpass, CMR, destripe, CSD) applied on the fly
-- Single-channel waveform view
-- Firing rate overlay
-- Power spectrum overlay (per-channel PSD)
-- Channel removal
-- Noise suppression display filters (wavelet, isolated events, soft-knee noise gate)
-- IBL-style channel classification (dead, noisy, outside of brain)
-- Atlas registration with the Allen mouse brain atlas
-- Peri-stimulus averages (PSTH)
-- Event overlay (stimuli, TTL pulses, behavioural events)
-- Spike-sorted data overlay (phy / Kilosort output)
-- Screenshots of the plot area
-- Export of the preprocessed recording (SpikeGLX or Open Ephys format) for spike sorting
+With it you can:
+
+- Scroll quickly through the whole recording while the preprocessing runs on the fly.
+- View the waveform of a single channel.
+- Remove channels and automatically classify bad ones (dead, noisy, outside of the brain).
+- Overlay firing rates, events, spike-sorted units and per-channel power spectra.
+- Compute peri-stimulus time histograms (PSTH) and current source density (CSD).
+- Suppress noise with display filters and notch filters.
+- Register the probe to the Allen mouse brain atlas.
+- Save screenshots, and export the preprocessed recording for spike sorting.
 
 **This is beta software.** It has not been tested with all recording configurations and probe types.
 
 ![App Screenshot](ex_screenshot.png)
 
+## Contents
+
+1. [Supported data](#supported-data)
+2. [Get started](#get-started)
+3. [Navigate](#navigate)
+4. [Select and inspect channels](#select-and-inspect-channels)
+5. [Set the color scale](#set-the-color-scale)
+6. [Remove channels](#remove-channels)
+7. [Preprocess](#preprocess)
+8. [Firing rate overlay](#firing-rate-overlay)
+9. [Channel classification](#channel-classification)
+10. [Events](#events)
+11. [PSTH](#psth-peri-stimulus-average)
+12. [Spike-sorted data](#spike-sorted-data)
+13. [Power spectrum](#power-spectrum)
+14. [CSD](#csd-current-source-density)
+15. [Noise suppression](#noise-suppression)
+16. [Notch filters](#notch-filters)
+17. [Atlas registration](#atlas-registration)
+18. [Screenshot](#screenshot)
+19. [Export preprocessed data](#export-preprocessed-data)
+20. [Settings and preferences](#settings-and-preferences)
+21. [Known limitations](#known-limitations)
+
 ## Supported data
 
 - SpikeGLX (`.ap.bin`, `.lf.bin`) with the matching `.meta` file next to it.
-- Open Ephys binary format (`continuous.dat`); `structure.oebin` and `settings.xml` are found automatically.
+- Open Ephys binary format (`continuous.dat`). NPXplorer finds `structure.oebin` and `settings.xml` automatically.
 - mtscomp-compressed files (`.cbin` with its `.ch` file).
-- Tested with NP 1.0, NP 2.0 single-shank and NP 2.0 multi-shank probes (SpikeGLX), and a single-shank NP 1.0 recording from Open Ephys.
+- Zarr folders written by SpikeInterface (`recording.save(format="zarr")`, Zarr v2). NPXplorer reads the compressors Blosc (with LZ4, Zstd, Zlib or BloscLZ inside), Zstd, GZip, Zlib, LZ4, WavPack and FLAC, and the Delta filter. Blosc with Snappy is not supported. Open with File -> Open Zarr Folder...
+- NWB files (`.nwb`, HDF5) with an `ElectricalSeries` in `/acquisition`. 
 
-## Usage
+Zarr and NWB recordings must hold 16-bit integer samples, as the acquisition software wrote them.
 
-Channels are named as in the recording's metadata (e.g. `AP12` for SpikeGLX, `CH13` for Open Ephys), everywhere in the app and in exported files. The status bar lists anything the metadata did not provide (e.g. an unknown probe type, whose gain and electrode positions are then assumed), so you know when µV values or depths are nominal.
+Tested with NP 1.0, NP 2.0 single-shank and NP 2.0 multi-shank probes (SpikeGLX), and with a single-shank NP 1.0 recording from Open Ephys. Contact me if you have data that is incompatible.
 
-### Navigation
+## Get started
 
-- **Scroll wheel**: move in time (step size set by **Fine**/**Coarse**).
-- **Arrow keys** or **A/D**: jump half a window.
-- **Navigation bar** (bottom): click to jump. The solid marker shows the displayed window, the shaded area the part that is already preprocessed.
-- **Left-drag** on the heatmap: draw a rectangle to zoom into its channels and time range (the readout at the bottom left shows both while dragging). You can zoom again inside the zoomed view.
-- **Enter**: applies the main action of the window you are typing in, or else of the topmost window (Apply, Apply/Compute, Calculate, Save…, Export…, Load, OK); in a multi-line text field it starts a new line.
-- **Esc**: closes the topmost open window, one per press, aborting what it is calculating (in a progress window, Esc is Abort; while exporting, it aborts the export); with no window open, it leaves the waveform view's zoom, then the waveform view, then the heatmap's zoom (returning to the full view and the previous time window).
+Download the release
+or build NPXplorer with Rust stable:
 
-### Selecting channels
+```
+cargo build --release
+```
 
-- **Alt + left-click** a row to select a channel, **Alt + right-click** to select a second one. With two selected, their vertical distance (Δ µm) is shown in the top right.
-- **Right-click** a row for a menu: **View waveform** shows that channel's trace (Alt + scroll changes its vertical scale; the readout at the bottom left shows the time and voltage of the hovered point; left-drag a rectangle to zoom into its time and voltage range, Esc returns to the view before the zoom; Esc or ✖ returns to the heatmap), **Remove channel** excludes it.
+To open a recording, click in the center of the app upon launch, or use **File → Open**, pick it from **File → Recent files**, or give it on the command line. A Zarr recording is a folder: use **File → Open Zarr folder…**, or give the folder on the command line.
 
-### Removing channels
+| Option | Effect |
+|---|---|
+| `--file <path>` | Opens the recording directly. |
+| `--debug` | Writes `debug.log` next to the executable. |
 
-**Remove channels…** excludes channels from the display and from all processing. Enter channel IDs or ranges separated by commas (e.g. `AP3,AP17,AP40-AP50`); a bare number (`17`, `40-50`) matches the channels whose ID ends in that number. **Load from file…** reads the list from a file, using a layout file like the PSTH one (see below): `channel_remove_layout.csv` next to the list file, or the default in `config/`.
+NPXplorer names channels as the recording's metadata does (for example `AP12` for SpikeGLX, `CH13` for Open Ephys). These names appear everywhere in the app and in exported files.
 
-When a recording is opened for the first time, the list starts with the probe's reference sites, which carry no neural signal, and they are removed before any preprocessing: those SpikeGLX marks as unused in its geometry map, and those Open Ephys lists without a position. If the metadata marks none, they are taken from the probe type (channel 191 on NP 1.0; NP 2.0 has none). **Reset** includes them again. The list is saved with the recording's settings.
+Read the status bar after you open a recording. It lists anything the metadata did not provide, for example an unknown probe type. NPXplorer then assumes the gain and the electrode positions, so µV values and depths are nominal.
 
-### Preprocessing
+## Navigate
 
-- **DC**: remove each channel's mean.
-- **Phase Shift**: correct the sampling delay between channels. Channels sharing an ADC are digitised one after another within each sample period; the delay of every channel is taken from the recording's `~muxTbl` (SpikeGLX) or from the probe type, and removed with a windowed-sinc fractional-delay filter on each raw channel before any averaging.
-- **Notch (n)**: the notch filters set up in the Noise Suppression window (shown once there are any). Applied after DC removal, before the highpass.
-- **300 Hz HP**: zero-phase highpass filter (always on with Destripe).
-- **Spatial**: **Global CMR** (subtract the median of all channels of the shank), **Local CMR** (median of nearby channels), or **Destripe** (IBL-style). Destripe's spatial filter runs along physical depth over each stretch of neighbouring electrodes — it never mixes channels across a gap in the layout (drawn as a dotted line) or across shanks, whatever the display order.
-- **CSD**: current source density along depth, for AP and LF files. Choosing it opens a small window (**Apply** or Enter switches it on, Esc cancels): optional **Gaussian smoothing** along depth with **σ** (default on, 40 µm; for LFP 40–80 µm, below ~30 µm the result is mostly noise) before the second derivative, and an optional zero-phase **Bandpass** (Butterworth, order 3 at each edge; default on, 5–150 Hz as in the Allen Brain Observatory Neuropixels CSD; lower the low cut to ~1 Hz for slow oscillations) that replaces the 300 Hz HP. The derivative uses the actual spacing of the rows (removed channels leave gaps), is computed per stretch of neighbouring electrodes and per shank, and mirrors the end rows (Vaknin). Values are shown as −∂²φ/∂z² in **mV/mm²** (no tissue conductivity assumed; multiply by σ ≈ 0.3 S/m for µA/mm³), so sinks are negative. While CSD is on, the colour scale, the hover readout, the waveform view and the PSTH use mV/mm², and CSD keeps its own colour settings (percentile 80–100 %, default 95 %; fixed range 0.1–1000 mV/mm², default ±10), so switching CSD off brings the µV ones back. A strong sink/source pair (e.g. at the brain surface) can still leave the rest dark: lower the percentile, or remove the channels outside the brain. CSD switches **Avg adjacent chans** on (one row per depth) and, with the bandpass, the 300 Hz HP off; choosing another spatial filter restores both. For LFP sinks and sources use the bandpass; without it, AP data gives a spike-band Laplacian. NP 1.0 AP data was usually highpassed in hardware (last field of each `~imroTbl` entry in the meta file), NP 2.0 AP data is wideband. While CSD is on, the firing-rate overlay is hidden and export is refused.
-- **Avg adjacent chans**: average channels at the same depth into one row.
+| Input | Action |
+|---|---|
+| Scroll wheel | Move in time. **Fine**/**Coarse** sets the step size. |
+| Arrow keys or A/D | Jump half a window. |
+| Click the navigation bar (bottom) | Jump to that time. |
+| Left-drag on the heatmap | Draw a rectangle to zoom into its channels and time range. |
+| Enter | Apply the main action of a window. |
+| Esc | Close or go back, one step per press. |
 
-### Noise suppression
+On the navigation bar, the solid marker shows the displayed window. The shaded area shows the part that is already preprocessed.
 
-**Noise Suppression** opens a window with filters for the display: they change the heatmap, the waveform view and the hovered µV value, not the firing rate, PSTH or spectrum. Changes take effect when **Apply** is pressed; **Disable all** switches every filter off at once (the values are kept). The button is highlighted while a filter is on; the applied settings are saved with the recording's settings. In **%ile** colour mode (without peak pooling) the colour range still comes from the unfiltered signal, so filtered and unfiltered views can be compared directly. The filters run in this order:
+While you drag a zoom rectangle, the readout at the bottom left shows its channels and time range. You can zoom again inside the zoomed view.
 
-- **Wavelet denoising**: each channel is split into scales with a wavelet (Haar, db4 or sym4; **Levels**, default 2). At each scale, coefficients below **Threshold** × that scale's noise level (default 3 × σ, σ = median |coefficient| / 0.6745) are removed (**Hard**) or all are shrunk toward 0 by it (**Soft**, default).
-- **Attenuate isolated events**: an event is a stretch of the signal between two zero crossings whose peak reaches **Event level** (default ±15 µV). It is kept if it spans at least **Min. adjacent channels** (default 3, counting its own) that are neighbours on the probe, each reaching **Neighbour amplitude** (default 90 %) of its peak with the same polarity within **Time tolerance** (default ±0.3 ms). Otherwise the whole event is reduced by **Attenuation** (default 50 %; 100 % removes it). Like Destripe, channels across a gap in the layout are not neighbours.
-- **Soft-knee noise gate**: scales every sample by a smooth S-shaped (logistic) function of its amplitude: 0 at 0 µV, half of **Max gain** at **Centre** (default 20 µV), reaching **Max gain** (default 1×) for strong signals. **Width** (default 5 µV) sets how sharp the transition is (12 % to 88 % within Centre ± 2 widths). Unlike a hard threshold it has no jump. A max gain above 1 is the same as narrowing the colour range; in **%ile** mode strong signals then saturate.
+## Select and inspect channels
 
-**Notch filters** (lower part of the window) are part of the preprocessing: they change the data everywhere, not just the display. **Find noise peaks** samples **Chunks to sample** (default 100) chunks of about 1 s across the recording, applies the current preprocessing (without notches), and averages each channel's power spectrum over the chunks. Narrow peaks are found on every channel's own spectrum, so noise that reaches the channels at different times, or only some of them, is found too; CMR and Destripe cannot remove such noise. A progress bar shows the scan, **Abort** stops it. A plot shows each shank's mean spectrum. The table lists a frequency when it is a peak on at least **Min. channels** of one shank's channels (default 30 %) and the peak is narrow: at least **Min. prominence** (default 6 dB) above the smoothed spectrum, at most **Max. width** wide (default 3 Hz), and present in at least **Min. presence** of the chunks (default 25 %; estimated from how much the peak's power varies between chunks). Broad peaks are usually brain oscillations, and peaks that come and go (e.g. stimulation artifacts) are no case for a filter on the whole recording. Evenly spaced lines (at least 3, e.g. a carrier with mains sidebands every 50 Hz) are shown as one row; its checkbox adds a notch for each line, and hovering lists them. Tick a peak to add a notch, or add one by hand; **Apply notches** activates them on all channels. The notches are saved with the recording's settings (separately for AP and LF) and restored when the file is reopened. **Notch (n)** in the preprocessing bar switches them off and on.
+- **Alt + left-click** a row to select a channel.
+- **Alt + right-click** a row to select a second channel. The top right then shows the vertical distance between the two (Δ µm).
+- **Right-click** a row to open a menu with **View waveform** and **Remove channel**.
 
-Voltages are scaled per channel from the metadata: SpikeGLX gains from `~imroTbl` (or `imChan0apGain`, or the fixed gain of the probe type), Open Ephys `bit_volts`.
+**View waveform** shows the trace of that channel. In the waveform view:
 
-### Color scale
+- **Alt + scroll** changes the vertical scale.
+- The readout at the bottom left shows the time and voltage of the hovered point.
+- **Left-drag** a rectangle to zoom into its time and voltage range. Esc returns to the view before the zoom.
+- Esc or ✖ returns to the heatmap.
 
-- **%ile**: the color range follows a percentile of the values within ±1 s of the view's centre (the whole view, if it is longer); **±µV**: a fixed range. **Alt + scroll** adjusts either.
-- **Peak pooling** (Preferences, off by default): when a pixel column covers many samples (long windows), it shows the sample with the largest magnitude instead of the mean, so spikes keep their amplitude at any window length. In **%ile** mode the colour range then follows the values on screen. Off gives a smoother, mean-based picture (better for LFP).
+## Set the color scale
 
-### Firing rate overlay
+Choose one of two modes. **Alt + scroll** adjusts either.
 
-A bar on the left of the heatmap shows the number of threshold crossings per channel in the displayed window. Threshold, scale and depth smoothing are set in Preferences.
+- **%ile**: the color range follows a percentile of the values within ±1 s of the centre of the view. If the view is longer than that, it uses the whole view.
+- **±µV**: a fixed range.
 
-### Channel classification
+**Peak pooling** (Preferences, off by default) helps with long time windows, where one pixel column covers many samples. When it is on, each pixel shows the sample with the largest magnitude, so spikes keep their amplitude at any window length. In **%ile** mode, the color range then follows the values on screen. When it is off, each pixel shows the mean, which gives a smoother picture and is better for LFP.
 
-Marks dead (magenta), noisy (red) and out-of-brain (green) channels with a colored stripe. Each shank is classified on its own with the channels in depth order; removed channels are skipped. **Outside of brain** (Preferences) chooses how the brain surface is found: **Adaptive** (default; IBL's adaptive mode, finds weaker surfaces, e.g. in LFP data) or **Fixed threshold** (IBL's default, stricter). **Chunks to sample** in Preferences sets how many snippets of the recording are used (more is more reliable but slower).
+## Remove channels
 
-### Atlas registration
+**Remove channels…** excludes channels from the display and from all processing.
 
-Draws the borders between brain regions of the Allen mouse atlas (CCF 2017, 10 µm) on the heatmap, from the probe's insertion coordinates. It needs a folder, set in **Preferences → Default file locations…**, with `annotation_10.nrrd` from the [Allen Institute](https://download.alleninstitute.org/informatics-archive/current-release/mouse_ccf/annotation/ccf_2017/) and the structure ontology saved as `query.csv` from the [Allen API](https://api.brain-map.org/api/v2/data/query.csv?criteria=model::Structure,rma::criteria,[ontology_id$eq1],rma::options[order$eq%27structures.graph_order%27][num_rows$eqall]). On the first load, the `.nrrd` is converted once into `annotation_10_npxplorer.npy` (2.4 GB) and `annotation_10_npxplorer_ids.txt` in the same folder, which takes a while and needs write access to the folder.
+- Enter channel IDs or ranges, separated by commas, for example `AP3,AP17,AP40-AP50`.
+- A bare number (`17`, `40-50`) matches the channels whose ID ends in that number.
+- **Load from file…** reads the list from a file. It uses a layout file like the one for the PSTH (see [Event file layout](#event-file-layout)): `channel_remove_layout.csv` next to the list file, or the default in `config/`.
 
-- **Insertion**: AP and ML in mm from bregma (AP positive = anterior, ML positive = right). Angles as **Azimuth / elevation / rotation** (azimuth from the lambda→bregma axis, elevation from horizontal) or **Polar / azimuth / roll** (polar angle from vertical, azimuth from +ML). Rotation/roll turns the probe around its axis, which matters for multi-shank probes.
-- **Depth**: from the brain surface to the tip, along the probe; the tip offset is the distance from the tip to the first electrode row (default from the probe type: 209 µm for NP 1.0, 206 µm for NP 2.0).
-- **Bregma–lambda distance** (default 4.1 mm) scales the atlas to the animal.
+When you open a recording for the first time, the list already contains the reference sites of the probe. They carry no neural signal, and NPXplorer removes them before any preprocessing. It takes them from the metadata: the sites that SpikeGLX marks as unused in its geometry map, or the sites that Open Ephys lists without a position. If the metadata marks none, it takes them from the probe type (channel 191 on NP 1.0, none on NP 2.0). **Reset** includes them again.
 
-Hover a region label for its full name; the hovered channel's region also appears in the readout at the bottom left. With channels ordered by ID, borders and labels are hidden. Regions with fewer channels than set in **Skip drawing regions with less than … channels** (default 4; 0 draws all) are not drawn on their own: their channels are split between the neighboring regions. The readout and **Save** still use the exact regions. To match the borders to the data:
+NPXplorer saves the list with the settings of the recording.
 
-- **Alt + drag** any border to move all borders together (changes the depth).
-- **Drag** a single border to move just that one (it stops at its neighbors). Dragged borders are kept when the depth changes, and only **Reset borders** undoes them.
+## Preprocess
 
-**Save** writes `<recording>_regions.csv` next to the data file, with each channel's ID and region. The coordinates and dragged borders are saved with the recording's settings (shared by the AP and LF files). If the overlay was shown when the recording was closed, the atlas is loaded and the borders are drawn again when it is opened.
+The preprocessing bar has these switches:
 
-The tool also works with the reformatted version of the atlas that the [Neuropixels Trajectory Explorer](https://github.com/petersaj/neuropixels_trajectory_explorer) uses (`annotation_volume_10um_by_index.npy` and `structure_tree_safe_2017.csv`, [download](https://osf.io/fv7ed/)). It has the same voxels and borders, loads without the conversion, and gives the same regions as that tool for the same inputs.
+| Switch | Effect |
+|---|---|
+| **DC** | Removes the mean of each channel. |
+| **Phase Shift** | Corrects the sampling delay between channels. |
+| **Notch (n)** | Switches the notch filters off and on. It appears when you have set up at least one (see [Notch filters](#notch-filters)). |
+| **300 Hz HP** | Zero-phase highpass filter. It is always on with Destripe. |
+| **Spatial** | **Global CMR**, **Local CMR**, **Destripe** (IBL-style) or **CSD**. |
+| **Avg adjacent chans** | Averages the channels at the same depth into one row. |
 
-### PSTH (peri-stimulus average)
+The spatial filters:
 
-Averages the signal around event onsets for all channels that are not removed, using the main window's preprocessing, and shows traces of up to two selected channels (left-/right-click the heatmap), the mean over all channels, and a heatmap. Nothing is computed until **Apply/Compute** is pressed. **Alt + scroll** over the window adjusts the color scale; the traces are scaled to fit when computed and then zoom along with it. Without a spatial filter, the raw windows are averaged first and the average is preprocessed once (identical result, since every step is then linear), which is much faster.
+- **Global CMR** subtracts the median of all channels of the shank.
+- **Local CMR** subtracts the median of nearby channels.
+- **Destripe** is the IBL-style filter. It never mixes channels across a gap in the layout (drawn as a dotted line) or across shanks.
+- **CSD** shows current source density (see [CSD](#csd-current-source-density)).
 
-The event file (onset times in seconds) is read according to a layout. Its lines mirror the event file: lines without an `o` are header rows to skip, and the first line with an `o` marks the column(s) holding the onset times (`f` = offset times, used by the Events window; `x` = ignore). For example
+NPXplorer applies the notch filters after the DC removal and before the highpass.
+
+## Firing rate overlay
+
+A bar on the left of the heatmap shows the number of threshold crossings per channel in the displayed window. Set the threshold, the scale and the depth smoothing in Preferences.
+
+## Channel classification
+
+Adapted from IBL. The classification marks channels with a colored stripe:
+
+| Color | Channel |
+|---|---|
+| Magenta | Dead |
+| Red | Noisy |
+| Green | Outside of the brain |
+
+NPXplorer classifies each shank on its own, with the channels in depth order. It skips removed channels.
+
+Two settings in Preferences control it:
+
+- **Outside of brain** chooses how NPXplorer finds the brain surface. **Adaptive** (default) is IBL's adaptive mode and finds weaker surfaces, for example in LFP data. **Fixed threshold** is IBL's default and is stricter.
+- **Chunks to sample** sets how many snippets of the recording it uses. More snippets are more reliable but slower.
+
+## Events
+
+The **Events** window shades the events on the heatmap and on the waveform view. It uses the color of the firing rate overlay, and the legend lists them as **Events**.
+
+1. Choose an event file with onset times in seconds.
+2. If needed, edit the layout in the **File format** field (see below).
+3. Press **Load**.
+
+Offsets come from the `f` column(s) of the event file. Without such a column, each shaded area is **Duration (ms)** long. **Emphasize on/offset** draws a thin line at each onset and offset.
+
+### Event file layout
+
+A layout tells NPXplorer how to read the event file. The lines of the layout mirror the lines of the event file:
+
+- A line without an `o` is a header row to skip.
+- The first line with an `o` marks the columns. `o` = onset times, `f` = offset times (used by the Events window), `x` = ignore. Trailing x's are not required.
+- A line that starts with `#` is a comment.
+
+For example, this layout skips one header row, reads onsets from the first column and reads offsets from the second:
 
 ```
 header
 o,f,x
 ```
 
-skips one header row, reads onsets from the first column and offsets from the second. Lines starting with `#` are comments. The layout is shown in the **File format** field of the PSTH and Events windows. Edits are saved with the recording's settings and used by both windows; the default in `config/` is never changed. **Reset to default** restores the default.
+The Events window and the PSTH window share the layout. NPXplorer saves your edits with the settings of the recording. It never changes the default in `config/`. **Reset to default** restores the default.
 
-### Events
+### Which event file opens
 
-Shades the events on the heatmap and the waveform view, in the color of the firing rate overlay, and lists them as **Events** in the legend. The event file is read with the same layout as the PSTH. Offsets come from the `f` column(s); without one, each area is **Duration (ms)** long. **Emphasize on/offset** draws a thin line at each onset and offset.
+NPXplorer saves the event file that you last loaded in the Events or PSTH window with the settings of the recording. When you open the recording again, it fills in that file. It does not load the file until you press **Load** or **Apply/Compute**.
 
-The event file last loaded in the Events or PSTH window is saved with the recording's settings, together with the Events and PSTH settings, and filled in when the recording is opened again (it is not loaded until **Load** or **Apply/Compute** is pressed). Without one, the default event file from **Preferences → Default file locations…** is filled in, if it exists. With **Load on start → Events** ticked there, the event file is loaded when the recording is opened: the recording's own one, or else the default.
+If the recording has no saved event file, NPXplorer fills in the default event file from **Preferences → Default file locations…**, if that file exists. Tick **Load on start → Events** there to load the event file when the recording opens. NPXplorer then loads the recording's own event file, or else the default.
 
-### Spike-sorted data
+## PSTH (peri-stimulus average)
 
-**Load Spikes** opens a window with the phy folder (the output of Kilosort, iblsorter and other sorters that write the phy format) and filters for the units to show. The folder starts as the default from **Preferences → Default file locations…** (`ks` next to the recording, unless changed); **Browse…** picks another. **Load** reads the folder; once loaded, **Apply** only re-runs the filters (the cluster tables are read again, so labels changed in phy are picked up). With **Load on start → Spike-sorted data** ticked in Preferences, the folder is loaded with the filters when the recording is opened.
+The PSTH window averages the signal around event onsets. It uses all channels that are not removed and the preprocessing of the main window.
 
-**Filter neurons** keeps the units that pass three filters, in this order:
+1. Choose an event file. The window reads it with the [event file layout](#event-file-layout).
+2. Optional: select up to two channels on the heatmap (left-click and right-click).
+3. Press **Apply/Compute**. NPXplorer computes nothing before that.
 
-- **Curation label (group)**: phy's manual label (`cluster_group.tsv`): **good** (default), **good + mua** or **all** (including noise and unsorted). If the sorting hasn't been curated yet (no `group` column), this filter is skipped; a note in the window and the legend says so.
-- **Kilosort label (KSLabel)**: Kilosort's automatic label (`cluster_KSLabel.tsv`), with the same choices (default **all**). Units created by merging or splitting in phy have no KSLabel, so **good** and **good + mua** drop them.
-- **User**: any column of the cluster tables, e.g. a label added in phy or a column of `cluster_info.tsv`. **Value** is one text or several separated by commas (`Th,CA1`), or a comparison with a number (`>50`, `<=10`, `=3`, `!=0`). Leave **Column** empty to skip this filter.
+The window shows a heatmap, the mean over all channels, and the traces of the selected channels. **Alt + scroll** over the window adjusts the color scale. NPXplorer scales the traces to fit when it computes them. After that, they zoom together with the color scale.
 
-Columns are found by the header in any `cluster_*.tsv` in the folder; the single-column files take precedence over `cluster_info.tsv`, and copies such as `cluster_info (copy 1).tsv` are ignored. If a column or a value is not found, or no units are left after a filter, the window says so and the spikes shown so far stay. The folder and the filters are saved with the recording's settings; a recording opened for the first time starts with the filters last used.
+The PSTH is much faster without a spatial filter. The result is identical.
 
-Each spike is drawn as a dot on the heatmap, at its time and on the channel where its template is largest (unwhitened with `whitening_mat_inv.npy`, as phy does) (black with a white outline; white with a black outline on Cool-Warm). The dots grow as the time window gets shorter. With more than 20,000 spikes in the view, none are drawn and the legend asks you to zoom in. The legend lists the number of units shown and toggles the dots with **Show spikes**/**Hide spikes**. Spikes are drawn in the LF view too.
+## Spike-sorted data
 
-Files read: `spike_times.npy`, `spike_templates.npy`, `templates.npy`, `channel_map.npy`, `params.py` (sample rate, channel count), the cluster tables, and if present `spike_clusters.npy` (curated clusters) and `templates_ind.npy` (sparse templates). The sorting must have been run on the open file, or on a file with the same channels: a different channel count in `params.py` (e.g. an export with channels removed) is refused. Spikes on removed channels are not drawn.
+**Load Spikes** shows the units of a phy folder as dots on the heatmap. Kilosort, iblsorter and other sorters that write the phy format produce such a folder.
 
-### Power Spectrum
+1. Check the folder. It starts as the default from **Preferences → Default file locations…** (`ks` next to the recording, unless changed). **Browse…** picks another.
+2. Set the filters under **Filter neurons**.
+3. Press **Load**.
 
-**Power Spectrum** opens a settings window for computing each channel's power spectral density (Welch's method) and showing it as a second heatmap to the right of the main one: one row per channel, aligned with the main heatmap's rows (including the current zoom), frequency on a log x axis with four tick labels, colour = power.
+After the load, **Apply** only runs the filters again. It reads the cluster tables again, so it picks up labels that you changed in phy. To load the folder and apply the filters when the recording opens, tick **Load on start → Spike-sorted data** in Preferences.
 
-- **Time scope**: **Current view window** follows the view as you scroll or zoom, once calculated; **Whole recording (chunks)** (default) averages evenly-spaced snippets across the whole recording — **Chunks to sample** (default 100) sets how many.
-- **Source**: raw voltage, or the currently preprocessed signal (current-view scope only; whole-recording mode always uses raw).
-- **Scaling**: linear power or **dB** (default); **Colour range**: **Global** (default, one shared range across channels) or **Per-channel**.
-- **Restrict frequency range** limits the displayed/coloured band to a chosen Hz range; off shows the full band up to Nyquist. In whole-recording mode, **Restrict time window** takes the chunks only from a chosen part of the recording.
+### Filter the units
 
-**Calculate** starts it. Whole-recording mode shows a progress bar and can be aborted; current-view mode recomputes once scrolling has stopped. Once computed, **Show Spectra**/**Hide Spectra** in the legend toggles the overlay (as do the other overlays' Show/Hide entries there, once they have something to show).
+NPXplorer keeps the units that pass three filters, in this order:
 
-### Screenshot
+1. **Curation label (group)**: the manual label from phy (`cluster_group.tsv`). Choose **good** (default), **good + mua** or **all** (which includes noise and unsorted). If the sorting is not curated yet (no `group` column), NPXplorer skips this filter. A note in the window and in the legend says so.
+2. **Kilosort label (KSLabel)**: the automatic label from Kilosort (`cluster_KSLabel.tsv`), with the same choices (default **all**). Units that you created with a merge or a split in phy have no KSLabel, so **good** and **good + mua** drop them.
+3. **User**: any column of the cluster tables, for example a label added in phy or a column of `cluster_info.tsv`. Leave **Column** empty to skip this filter.
 
-**Screenshot** (top right) opens a window listing the overlays calculated so far (events, spikes, atlas regions, firing rate, power spectrum, channel classification), plus the selected-channel lines and the scale bar; tick the ones to include. **Save…** asks for a file name and saves the plot area (the heatmap with the spectrum panel, or the waveform view) as a PNG at screen resolution, without windows, the legend or the hover readout. The window closes once the image is saved.
+For the **User** filter, **Value** can be:
 
-### Export preprocessed data
+- one text, or several texts separated by commas (`Th,CA1`)
+- a comparison with a number (`>50`, `<=10`, `=3`, `!=0`)
 
-**File → Export preprocessed data…** writes a copy of the recording with the current preprocessing applied, in the format of the original: a SpikeGLX `.bin` with its `.meta`, or an Open Ephys session folder (`settings.xml`, `structure.oebin`, `continuous.dat`, the timestamps cut to the exported range, and the events). All channels that are not removed are exported, in their original order, under their original names and at their original µV per bit; the SpikeGLX sync channel is copied unchanged.
+NPXplorer finds a column by its header in any `cluster_*.tsv` in the folder. The single-column files take precedence over `cluster_info.tsv`. It ignores copies such as `cluster_info (copy 1).tsv`.
 
-The window offers:
+If NPXplorer does not find a column or a value, or if no units are left after a filter, the window says so. The spikes shown so far stay.
 
-- **Time range** (**From**/**To**, s): **Whole recording** or **Current view**. The exported file starts at **From**; SpikeGLX's `firstSample` is shifted accordingly, Open Ephys timestamps keep their values, so the export stays aligned with other streams.
-- **Bad channels**, from the channel classification (it runs first if it hasn't): dead and noisy channels can each be kept, removed or interpolated from their neighbours; channels outside the brain can be removed. Check the classification overlay first: the outside-of-brain detection can be wrong.
-- **Average same-depth channels**, off by default. It changes the probe geometry and breaks spike sorters and most other analyses.
-- **Event blanking**: sets the data around each event of the **Events** window to 0 (**Blank**) or bridges it with a straight line (**Interpolate**), in a window from **Start** to **End** (ms, relative to the onset). **Around offsets** adds a second window around each offset; without an offset column in the event file, the offset is the onset plus **Event length**. Blanking runs before notch, highpass and spatial filter, so they don't spread the artifact.
-- **Write probe file for Kilosort 4**, and **Open export when done**.
+NPXplorer saves the folder and the filters with the settings of the recording. A recording that you open for the first time starts with the filters that you used last.
 
-**Export…** opens a save dialog, in the export folder from **Preferences → Default file locations…** if one is set (it is created if needed) or else next to the original, with a proposed name: the original's with `_preprocessed` and the time range added (e.g. `run_preprocessed_120-300s_g0_t0.imec0.ap.bin`); the original can't be overwritten. While the export runs, the window is frozen and greyed out and all CPU cores are used; **Abort** stops it and removes what was written. Noise suppression is a display filter and is not exported.
+### Read the display
 
-Next to the export, NPXplorer writes:
+- Each spike is a dot at its time, on the channel where its template is largest.
+- With more than 20,000 spikes in the view, NPXplorer draws none, and the legend asks you to zoom in.
+- The legend lists the number of units shown. **Show spikes**/**Hide spikes** there toggles the dots.
+- NPXplorer draws spikes in the LF view too.
 
-- `<name>.preprocessing.toml` (Open Ephys: `preprocessing.toml` in the session folder): source, time range, channels exported, removed and interpolated, and every step applied with its parameters, in order.
-- `<name>.npxplorer.toml`: settings for opening the export in NPXplorer, with preprocessing switched off (it is in the data now) and the atlas registration carried over.
-- `<name>.events.csv`: the events in the exported range, with times relative to its start (if an event file is loaded).
-- `<name>.kilosort4_probe.json`: channel positions and shanks in Kilosort 4's probe format (if ticked).
+### Required files
 
-## Configuration
+NPXplorer reads `spike_times.npy`, `spike_templates.npy`, `templates.npy`, `channel_map.npy`, `params.py` (sample rate, channel count) and the cluster tables. If they are present, it also reads `spike_clusters.npy` (curated clusters), `templates_ind.npy` (sparse templates) and `whitening_mat_inv.npy`.
 
-Every setting made for a recording, in the main window and in the tool windows (preprocessing, colour scale, time window, removed channels, noise suppression and notches, overlays, power spectrum, classification, events, PSTH, atlas registration), is saved in `<recording>.npxplorer.toml` next to the data file and applied when the recording is opened again. The AP and LF files of a recording share it: settings that differ between the bands are kept separately, the removed channels, event and atlas settings are shared. Overlays that take a computation (power spectrum, channel classification, PSTH) are not recomputed on opening; their settings are restored. The file is written about a second after a change and when the recording is closed. Files written by earlier versions (`.npx_atlas.toml`, `.npx_notch.toml`) are read and replaced by it.
+The sorting must come from the open file, or from a file with the same channels. NPXplorer refuses a folder with a different channel count in `params.py`, for example an export with channels removed.
 
-Preferences are saved in `config/npxplorer_prefs.toml` next to the executable, together with the default layout files for PSTH and Remove channels. They hold the settings that are not specific to a recording (atlas folder, buffer and memory limits, recent files) and the last-used settings, which a recording opened for the first time starts with.
+## Power spectrum
 
-**Default file locations…** (top of Preferences) sets where files that belong to a recording are looked for, as paths relative to the recording's folder (`..` goes up a folder, e.g. `../ks`; absolute paths work too): the **Event file**, the **Spike-sorted data** folder (default `ks`) and the **Export folder** (empty: next to the recording). For Open Ephys, the recording's folder is the one holding `continuous.dat`. **Load on start** loads the events and/or the spike-sorted data when a recording is opened. The **Atlas folder** for Atlas registration is set there too.
+**Power Spectrum** computes the power spectral density of each channel (Welch's method). It shows the result as a second heatmap to the right of the main one.
 
-The **Performance** section in Preferences controls how much of the recording is kept preprocessed. **Preprocess around view (s)** (default 10 s) is computed on both sides of the view first. **Background preprocessing** (off by default) keeps going while nothing else needs computing, about three times further in the scroll direction than behind, until the cache uses **Memory budget** (default 50 %) of the available memory; it pauses while Power spectrum, Classification, PSTH or Export run. Below **Memory reserve** (default 1500 MB) of free memory, the data farthest from the view is dropped. Preprocessed data is kept as 16-bit values, about 0.15 µV per step for NP1 (finer than the ADC), about 11.5 MB per second of NP1 AP data with averaged channels (twice that without).
+Set these options, then press **Calculate**:
+
+| Option | Choices |
+|---|---|
+| **Time scope** | **Whole recording (chunks)** (default) averages evenly spaced snippets from the whole recording. **Chunks to sample** (default 100) sets how many. **Current view window** follows the view as you scroll or zoom. |
+| **Source** | The raw voltage, or the currently preprocessed signal. The preprocessed signal is available in the current-view scope only. The whole-recording scope always uses raw. |
+| **Scaling** | Linear power or **dB** (default). |
+| **Colour range** | **Global** (default, one range for all channels) or **Per-channel**. |
+| **Restrict frequency range** | Limits the displayed and colored band to a range in Hz. Off shows the full band up to Nyquist. |
+| **Restrict time window** | Whole-recording scope only. Takes the chunks from a chosen part of the recording. |
+
+The whole-recording scope shows a progress bar, and you can abort it. The current-view scope computes again when the scroll stops.
+
+The spectrum heatmap has one row per channel. The rows align with the rows of the main heatmap, also when you zoom. Frequency is on a log x axis with four tick labels, and color shows power.
+
+After the calculation, **Show Spectra**/**Hide Spectra** in the legend toggles the overlay. The other overlays have Show/Hide entries there too, once they have something to show.
+
+## CSD (current source density)
+
+CSD shows current source density along depth. It works for AP and LF files.
+
+1. Choose **CSD** as the spatial filter. A small window opens.
+2. Set **Gaussian smoothing** and **Bandpass**.
+3. Press **Apply** or Enter to switch CSD on. Esc cancels.
+
+| Option | Default | Advice |
+|---|---|---|
+| **Gaussian smoothing** along depth, with **σ** | On, 40 µm | For LFP, use 40 to 80 µm. Below about 30 µm, the result is mostly noise. |
+| **Bandpass** (zero-phase Butterworth, order 3 at each edge) | On, 5–150 Hz, as in the Allen Brain Observatory Neuropixels CSD | For slow oscillations, lower the low cut to about 1 Hz. |
+
+The bandpass replaces the 300 Hz HP. Use the bandpass for LFP sinks and sources. Without it, AP data gives a spike-band Laplacian. NP 1.0 AP data was usually highpassed in hardware (see the last field of each `~imroTbl` entry in the meta file). NP 2.0 AP data is wideband.
+
+NPXplorer shows the values as −∂²φ/∂z² in **mV/mm²**, so sinks are negative. It assumes no tissue conductivity. Multiply by σ ≈ 0.3 S/m to get µA/mm³.
+
+While CSD is on:
+
+- The color scale, the hover readout, the waveform view and the PSTH use mV/mm².
+- CSD has its own color settings: percentile 80–100 % (default 95 %), or a fixed range of 0.1–1000 mV/mm² (default ±10). When you switch CSD off, the µV settings come back.
+- **Avg adjacent chans** is on (one row per depth). With the bandpass, the 300 Hz HP is off. When you choose another spatial filter, NPXplorer restores both.
+- NPXplorer hides the firing rate overlay and refuses to export.
+
+A strong pair of sink and source, for example at the brain surface, can leave the rest of the heatmap dark. If this occurs, lower the percentile or remove the channels outside the brain.
+
+## Noise suppression
+
+**Noise Suppression** opens a window with display filters. These filters change the heatmap, the waveform view and the hovered µV value. They do not change the firing rate, the PSTH, the spectrum or the export.
+
+- Press **Apply** to make your changes take effect.
+- **Disable all** switches every filter off at once and keeps the values.
+- The button is highlighted while a filter is on.
+- NPXplorer saves the applied settings with the settings of the recording.
+
+In **%ile** color mode without peak pooling, the color range still comes from the unfiltered signal. You can thus compare the filtered and the unfiltered view directly.
+
+The filters run in the order below.
+
+### Wavelet denoising
+
+This filter splits each channel into scales with a wavelet and removes small coefficients at each scale.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| Wavelet | | Haar, db4 or sym4. |
+| **Levels** | 2 | The number of scales. |
+| **Threshold** | 3 × σ | A multiple of the noise level of each scale. |
+| **Hard** / **Soft** | Soft | **Hard** removes the coefficients below the threshold. **Soft** shrinks all coefficients toward 0 by the threshold. |
+
+### Attenuate isolated events
+
+This filter reduces events that appear on too few neighbouring channels. An event is a stretch of the signal between two zero crossings whose peak reaches **Event level**.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| **Event level** | ±15 µV | The peak that makes a stretch an event. |
+| **Min. adjacent channels** | 3 | The filter keeps an event that spans at least this many neighbouring channels. The count includes the channel of the event. |
+| **Neighbour amplitude** | 90 % | Each neighbour must reach this share of the peak, with the same polarity. |
+| **Time tolerance** | ±0.3 ms | The neighbour must reach it within this time. |
+| **Attenuation** | 50 % | The filter reduces every other event by this amount. 100 % removes the event. |
+
+As with Destripe, channels across a gap in the layout are not neighbours.
+
+### Soft-knee noise gate
+
+This filter scales every sample by a smooth S-shaped function of its amplitude. Weak signals fade and strong signals stay. Unlike a hard threshold, it has no jump.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| **Centre** | 20 µV | The amplitude that gets half of **Max gain**. |
+| **Width** | 5 µV | The sharpness of the transition. The gain goes from 12 % to 88 % within Centre ± 2 widths. |
+| **Max gain** | 1× | The gain for strong signals. |
+
+A max gain above 1 is the same as a narrower color range. In **%ile** mode, strong signals then saturate.
+
+## Notch filters
+
+The notch filters are in the lower part of the **Noise Suppression** window. Unlike the display filters, they are part of the preprocessing: they change the data everywhere, not only on the display.
+
+1. Press **Find noise peaks**. NPXplorer scans chunks of about 1 s across the recording. A progress bar shows the scan, and **Abort** stops it.
+2. Read the result. A plot shows the mean spectrum of each shank, and a table lists the peaks found.
+3. Tick a peak to add a notch, or add a notch by hand.
+4. Press **Apply notches** to activate them on all channels.
+
+The scan uses the current preprocessing without the notches. It looks at the spectrum of every channel on its own. It thus also finds noise that reaches only some channels, or reaches the channels at different times. CMR and Destripe cannot remove such noise.
+
+These settings control which peaks the table lists:
+
+| Setting | Default | A peak is listed if |
+|---|---|---|
+| **Chunks to sample** | 100 | (The number of chunks in the scan.) |
+| **Min. channels** | 30 % | It is a peak on at least this share of the channels of one shank. |
+| **Min. prominence** | 6 dB | It is at least this far above the smoothed spectrum. |
+| **Max. width** | 3 Hz | It is at most this wide. |
+| **Min. presence** | 25 % | It is present in at least this share of the chunks. |
+
+The table leaves out broad peaks, which are usually brain oscillations. It also leaves out peaks that come and go, such as stimulation artifacts. A filter on the whole recording is the wrong tool for those.
+
+The table shows evenly spaced lines (at least 3, for example a carrier with mains sidebands every 50 Hz) as one row. The checkbox of that row adds a notch for each line. Hover over the row to list the lines.
+
+NPXplorer saves the notches with the settings of the recording, separately for AP and LF. It restores them when you open the file again. **Notch (n)** in the preprocessing bar switches them off and on.
+
+## Atlas registration
+
+Atlas registration draws the borders between brain regions of the Allen mouse atlas (CCF 2017, 10 µm) on the heatmap. It computes them from the insertion coordinates of the probe.
+
+### Set up the atlas
+
+1. Create a folder and set it in **Preferences → Default file locations…**.
+2. Download `annotation_10.nrrd` from the [Allen Institute](https://download.alleninstitute.org/informatics-archive/current-release/mouse_ccf/annotation/ccf_2017/) into the folder.
+3. Save the structure ontology from the [Allen API](https://api.brain-map.org/api/v2/data/query.csv?criteria=model::Structure,rma::criteria,[ontology_id$eq1],rma::options[order$eq%27structures.graph_order%27][num_rows$eqall]) as `query.csv` in the folder.
+
+On the first load, NPXplorer converts the `.nrrd` once into `annotation_10_npxplorer.npy` (2.4 GB) and `annotation_10_npxplorer_ids.txt` in the same folder. This takes a while and needs write access to the folder.
+
+You can also use the reformatted atlas of the [Neuropixels Trajectory Explorer](https://github.com/petersaj/neuropixels_trajectory_explorer): `annotation_volume_10um_by_index.npy` and `structure_tree_safe_2017.csv` ([download](https://osf.io/fv7ed/)). It has the same voxels and borders, and it loads without the conversion.
+
+### Enter the insertion
+
+| Field | Meaning |
+|---|---|
+| **Insertion** AP and ML | In mm from bregma. AP positive = anterior, ML positive = right. |
+| Angles as **Azimuth / elevation / rotation** | Azimuth from the lambda→bregma axis, elevation from horizontal. |
+| Angles as **Polar / azimuth / roll** | Polar angle from vertical, azimuth from +ML. |
+| **Depth** | From the brain surface to the tip, along the probe. |
+| Tip offset | The distance from the tip to the first electrode row. The default comes from the probe type: 209 µm for NP 1.0, 206 µm for NP 2.0. |
+| **Bregma–lambda distance** | Scales the atlas to the animal. Default 4.1 mm. |
+
+Rotation or roll turns the probe around its axis. This matters for multi-shank probes.
+
+### Match the borders to the data
+
+- **Alt + drag** any border to move all borders together. This changes the depth.
+- **Drag** a single border to move only that one. It stops at its neighbours.
+
+NPXplorer keeps dragged borders when the depth changes. Only **Reset borders** undoes them.
+
+### Read and save the regions
+
+- Hover over a region label to see its full name.
+- The readout at the bottom left shows the region of the hovered channel.
+- With channels ordered by ID, NPXplorer hides the borders and labels.
+- **Skip drawing regions with less than … channels** (default 4, 0 draws all) hides small regions. NPXplorer splits their channels between the neighbouring regions on the display. The readout and **Save** still use the exact regions.
+
+**Save** writes `<recording>_regions.csv` next to the data file, with the ID and the region of each channel.
+
+NPXplorer saves the coordinates and the dragged borders with the settings of the recording. The AP and LF files share them. If the overlay was visible when you closed the recording, NPXplorer loads the atlas and draws the borders again when you open it.
+
+## Screenshot
+
+1. Press **Screenshot** (top right). A window lists the overlays calculated so far (events, spikes, atlas regions, firing rate, power spectrum, channel classification), the lines of the selected channels and the scale bar.
+2. Tick the items to include.
+3. Press **Save…** and give a file name.
+
+NPXplorer saves the plot area as a PNG at screen resolution. The plot area is the heatmap with the spectrum panel, or the waveform view. The image has no windows, no legend and no hover readout. The window closes after the save.
+
+## Export preprocessed data
+
+**File → Export preprocessed data…** writes a copy of the recording with the current preprocessing applied. The copy has the format of the original:
+
+- SpikeGLX: a `.bin` with its `.meta`.
+- Open Ephys: a session folder with `settings.xml`, `structure.oebin`, `continuous.dat`, the timestamps cut to the exported range, and the events.
+
+The export contains all channels that are not removed, in their original order, with their original names and their original µV per bit. NPXplorer copies the SpikeGLX sync channel unchanged. Noise suppression is a display filter, so the export does not contain it.
+
+### Export options
+
+- **Time range** (**From**/**To**, in s): **Whole recording** or **Current view**. The exported file starts at **From**. NPXplorer shifts SpikeGLX's `firstSample` to match, and Open Ephys timestamps keep their values. The export thus stays aligned with other streams.
+- **Bad channels**: you can keep, remove or interpolate dead channels and noisy channels, each from their neighbours. You can remove channels outside the brain. This option uses the channel classification and runs it first if needed.
+- **Average same-depth channels** (off by default). This breaks spike sorting.
+- **Event blanking**: changes the data around each event of the **Events** window. **Blank** sets the data to 0. **Interpolate** bridges it with a straight line. The window goes from **Start** to **End** (ms, relative to the onset).
+- **Around offsets**: adds a second blanking window around each offset. If the event file has no offset column, the offset is the onset plus **Event length**.
+- **Write probe file for Kilosort 4**.
+- **Open export when done**.
+
+**Check the classification overlay before you remove or interpolate bad channels.** The outside-of-brain detection can be wrong.
+
+**Average same-depth channels changes the probe geometry.** It breaks spike sorters and most other analyses.
+
+Event blanking runs before the notch, the highpass and the spatial filter, so these filters do not spread the artifact.
+
+### Run the export
+
+1. Press **Export…**. A save dialog opens with a proposed name.
+2. Confirm the name. You cannot overwrite the original.
+
+The dialog opens in the export folder from **Preferences → Default file locations…**, if one is set. NPXplorer creates that folder if needed. Otherwise the dialog opens next to the original.
+
+The proposed name is the name of the original with `_preprocessed` and the time range added, for example `run_preprocessed_120-300s_g0_t0.imec0.ap.bin`.
+
+During the export, the window is frozen and greyed out, and NPXplorer uses all CPU cores. **Abort** stops the export and removes what it wrote.
+
+### Files next to the export
+
+| File | Content |
+|---|---|
+| `<name>.preprocessing.toml` (Open Ephys: `preprocessing.toml` in the session folder) | The source, the time range, the channels exported, removed and interpolated, and every step applied with its parameters, in order. |
+| `<name>.npxplorer.toml` | Settings to open the export in NPXplorer. Preprocessing is off, because it is in the data now. The atlas registration is carried over. |
+| `<name>.events.csv` | The events in the exported range, with times relative to its start. Written if an event file is loaded. |
+| `<name>.kilosort4_probe.json` | Channel positions and shanks in the probe format of Kilosort 4. Written if ticked. |
+
+## Settings and preferences
+
+### Settings of a recording
+
+NPXplorer saves every setting that you make for a recording in `<recording>.npxplorer.toml` next to the data file. It applies them when you open the recording again. This covers the main window and the tool windows:
+
+- preprocessing, color scale and time window
+- removed channels, noise suppression and notches
+- overlays, power spectrum and classification
+- events, PSTH and atlas registration
+
+- The AP and LF files of a recording share the file. Settings that differ between the bands are kept separately. The removed channels, the event settings and the atlas settings are shared.
+- NPXplorer does not recompute the power spectrum, the channel classification or the PSTH when you open a recording. It restores their settings only.
+- NPXplorer reads files from earlier versions (`.npx_atlas.toml`, `.npx_notch.toml`) and replaces them with the new file.
+
+### Preferences
+
+NPXplorer saves the preferences in `config/npxplorer_prefs.toml` next to the executable. The default layout files for PSTH and Remove channels are in the same folder.
+
+The preferences hold the settings that do not belong to one recording: the atlas folder, the buffer and memory limits, and the recent files. They also hold the settings that you used last. A recording that you open for the first time starts with those.
+
+### Default file locations
+
+**Default file locations…** (top of Preferences) sets where NPXplorer looks for the files that belong to a recording.
+
+| Entry | Default |
+|---|---|
+| **Event file** | |
+| **Spike-sorted data** folder | `ks` |
+| **Export folder** | Empty: next to the recording. |
+| **Atlas folder** | |
+
+- Paths are relative to the folder of the recording. `..` goes up a folder, for example `../ks`. Absolute paths work too.
+- For Open Ephys, the folder of the recording is the one that holds `continuous.dat`.
+- **Load on start** loads the events, the spike-sorted data or both when you open a recording.
+
+### Performance
+
+The **Performance** section in Preferences controls how much of the recording NPXplorer keeps preprocessed. Experiment with it to find good settings for your computer.
+
+| Setting | Default | Effect |
+|---|---|---|
+| **Preprocess around view (s)** | 10 s | NPXplorer computes this much on both sides of the view first. |
+| **Background preprocessing** | Off | NPXplorer continues to preprocess while nothing else needs computing. It goes about three times further in the scroll direction than behind. |
+| **Memory budget** | 50 % | Background preprocessing stops when the cache uses this share of the available memory. |
+| **Memory reserve** | 1500 MB | Below this much free memory, NPXplorer drops the data farthest from the view. |
+
+Background preprocessing pauses while Power spectrum, Classification, PSTH or Export run.
+
+One second of preprocessed NP1 AP data takes about 11.5 MB with averaged channels, and twice that without.
 
 ## Known limitations
 
-- `.cbin` files are slower to navigate, since they are decompressed on the fly.
-- Open Ephys: only the first probe of a `settings.xml` processor is used; multi-shank probes and multi-experiment/multi-recording sessions are untested.
-- Open Ephys export: removing channels rewrites the probe's channel lists in `settings.xml`; this has not been checked with SpikeInterface/probeinterface yet.
-- SpikeGLX recordings older than 20230202 have no `~snsGeomMap`; electrode positions are then rebuilt from `~snsShankMap` and the probe type's pitch. Unknown probe types fall back to a nominal single column at 20 µm and a warning in the status bar.
-
-## Command line
-
-Build with `cargo build --release` (Rust stable). `--file <path>` opens a recording directly, `--debug` writes `debug.log` next to the executable.
+- `.cbin` files, Zarr folders and NWB files are slower to navigate, because NPXplorer decompresses them on the fly. NWB files are the slowest: they usually store long chunks (about 30 s), and NPXplorer must decompress a whole chunk to show a part of it.
+- Zarr and NWB: **Export preprocessed data** is not available.
+- Zarr: NPXplorer takes the electrode positions and the probe type from the probe that SpikeInterface stored with the recording. Without a stored probe, it assumes a single column at 20 µm and cannot correct the sampling delay (**Phase Shift**). The status bar says so.
+- Zarr: NPXplorer shows only the first segment.
+- Zarr with lossy WavPack (`bps` set): the decoded values can differ by a few ADC counts from the values that the WavPack reference decoder gives. Lossless WavPack is exact.
+- NWB: NPXplorer needs the columns `rel_x` and `rel_y` in the electrodes table for the electrode positions, and the column `inter_sample_shift` for **Phase Shift**. Without them, it assumes a single column at 20 µm and applies no delay correction. If the file holds several electrical series, NPXplorer shows the one with the highest sample rate.
+- NWB files with a Zarr backend are not supported.
+- Open Ephys: NPXplorer uses only the first probe of a `settings.xml` processor. Multi-shank probes and sessions with several experiments or recordings are untested.
+- Open Ephys export: if you remove channels, the export rewrites the channel lists of the probe in `settings.xml`. This is not checked with SpikeInterface/probeinterface yet.
+- SpikeGLX recordings older than 20230202 have no `~snsGeomMap`. NPXplorer then rebuilds the electrode positions from `~snsShankMap` and the pitch of the probe type.
+- For an unknown probe type, NPXplorer falls back to a nominal single column at 20 µm and shows a warning in the status bar.

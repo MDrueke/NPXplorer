@@ -893,6 +893,8 @@ pub struct NPXplorerApp {
 
     // UI state
     pub file_dialog_request: bool,
+    /// like `file_dialog_request`, for the folder picker ("Open Zarr folder…")
+    pub folder_dialog_request: bool,
     /// set by the toolbar's "Recent files" menu; polled by MainApp to switch recordings
     pub open_recent_request: Option<PathBuf>,
     recent_files: Vec<PathBuf>,
@@ -975,6 +977,8 @@ struct MainScreenshot;
 
 impl NPXplorerApp {
     pub fn new(ctx: &egui::Context, bin_path: PathBuf) -> anyhow::Result<Self> {
+        // a Zarr recording is its folder, whichever file in it was picked
+        let bin_path = crate::zarr::root_of(&bin_path).unwrap_or(bin_path);
         let meta = Arc::new(Meta::from_data_path(&bin_path)?);
         let raw = Arc::new(open_data(&bin_path, &meta)?);
         let fs = meta.sample_rate;
@@ -1248,6 +1252,7 @@ impl NPXplorerApp {
             zoom: None,
             zoom_drag_start: None,
             file_dialog_request: false,
+            folder_dialog_request: false,
             open_recent_request: None,
             recent_files,
             projection_sums: Vec::new(),
@@ -3164,6 +3169,10 @@ impl NPXplorerApp {
                         self.file_dialog_request = true;
                         ui.close_menu();
                     }
+                    if ui.button("Open Zarr folder…").clicked() {
+                        self.folder_dialog_request = true;
+                        ui.close_menu();
+                    }
                     ui.menu_button("Recent files", |ui| {
                         if let Some(path) = crate::draw_recent_files_menu(ui, &self.recent_files) {
                             self.open_recent_request = Some(path);
@@ -3171,7 +3180,13 @@ impl NPXplorerApp {
                         }
                     });
                     ui.separator();
-                    if ui.button("Export preprocessed data…").clicked() {
+                    // an export is written in the format of the original, which needs its
+                    // SpikeGLX or Open Ephys metadata files
+                    let exportable = crate::zarr::root_of(&self.bin_path).is_none() && !crate::nwb::is_nwb(&self.bin_path);
+                    let export = ui
+                        .add_enabled(exportable, egui::Button::new("Export preprocessed data…"))
+                        .on_disabled_hover_text("Not available for Zarr and NWB recordings.");
+                    if export.clicked() {
                         self.export_ui.open_window(&self.bin_path);
                         ui.close_menu();
                     }

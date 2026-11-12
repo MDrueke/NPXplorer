@@ -11,7 +11,7 @@ const AP_RATE_HZ: f64 = 30_000.0;
 /// Factor converting a delay in AP sample periods into samples of a stream at `fs`:
 /// 1 for an AP / full-band stream (whatever its calibrated rate, e.g. 29999.84 Hz),
 /// fs / 30 kHz for an LF stream.
-fn stream_delay_scale(fs: f64) -> f32 {
+pub(crate) fn stream_delay_scale(fs: f64) -> f32 {
     if fs > 10_000.0 { 1.0 } else { (fs / AP_RATE_HZ) as f32 }
 }
 
@@ -105,6 +105,12 @@ impl Meta {
     /// identified by a `structure.oebin` found in an ancestor directory (with a
     /// `settings.xml` further up, at the Record Node level).
     pub fn from_data_path(bin_path: &Path) -> Result<Self> {
+        if let Some(root) = crate::zarr::root_of(bin_path) {
+            return crate::zarr::load_meta(&root);
+        }
+        if crate::nwb::is_nwb(bin_path) {
+            return crate::nwb::load_meta(bin_path);
+        }
         // for mtscomp-compressed data the true sample count lives in the .ch file: the
         // compressed file's size says nothing about it
         let cbin_n_samples = if is_cbin(bin_path) {
@@ -123,8 +129,9 @@ impl Meta {
             return Self::from_open_ephys(bin_path, &oebin_path, &settings_path, cbin_n_samples);
         }
         bail!(
-            "no metadata found for {}: expected a sibling .meta file (SpikeGLX) \
-             or a structure.oebin in a parent directory (Open Ephys)",
+            "no metadata found for {}: expected a sibling .meta file (SpikeGLX), \
+             a structure.oebin in a parent directory (Open Ephys), a Zarr folder \
+             written by SpikeInterface, or an .nwb file",
             bin_path.display()
         );
     }
@@ -593,7 +600,7 @@ fn is_cbin(path: &Path) -> bool {
 }
 
 /// A representative `imDatPrb_type` for a spec looked up by part number.
-fn probe_type_of_spec(spec: &ProbeSpec) -> u32 {
+pub(crate) fn probe_type_of_spec(spec: &ProbeSpec) -> u32 {
     match spec.part_number {
         "NP1000" => 0,
         "NP2000" => 21,
@@ -638,7 +645,7 @@ fn parse_chan_map(s: Option<&str>, n_ap: usize) -> Vec<String> {
     ids
 }
 
-fn default_geom(n_ap: usize) -> Vec<ChannelGeom> {
+pub(crate) fn default_geom(n_ap: usize) -> Vec<ChannelGeom> {
     (0..n_ap)
         .map(|i| ChannelGeom { x_um: 0.0, y_um: i as f32 * 20.0, shank: 0 })
         .collect()
@@ -945,7 +952,16 @@ impl ShiftKernels {
 
 pub enum RawData {
     Uncompressed(memmap2::Mmap),
-    Compressed(crate::mtscomp::MtscompReader),
+    Compressed(Box<dyn ChunkSource>),
+}
+
+/// A recording stored as compressed chunks of consecutive samples (mtscomp, Zarr).
+pub trait ChunkSource: Send + Sync {
+    fn n_channels(&self) -> usize;
+    /// First sample of every chunk, then the total sample count.
+    fn chunk_bounds(&self) -> &[usize];
+    /// Decompressed chunk `idx`, interleaved `[t][ch]`.
+    fn chunk(&self, idx: usize) -> Result<Arc<Vec<i16>>>;
 }
 
 /// Time samples converted per parallel work item: a block of interleaved source
@@ -1137,7 +1153,7 @@ impl RawData {
                 // the range plus the filter halo, decompressed into one interleaved buffer
                 let want_lo = first_sample.saturating_sub(SHIFT_HALO);
                 let want_hi = first_sample + n_samp + SHIFT_HALO;
-                let Some((src, gather_start)) = gather_compressed(reader, want_lo, want_hi) else {
+                let Some((src, gather_start)) = gather_compressed(reader.as_ref(), want_lo, want_hi) else {
                     return out;
                 };
                 let src_offset = first_sample.saturating_sub(gather_start);
@@ -1169,7 +1185,7 @@ impl RawData {
         match self {
             RawData::Uncompressed(mmap) => copy(mmap_as_i16(mmap), first_sample),
             RawData::Compressed(reader) => {
-                if let Some((src, gather_start)) = gather_compressed(reader, first_sample, first_sample + n_samp) {
+                if let Some((src, gather_start)) = gather_compressed(reader.as_ref(), first_sample, first_sample + n_samp) {
                     copy(&src, first_sample - gather_start);
                 }
             }
@@ -1181,10 +1197,10 @@ impl RawData {
 /// Decompress every chunk overlapping samples `[want_lo, want_hi)` (in parallel) and
 /// stitch them into one interleaved buffer; returns it with its first sample, or
 /// `None` if the range lies outside the recording.
-fn gather_compressed(reader: &crate::mtscomp::MtscompReader, want_lo: usize, want_hi: usize) -> Option<(Vec<i16>, usize)> {
+fn gather_compressed(reader: &dyn ChunkSource, want_lo: usize, want_hi: usize) -> Option<(Vec<i16>, usize)> {
     use rayon::prelude::*;
-    let bounds = &reader.meta.chunk_bounds;
-    let n_ch = reader.meta.n_channels;
+    let bounds = reader.chunk_bounds();
+    let n_ch = reader.n_channels();
     if bounds.len() < 2 {
         return None;
     }
@@ -1218,6 +1234,20 @@ fn mmap_as_i16(mmap: &memmap2::Mmap) -> &[i16] {
 }
 
 pub fn open_data(bin_path: &Path, meta: &Meta) -> Result<RawData> {
+    if let Some(root) = crate::zarr::root_of(bin_path) {
+        let reader = crate::zarr::ZarrReader::open(&root)?;
+        if reader.n_channels() != meta.n_saved_chans {
+            bail!("{} holds {} channels but its metadata says {}", root.display(), reader.n_channels(), meta.n_saved_chans);
+        }
+        return Ok(RawData::Compressed(Box::new(reader)));
+    }
+    if crate::nwb::is_nwb(bin_path) {
+        let reader = crate::nwb::NwbReader::open(bin_path)?;
+        if reader.n_channels() != meta.n_saved_chans {
+            bail!("{} holds {} channels but its metadata says {}", bin_path.display(), reader.n_channels(), meta.n_saved_chans);
+        }
+        return Ok(RawData::Compressed(Box::new(reader)));
+    }
     if is_cbin(bin_path) {
         let ch_path = bin_path.with_extension("ch");
         if !ch_path.exists() {
@@ -1236,7 +1266,7 @@ pub fn open_data(bin_path: &Path, meta: &Meta) -> Result<RawData> {
             bail!("{} has no chunks", ch_path.display());
         }
         let reader = crate::mtscomp::MtscompReader::new(bin_path, mts_meta)?;
-        Ok(RawData::Compressed(reader))
+        Ok(RawData::Compressed(Box::new(reader)))
     } else {
         let file = std::fs::File::open(bin_path)
             .with_context(|| format!("opening {}", bin_path.display()))?;

@@ -24,6 +24,11 @@ toml = "1.1.2"
 roxmltree = "0.20"
 rustfft = "6.2"
 sha1 = "0.11.0"
+ruzstd = "0.9.1"
+lz4_flex = "0.14.0"
+claxon = "0.4.3"
+oxideav-wavpack = "0.0.5"
+hdf5-pure = "0.48.0"
 
 [profile.release]
 opt-level = 3
