@@ -1,4 +1,5 @@
 use crate::colormap::ColorMapChoice;
+use crate::rows::SampleWindow;
 use crate::data::DisplayRow;
 
 pub use crate::colormap::C_ZERO;
@@ -66,27 +67,21 @@ fn paint_rows(
 
 #[inline]
 fn fill_solid(row: &mut [u8], rgb: [u8; 3]) {
-    for px in row.chunks_exact_mut(4) {
-        px[0] = rgb[0];
-        px[1] = rgb[1];
-        px[2] = rgb[2];
-        px[3] = 255;
+    for px in row.as_chunks_mut::<4>().0 {
+        *px = [rgb[0], rgb[1], rgb[2], 255];
     }
 }
 
 /// Background with a dotted grey line: the marker of a gap between electrode rows.
 #[inline]
 fn fill_gap(row: &mut [u8]) {
-    for (px_idx, px) in row.chunks_exact_mut(4).enumerate() {
+    for (px_idx, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let (r, g, b) = if (px_idx / 4) % 2 == 0 {
             (0x60, 0x60, 0x60)
         } else {
             (C_ZERO[0], C_ZERO[1], C_ZERO[2])
         };
-        px[0] = r;
-        px[1] = g;
-        px[2] = b;
-        px[3] = 255;
+        *px = [r, g, b, 255];
     }
 }
 
@@ -133,25 +128,20 @@ fn abs_percentile(values: impl Iterator<Item = f32>, pct: f32) -> Option<f32> {
     }
     let k = (((v.len() - 1) as f32) * (pct / 100.0).clamp(0.0, 1.0)).round() as usize;
     let (_, kth, _) = v.select_nth_unstable_by(k, |a, b| {
-        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        a.total_cmp(b)
     });
     Some(*kth)
 }
 
 /// Colour a pixel row from pooled values (NaN = no data -> background).
 fn colour_row(row: &mut [u8], pooled: &[f32], vmax: f32, cmap: &ColorMapChoice) {
-    for (px, &v) in row.chunks_exact_mut(4).zip(pooled) {
-        let rgba = if v.is_nan() {
-            [C_ZERO[0], C_ZERO[1], C_ZERO[2], 255]
-        } else {
-            voltage_to_rgba(v, vmax, cmap)
-        };
-        px.copy_from_slice(&rgba);
+    for (px, &v) in row.as_chunks_mut::<4>().0.iter_mut().zip(pooled) {
+        *px = if v.is_nan() { [C_ZERO[0], C_ZERO[1], C_ZERO[2], 255] } else { voltage_to_rgba(v, vmax, cmap) };
     }
 }
 
 /// How a heatmap's colour range is chosen.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ColorScale {
     /// fixed ±vmax (µV)
     Fixed(f32),
@@ -167,22 +157,29 @@ pub enum ColorScale {
 //   Gap rows are rendered as a dotted grey line.
 // ---------------------------------------------------------------------------
 
-/// Render the main heatmap; returns the colour range (vmax, µV) used.
+/// How a heatmap's values become colours.
+#[derive(Clone, Copy)]
+pub struct HeatmapStyle<'a> {
+    pub scale: ColorScale,
+    /// a pixel column shows its extreme sample instead of the mean of its samples
+    pub peak_pooling: bool,
+    pub colormap: &'a ColorMapChoice,
+}
+
+/// Render the main heatmap, `size` pixels, of the samples `view` = (first, n) (absolute
+/// sample indices), taken from `src`, whose rows the data rows of `display_rows` index;
+/// parts of the view outside `src` are background. Returns the colour range (vmax, µV)
+/// used.
 pub fn build_heatmap_into(
     out: &mut Vec<u8>,
-    data: &[f32],
+    src: &SampleWindow,
     display_rows: &[DisplayRow],
-    data_stride: usize, // n_samp in the buffer
-    buf_first: usize,   // absolute first sample covered by the buffer
-    buf_n_samp: usize,  // number of samples covered by the buffer
-    view_first: usize,  // absolute first sample of the requested view
-    n_view: usize,      // number of samples in the requested view
-    pixel_w: usize,
-    pixel_h: usize,
-    scale: ColorScale,
-    peak_pooling: bool,
-    cmap: &ColorMapChoice,
+    (view_first, n_view): (usize, usize),
+    [pixel_w, pixel_h]: [usize; 2],
+    style: &HeatmapStyle,
 ) -> f32 {
+    let (data, data_stride, buf_first, buf_n_samp) = (src.data, src.n, src.first, src.n);
+    let HeatmapStyle { scale, peak_pooling, colormap: cmap } = *style;
     use rayon::prelude::*;
     let total = pixel_w * pixel_h * 4;
     out.resize(total, 0);
@@ -408,6 +405,15 @@ pub fn spectrum_tick_label(f: f32) -> String {
     }
 }
 
+/// How a power spectrum strip is drawn.
+#[derive(Clone, Copy, PartialEq)]
+pub struct SpectrumStyle {
+    pub scaling: crate::spectrum::SpectrumScaling,
+    pub normalization: crate::spectrum::SpectrumNormalization,
+    /// shown band (Hz), `None` = up to Nyquist
+    pub freq_range: Option<(f32, f32)>,
+}
+
 /// Render a per-channel power spectrum as an opaque heatmap: one row per channel
 /// (same row layout/order as the main heatmap), x = frequency on a log scale,
 /// colour = power. `freq_range` restricts the displayed band (see
@@ -419,16 +425,14 @@ pub fn spectrum_tick_label(f: f32) -> String {
 /// `shown_rows[0]` in the full list, so indexing into `power` still lines up.
 pub fn build_spectrum_heatmap_into(
     out: &mut Vec<u8>,
-    power: &[Vec<f32>],
-    freqs: &[f32],
+    spectrum: &crate::spectrum::SpectrumResult,
     shown_rows: &[DisplayRow],
     row_offset: usize,
-    pixel_w: usize,
-    pixel_h: usize,
-    scaling: crate::spectrum::SpectrumScaling,
-    normalization: crate::spectrum::SpectrumNormalization,
-    freq_range: Option<(f32, f32)>,
+    [pixel_w, pixel_h]: [usize; 2],
+    style: &SpectrumStyle,
 ) {
+    let (power, freqs) = (&spectrum.power, &spectrum.freqs);
+    let SpectrumStyle { scaling, normalization, freq_range } = *style;
     let total = pixel_w * pixel_h * 4;
     out.resize(total, 0);
     let n_rows = shown_rows.len();

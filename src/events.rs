@@ -47,6 +47,14 @@ pub struct PsthSettings {
     pub color_uv: Option<f32>,
 }
 
+/// The time view the Events window moves: its start (s), length (s), and the
+/// recording's length (s).
+pub struct TimeView<'a> {
+    pub start_s: &'a mut f64,
+    pub dur_s: f64,
+    pub total_s: f64,
+}
+
 pub struct EventsState {
     pub open: bool,
     path_text: String,
@@ -100,7 +108,7 @@ impl EventsState {
 
     /// The loaded on- and offset times (s), if an event file has been loaded.
     pub fn times(&self) -> Option<(&[f64], Option<&[f64]>)> {
-        (!self.onsets.is_empty()).then(|| (self.onsets.as_slice(), self.offsets.as_deref()))
+        (!self.onsets.is_empty()).then_some((self.onsets.as_slice(), self.offsets.as_deref()))
     }
 
     /// Load `path` (Load on start); returns whether it was loaded. On failure the
@@ -166,18 +174,17 @@ impl EventsState {
         })
     }
 
-    /// A successfully loaded file is stored in `event_file`. `view_start_s` is updated
-    /// in place by the "jump to event" buttons, centering the targeted event in the view.
+    /// A successfully loaded file is stored in `event_file`. The "jump to event" buttons
+    /// move `view.start_s`, centring the event in the view.
     pub fn draw_window(
         &mut self,
         ctx: &egui::Context,
         layout_text: &mut String,
         bin_path: &Path,
         event_file: &mut Option<PathBuf>,
-        view_start_s: &mut f64,
-        view_dur_s: f64,
-        total_s: f64,
+        view: TimeView,
     ) {
+        let TimeView { start_s: view_start_s, dur_s: view_dur_s, total_s } = view;
         if !self.open {
             return;
         }

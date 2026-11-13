@@ -2,48 +2,13 @@ use anyhow::{Result, bail};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering, AtomicUsize};
+use std::sync::atomic::Ordering;
 
+use crate::config::{config_dir, read_text_file};
+use crate::control::Control;
 use crate::data::{DisplayRow, Meta, RawData};
 use crate::preprocess::{Filters, PreprocConfig, SpatialFilter, preprocess};
 use crate::worker::compute_thread_count;
-
-// ---------------------------------------------------------------------------
-// Encoding-robust text reading
-// ---------------------------------------------------------------------------
-
-/// Read a text file without assuming UTF-8. Handles UTF-8 (with/without BOM) and
-/// UTF-16 LE/BE (with BOM); anything else that isn't valid UTF-8 is decoded as
-/// Latin-1 (ISO-8859-1), which maps every byte to a char and so never fails. This
-/// keeps event files exported from Excel/MATLAB/Python on any platform readable
-/// without adding an encoding dependency.
-pub fn read_text_file(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| anyhow::anyhow!("could not read {}: {e}", path.display()))?;
-
-    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        return Ok(String::from_utf8_lossy(&bytes[3..]).into_owned());
-    }
-    if bytes.starts_with(&[0xFF, 0xFE]) {
-        return Ok(decode_utf16(&bytes[2..], false));
-    }
-    if bytes.starts_with(&[0xFE, 0xFF]) {
-        return Ok(decode_utf16(&bytes[2..], true));
-    }
-    match String::from_utf8(bytes) {
-        Ok(s) => Ok(s),
-        // not valid UTF-8: fall back to Latin-1 (each byte -> code point)
-        Err(e) => Ok(e.into_bytes().iter().map(|&b| b as char).collect()),
-    }
-}
-
-fn decode_utf16(bytes: &[u8], big_endian: bool) -> String {
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| if big_endian { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) })
-        .collect();
-    String::from_utf16_lossy(&units)
-}
 
 /// Split a data line into fields. Uses commas if present (CSV/TSV-with-commas),
 /// otherwise falls back to any-whitespace splitting.
@@ -246,10 +211,9 @@ pub fn compute_psth(
     cfg: &PreprocConfig,
     event_times_s: &[f64],
     params: &PsthParams,
-    cancel: &AtomicBool,
-    progress: &AtomicUsize,
-    progress_total: &AtomicUsize,
+    ctl: Control<'_>,
 ) -> Result<PsthResult> {
+    let (cancel, progress) = (ctl.cancel, ctl.done);
     let fs = meta.sample_rate;
     if params.end_ms <= params.start_ms {
         bail!("PSTH window end ({} ms) must be greater than start ({} ms).", params.end_ms, params.start_ms);
@@ -301,7 +265,9 @@ pub fn compute_psth(
     if n_used == 0 {
         bail!("all {} events fall too close to the recording edges for the chosen window.", event_times_s.len());
     }
-    progress_total.store(n_used, Ordering::Relaxed);
+    if let Some(total) = ctl.total {
+        total.store(n_used, Ordering::Relaxed);
+    }
 
     let filt = Filters::new(cfg);
     let n_threads = compute_thread_count();
@@ -392,7 +358,7 @@ pub fn compute_psth(
     }
 
     let mut abs_sorted: Vec<f32> = data.iter().map(|v| v.abs()).collect();
-    abs_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    abs_sorted.sort_by(|a, b| a.total_cmp(b));
 
     Ok(PsthResult {
         display_rows: (*display_rows).clone(),
@@ -413,15 +379,6 @@ pub fn compute_psth(
 // ---------------------------------------------------------------------------
 
 /// `config/` directory next to the executable.
-pub fn config_dir() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            return dir.join("config");
-        }
-    }
-    PathBuf::from("config")
-}
-
 pub fn default_layout_path() -> PathBuf {
     config_dir().join("events_file_layout.csv")
 }

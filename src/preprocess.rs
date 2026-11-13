@@ -422,8 +422,8 @@ pub(crate) fn contiguous_depth_blocks(rows: &[&DisplayRow]) -> Vec<Vec<usize>> {
     order.sort_by(|&a, &b| {
         let (ya, xa) = pos(rows[a]);
         let (yb, xb) = pos(rows[b]);
-        ya.partial_cmp(&yb).unwrap_or(std::cmp::Ordering::Equal)
-            .then(xa.partial_cmp(&xb).unwrap_or(std::cmp::Ordering::Equal))
+        ya.total_cmp(&yb)
+            .then(xa.total_cmp(&xb))
     });
     let pitch = order
         .windows(2)
@@ -458,65 +458,78 @@ fn apply_dc_removal(data: &mut [f32], n_samp: usize) {
 
 use std::cell::RefCell;
 
+use crate::rows::{select_rows_mut, time_blocks_mut};
+
+/// Time samples per parallel work item in the spatial filters, which combine all rows
+/// at each sample: small enough that a block of every row stays in cache.
+const SPATIAL_BLOCK_T: usize = 512;
+
 thread_local! {
-    static LOCAL_CMR_BUF: RefCell<(Vec<f32>, Vec<f32>)> = RefCell::new((Vec::new(), Vec::new()));
-    static SCRATCH: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    /// filtfilt work buffer, reused across calls (it is as long as a row)
+    static SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 // ---------------------------------------------------------------------------
 // Local CMR
 // ---------------------------------------------------------------------------
 
+/// Local CMR reference: the median of the channels in this distance range (µm) from
+/// each channel, an annulus that leaves out the channel's own spikes (as in IBL's and
+/// Kilosort's local referencing).
+const LOCAL_CMR_INNER_UM: f32 = 100.0;
+const LOCAL_CMR_OUTER_UM: f32 = 400.0;
+/// Time samples per parallel work item of local CMR. Smaller than `SPATIAL_BLOCK_T`:
+/// each sample costs one median per row, so a second of data in 512-sample blocks
+/// gives too few items to keep every thread busy until the end.
+const LOCAL_CMR_BLOCK_T: usize = 64;
+
 fn apply_local_cmr(data: &mut [f32], n_samp: usize, data_rows: &[&DisplayRow]) {
     let n_rows = data_rows.len();
-    let mut neighborhoods = vec![Vec::new(); n_rows];
+    let position = |r: &DisplayRow| match r {
+        DisplayRow::Data { x_um, y_um, .. } => Some((*x_um, *y_um)),
+        _ => None,
+    };
+    // per row, the rows in the annulus around it
+    let neighborhoods: Vec<Vec<usize>> = data_rows
+        .iter()
+        .map(|a| {
+            let Some((x1, y1)) = position(a) else { return Vec::new() };
+            data_rows
+                .iter()
+                .enumerate()
+                .filter_map(|(j, b)| {
+                    let (x2, y2) = position(b)?;
+                    let d = ((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2)).sqrt();
+                    (LOCAL_CMR_INNER_UM..=LOCAL_CMR_OUTER_UM).contains(&d).then_some(j)
+                })
+                .collect()
+        })
+        .collect();
 
-    // Pre-calculate neighborhoods
-    for i in 0..n_rows {
-        if let DisplayRow::Data { x_um: x1, y_um: y1, .. } = data_rows[i] {
-            for j in 0..n_rows {
-                if let DisplayRow::Data { x_um: x2, y_um: y2, .. } = data_rows[j] {
-                    let dx = x1 - x2;
-                    let dy = y1 - y2;
-                    let d = (dx*dx + dy*dy).sqrt();
-                    if d >= 100.0 && d <= 400.0 {
-                        neighborhoods[i].push(j);
-                    }
-                }
-            }
-        }
+    if n_rows == 0 || n_samp == 0 {
+        return;
     }
-
-    let data_ptr = SendPtr(data.as_mut_ptr());
-    (0..n_samp).into_par_iter().for_each(|t| {
-        let dp = data_ptr.0;
-        let _ = &data_ptr;
-        LOCAL_CMR_BUF.with(|cell| {
-            let mut buf = cell.borrow_mut();
-            buf.0.resize(n_rows, 0.0);
-            for ch in 0..n_rows {
-                buf.0[ch] = unsafe { *dp.add(ch * n_samp + t) };
-            }
-
-            for (ch, neighbors) in neighborhoods.iter().enumerate() {
-                if neighbors.is_empty() { continue; }
-                buf.1.resize(neighbors.len(), 0.0);
-                for (i, &n) in neighbors.iter().enumerate() {
-                    buf.1[i] = buf.0[n];
+    assert_eq!(data.len(), n_rows * n_samp, "data does not match the rows");
+    let blocks = time_blocks_mut(data.chunks_exact_mut(n_samp), LOCAL_CMR_BLOCK_T);
+    blocks.into_par_iter().for_each_init(
+        || (Vec::with_capacity(n_rows), Vec::new()),
+        |(col, ring), mut rows| {
+            for t in 0..rows[0].len() {
+                // every row's sample before any is changed: the references use the input
+                col.clear();
+                col.extend(rows.iter().map(|r| r[t]));
+                for (ch, neighbors) in neighborhoods.iter().enumerate() {
+                    if neighbors.is_empty() {
+                        continue;
+                    }
+                    ring.clear();
+                    ring.extend(neighbors.iter().map(|&n| col[n]));
+                    let median = crate::stats::median(ring).expect("neighbourhood is not empty");
+                    rows[ch][t] = col[ch] - median;
                 }
-                let half = buf.1.len() / 2;
-                buf.1.select_nth_unstable_by(half, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let median = if buf.1.len() % 2 == 0 {
-                    let upper = buf.1[half];
-                    buf.1[..half].select_nth_unstable_by(half - 1, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    (upper + buf.1[half - 1]) / 2.0
-                } else {
-                    buf.1[half]
-                };
-                unsafe { *dp.add(ch * n_samp + t) = buf.0[ch] - median; }
             }
-        });
-    });
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -640,42 +653,15 @@ fn apply_temporal_hp(data: &mut [f32], n_samp: usize, filt: &SosFilter) {
 // Global CMR
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    static CMR_COL: RefCell<Vec<f32>> = RefCell::new(Vec::new());
-}
-
 fn apply_global_cmr(data: &mut [f32], n_rows: usize, n_samp: usize) {
-    if n_rows == 0 {
+    if n_rows == 0 || n_samp == 0 {
         return;
     }
-    let data_ptr = SendPtr(data.as_mut_ptr());
-    let half = n_rows / 2;
-
-    (0..n_samp).into_par_iter().for_each(|t| {
-        let dp = data_ptr.0;
-        let _ = &data_ptr;
-        CMR_COL.with(|cell| {
-            let mut col = cell.borrow_mut();
-            col.resize(n_rows, 0.0);
-            for ch in 0..n_rows {
-                col[ch] = unsafe { *dp.add(ch * n_samp + t) };
-            }
-            col.select_nth_unstable_by(half, |a, b| {
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let median = if n_rows % 2 == 0 {
-                let upper = col[half];
-                col[..half].select_nth_unstable_by(half - 1, |a, b| {
-                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                (upper + col[half - 1]) / 2.0
-            } else {
-                col[half]
-            };
-            for ch in 0..n_rows {
-                unsafe { *dp.add(ch * n_samp + t) -= median; }
-            }
-        });
+    let trace = crate::stats::median_trace(data, n_rows, n_samp);
+    data.par_chunks_mut(n_samp).for_each(|row| {
+        for (v, &m) in row.iter_mut().zip(&trace) {
+            *v -= m;
+        }
     });
 }
 
@@ -715,15 +701,15 @@ fn compute_agc_gain(data: &[f32], n_samp: usize, rows: &[usize], win: usize, eps
         let src = &data[rows[i] * n_samp..(rows[i] + 1) * n_samp];
         // prefix sum of |x|
         let mut prefix = vec![0.0f64; n_samp + 1];
-        for t in 0..n_samp {
-            prefix[t + 1] = prefix[t] + src[t].abs() as f64;
+        for (t, &x) in src.iter().enumerate() {
+            prefix[t + 1] = prefix[t] + x.abs() as f64;
         }
-        for t in 0..n_samp {
+        for (t, gt) in g.iter_mut().enumerate() {
             let lo = t.saturating_sub(half);
             let hi = (t + half + 1).min(n_samp);
             let count = hi - lo;
             let mean_abs = (prefix[hi] - prefix[lo]) / count as f64;
-            g[t] = (mean_abs as f32).max(epsilon);
+            *gt = (mean_abs as f32).max(epsilon);
         }
     });
     gain
@@ -734,16 +720,9 @@ fn compute_agc_gain(data: &[f32], n_samp: usize, rows: &[usize], win: usize, eps
 // ---------------------------------------------------------------------------
 
 thread_local! {
-    static KFILT_COL: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    /// one padded time block of the rows, `[n_padded][n_t]`, reused across calls
+    static KFILT_BLOCK: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
-
-/// Raw mutable pointer wrapper for cross-thread access in rayon.
-/// SAFETY: this is only safe when each parallel iteration accesses
-/// disjoint memory. All uses iterate over time samples `t`, where
-/// each `t` touches `ch * n_samp + t` — guaranteed disjoint for distinct `t`.
-struct SendPtr(*mut f32);
-unsafe impl Send for SendPtr {}
-unsafe impl Sync for SendPtr {}
 
 /// Spatial highpass along `rows` (indices into `data`'s rows, ordered by depth),
 /// with AGC before and its inverse after, like IBL's `kfilt`. `epsilon` is the AGC
@@ -758,70 +737,47 @@ fn apply_kfilt(data: &mut [f32], n_samp: usize, rows: &[usize], filt: &Filters, 
     let n_padded = n_rows + 2 * pad;
     let gain = compute_agc_gain(data, n_samp, rows, filt.kfilt_lagc, epsilon);
 
+    // the block's rows in depth order; `gain` has the same order
+    let mut block_rows = select_rows_mut(data, n_samp, rows);
+
     // divide by gain
-    let data_ptr = SendPtr(data.as_mut_ptr());
-    gain.par_chunks(n_samp).enumerate().for_each(|(i, g)| {
-        let dp = data_ptr.0;
-        let _ = &data_ptr;
-        let row = unsafe { std::slice::from_raw_parts_mut(dp.add(rows[i] * n_samp), n_samp) };
-        for (v, &gv) in row.iter_mut().zip(g.iter()) {
+    block_rows.par_iter_mut().zip(gain.par_chunks(n_samp)).for_each(|(row, g)| {
+        for (v, &gv) in row.iter_mut().zip(g) {
             *v /= gv;
         }
     });
 
-    let gain_ptr = SendPtr(gain.as_ptr() as *mut f32);
     let sos = &filt.kfilt;
-
-    let chunk_size = 512;
-    (0..n_samp).into_par_iter().step_by(chunk_size).for_each(|t_start| {
-        let t_end = (t_start + chunk_size).min(n_samp);
-        let n_t = t_end - t_start;
-        let dp = data_ptr.0;
-        let gp = gain_ptr.0;
-        let _ = (&data_ptr, &gain_ptr);
-
-        KFILT_COL.with(|cell| {
+    let blocks = time_blocks_mut(block_rows, SPATIAL_BLOCK_T);
+    blocks.into_par_iter().enumerate().for_each(|(b, mut block)| {
+        let t_start = b * SPATIAL_BLOCK_T;
+        let n_t = block[0].len();
+        KFILT_BLOCK.with(|cell| {
             let mut buf = cell.borrow_mut();
-            // We use buf to store a 2D block: [n_padded][n_t] in row-major
             buf.resize(n_padded * n_t, 0.0);
 
-            // Read row by row (in depth order) for contiguous memory access
-            for (i, &r) in rows.iter().enumerate() {
-                let src_row = unsafe { std::slice::from_raw_parts(dp.add(r * n_samp + t_start), n_t) };
-                let dst_row = &mut buf[(pad + i) * n_t .. (pad + i + 1) * n_t];
-                dst_row.copy_from_slice(src_row);
+            // the rows in depth order, between `pad` mirrored rows on each side
+            for (i, row) in block.iter().enumerate() {
+                buf[(pad + i) * n_t..(pad + i + 1) * n_t].copy_from_slice(row);
             }
-
-            // mirror-pad at top
             for p in 0..pad {
-                let src_ch = (pad - 1 - p).min(n_rows.saturating_sub(1));
-                let src_idx = (pad + src_ch) * n_t;
-                let dst_idx = p * n_t;
-                for i in 0..n_t {
-                    buf[dst_idx + i] = buf[src_idx + i];
-                }
+                let src = pad + (pad - 1 - p).min(n_rows - 1);
+                buf.copy_within(src * n_t..(src + 1) * n_t, p * n_t);
             }
-
-            // mirror-pad at bottom
             for p in 0..pad {
-                let src_ch = n_rows.saturating_sub(1 + p);
-                let src_idx = (pad + src_ch) * n_t;
-                let dst_idx = (pad + n_rows + p) * n_t;
-                for i in 0..n_t {
-                    buf[dst_idx + i] = buf[src_idx + i];
-                }
+                let src = pad + n_rows.saturating_sub(1 + p);
+                buf.copy_within(src * n_t..(src + 1) * n_t, (pad + n_rows + p) * n_t);
             }
 
             // filter along depth, all time samples of the block at once
             SCRATCH.with(|s| sos.filtfilt_columns(&mut buf[..n_padded * n_t], n_padded, n_t, &mut s.borrow_mut()));
 
-            // Write back row by row, restoring the gain
-            for (i, &r) in rows.iter().enumerate() {
-                let dst_row = unsafe { std::slice::from_raw_parts_mut(dp.add(r * n_samp + t_start), n_t) };
-                let src_row = &buf[(pad + i) * n_t .. (pad + i + 1) * n_t];
-                let g_row = unsafe { std::slice::from_raw_parts(gp.add(i * n_samp + t_start), n_t) };
-                for k in 0..n_t {
-                    dst_row[k] = src_row[k] * g_row[k];
+            // back into the rows, restoring the gain
+            for (i, row) in block.iter_mut().enumerate() {
+                let filtered = &buf[(pad + i) * n_t..(pad + i + 1) * n_t];
+                let g = &gain[i * n_samp + t_start..i * n_samp + t_start + n_t];
+                for ((o, &v), &gv) in row.iter_mut().zip(filtered).zip(g) {
+                    *o = v * gv;
                 }
             }
         });

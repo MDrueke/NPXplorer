@@ -11,8 +11,9 @@
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
+use crate::control::Control;
 use crate::data::{Meta, RawData};
 use crate::preprocess::{butter_highpass, SosFilter};
 
@@ -24,8 +25,8 @@ const SIMILARITY_HIGH: f32 = 1.0; // above this: noisy
 const DETREND_NMED: usize = 11;
 
 thread_local! {
-    static SCRATCH: RefCell<Vec<f32>> = RefCell::new(Vec::new());
-    static COL: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    /// filtfilt work buffer, reused across calls
+    static SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +151,7 @@ fn welch_psd_hf(chan: &[f32], fs: f64, plan: &WelchPlan) -> f32 {
         for k in 0..plan.n_bins {
             let mag2 = re[k] * re[k] + im[k] * im[k];
             let mut p = mag2 / (fs as f32 * plan.win_sum_sq);
-            let is_nyquist = nperseg % 2 == 0 && k == plan.n_bins - 1;
+            let is_nyquist = nperseg.is_multiple_of(2) && k == plan.n_bins - 1;
             if k != 0 && !is_nyquist {
                 p *= 2.0;
             }
@@ -169,38 +170,12 @@ fn welch_psd_hf(chan: &[f32], fs: f64, plan: &WelchPlan) -> f32 {
     hf_bins.iter().map(|&v| v / n_seg as f32).sum::<f32>() / hf_bins.len() as f32
 }
 
-// ---------------------------------------------------------------------------
-// Per-time-sample median across channels (the "reference trace"), same
-// select_nth_unstable approach as apply_global_cmr in preprocess.rs.
-// ---------------------------------------------------------------------------
-
-fn median_trace(raw: &[f32], nc: usize, ns: usize) -> Vec<f32> {
-    let mut out = vec![0f32; ns];
-    out.par_iter_mut().enumerate().for_each(|(t, o)| {
-        COL.with(|cell| {
-            let mut col = cell.borrow_mut();
-            col.clear();
-            col.extend((0..nc).map(|ch| raw[ch * ns + t]));
-            let half = nc / 2;
-            col.select_nth_unstable_by(half, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            *o = if nc % 2 == 0 {
-                let upper = col[half];
-                col[..half].select_nth_unstable_by(half - 1, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                (upper + col[half - 1]) / 2.0
-            } else {
-                col[half]
-            };
-        });
-    });
-    out
-}
-
 /// Zero-lag cross-correlation of each channel with the median reference trace.
 /// The IBL reference computes this via an FFT circular cross-correlation and
 /// only ever reads the zero-lag term back out, which collapses to a plain dot
 /// product — so no FFT is needed for this part.
 fn channels_similarity(raw: &[f32], nc: usize, ns: usize) -> Vec<f32> {
-    let ref_trace = median_trace(raw, nc, ns);
+    let ref_trace = crate::stats::median_trace(raw, nc, ns);
     let ref_mean = ref_trace.iter().sum::<f32>() / ns as f32;
     let ref_dm: Vec<f32> = ref_trace.iter().map(|&v| v - ref_mean).collect();
     let denom: f32 = ref_dm.iter().map(|&v| v * v).sum::<f32>().max(1e-20);
@@ -226,7 +201,7 @@ fn detrend(x: &[f32], nmed: usize) -> Vec<f32> {
     let ntap = (nmed as f32 / 2.0).ceil() as usize;
     let mut xf = vec![x[0]; ntap];
     xf.extend_from_slice(x);
-    xf.extend(std::iter::repeat(*x.last().unwrap()).take(ntap));
+    xf.extend(std::iter::repeat_n(*x.last().unwrap(), ntap));
 
     let half = nmed / 2;
     (0..n)
@@ -235,7 +210,7 @@ fn detrend(x: &[f32], nmed: usize) -> Vec<f32> {
             let lo = center.saturating_sub(half);
             let hi = (center + half + 1).min(xf.len());
             let mut w: Vec<f32> = xf[lo..hi].to_vec();
-            w.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            w.sort_by(|a, b| a.total_cmp(b));
             x[i] - w[w.len() / 2]
         })
         .collect()
@@ -401,12 +376,12 @@ pub(crate) fn shank_groups(meta: &Meta, removed: &BTreeSet<usize>) -> Vec<Vec<us
         .into_iter()
         .map(|s| {
             let mut chans: Vec<usize> = (0..meta.n_ap_chans)
-                .filter(|&c| !removed.contains(&c) && meta.channel_geom.get(c).map_or(false, |g| g.shank == s))
+                .filter(|&c| !removed.contains(&c) && meta.channel_geom.get(c).is_some_and(|g| g.shank == s))
                 .collect();
             chans.sort_by(|&a, &b| {
                 let (ga, gb) = (&meta.channel_geom[a], &meta.channel_geom[b]);
-                ga.y_um.partial_cmp(&gb.y_um).unwrap_or(std::cmp::Ordering::Equal)
-                    .then(ga.x_um.partial_cmp(&gb.x_um).unwrap_or(std::cmp::Ordering::Equal))
+                ga.y_um.total_cmp(&gb.y_um)
+                    .then(ga.x_um.total_cmp(&gb.x_um))
             });
             chans
         })
@@ -421,9 +396,9 @@ pub fn classify_recording(
     removed: &BTreeSet<usize>,
     n_chunks: usize,
     outside_rule: OutsideRule,
-    cancel: &AtomicBool,
-    progress: &AtomicUsize,
+    ctl: Control<'_>,
 ) -> Option<Vec<u8>> {
+    let (cancel, progress) = (ctl.cancel, ctl.done);
     let nc = meta.n_ap_chans;
     let fs = meta.sample_rate;
     let total_dur = meta.n_samples as f64 / fs;
@@ -498,9 +473,9 @@ pub fn classify_recording(
         .map(|counts| {
             let mut best_label = 0u8;
             let mut best_count = counts[0];
-            for l in 1..4 {
-                if counts[l] > best_count {
-                    best_count = counts[l];
+            for (l, &c) in counts.iter().enumerate().skip(1) {
+                if c > best_count {
+                    best_count = c;
                     best_label = l as u8;
                 }
             }
@@ -525,6 +500,6 @@ mod tests {
         assert_eq!(fixed.len(), 30 - 17); // -0.1 - 0.04 i < -0.75  <=>  i > 16.25
         let adaptive = outside_candidates(&x, OutsideRule::Adaptive);
         assert!(!adaptive.is_empty() && adaptive.last() == Some(&99));
-        assert!(outside_candidates(&vec![0.0; 50], OutsideRule::Adaptive).is_empty());
+        assert!(outside_candidates(&[0.0; 50], OutsideRule::Adaptive).is_empty());
     }
 }

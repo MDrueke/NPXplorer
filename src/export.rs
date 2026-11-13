@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
+use crate::control::Control;
 use crate::data::{DisplayRow, Meta, RawData};
 use crate::preprocess::{preprocess, Filters, PreprocConfig, SpatialFilter};
 
@@ -317,7 +318,9 @@ impl Handle {
     }
 }
 
-pub fn spawn(job: Job, ctx: egui::Context) -> Handle {
+/// Run the export on its own thread; `finished` is called when it has ended (to
+/// redraw the window that shows it).
+pub fn spawn(job: Job, finished: impl FnOnce() + Send + 'static) -> Handle {
     let progress = Arc::new(Progress::default());
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
@@ -333,7 +336,7 @@ pub fn spawn(job: Job, ctx: egui::Context) -> Handle {
             cleanup(&job);
         }
         let _ = tx.send((outcome, labels_out));
-        ctx.request_repaint();
+        finished();
     });
     Handle { progress, cancel, started: Instant::now(), rx }
 }
@@ -547,13 +550,13 @@ fn apply_blanking(data: &mut [f32], n_samp: usize, first: usize, intervals: &[(u
 /// Chunks the DC offsets and destripe AGC floors are estimated from.
 const ESTIMATE_CHUNKS: usize = 16;
 
+/// Per-row DC offsets and per-block destripe AGC floors, estimated once for the whole
+/// export (each `None` when the settings don't use it).
+type Estimates = (Option<Vec<f32>>, Option<Vec<f32>>);
+
+/// Upper median of per-chunk estimates; 0 if there are none.
 fn median(v: &mut [f32]) -> f32 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    let mid = v.len() / 2;
-    let (_, m, _) = v.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    *m
+    crate::stats::upper_median(v).unwrap_or(0.0)
 }
 
 /// Where the output goes, per format.
@@ -609,8 +612,7 @@ pub(crate) fn run(job: &Job, p: &Progress, cancel: &AtomicBool, labels_out: &mut
             &job.cfg.removed_channels,
             job.classify_chunks.max(1),
             job.outside_rule,
-            cancel,
-            &p.classify_done,
+            Control { cancel, done: &p.classify_done, total: None },
         )
         .context("cancelled")?;
         *labels_out = Some(l.clone());
@@ -670,7 +672,7 @@ pub(crate) fn run(job: &Job, p: &Progress, cancel: &AtomicBool, labels_out: &mut
     let starts: Vec<usize> = (0..ESTIMATE_CHUNKS.min(n_samples / est_len.max(1)).max(1))
         .map(|i| first + (n_samples - est_len) * i / (ESTIMATE_CHUNKS - 1).max(1))
         .collect();
-    let (dc, eps) = pool.install(|| -> Result<(Option<Vec<f32>>, Option<Vec<f32>>)> {
+    let (dc, eps) = pool.install(|| -> Result<Estimates> {
         let dc = if cfg.dc_removal {
             let mut per_row: Vec<Vec<f32>> = vec![Vec::new(); plan.n_rows];
             for &st in &starts {
@@ -747,13 +749,12 @@ pub(crate) fn run(job: &Job, p: &Progress, cancel: &AtomicBool, labels_out: &mut
         stop.store(true, Ordering::Relaxed);
     };
     let clipped = AtomicU64::new(0);
-    let hasher_result: Mutex<Option<String>> = Mutex::new(None);
     let scale: Vec<f32> = plan.out.iter().map(|o| 1.0 / meta.uv_per_bit[o.ch]).collect();
     // busy time per stage (ns), for the debug log
     let busy: [AtomicU64; 5] = Default::default();
     let timed = |i: usize, t: Instant| busy[i].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-    std::thread::scope(|sc| {
+    let sha1 = std::thread::scope(|sc| {
         let (to_compute, from_reader) = mpsc::sync_channel::<ReadChunk>(1);
         let (to_writer, from_compute) = mpsc::sync_channel::<ReadChunk>(1);
         let (to_hasher, from_writer) = mpsc::sync_channel::<Vec<i16>>(2);
@@ -802,8 +803,8 @@ pub(crate) fn run(job: &Job, p: &Progress, cancel: &AtomicBool, labels_out: &mut
         });
 
         // hasher (SpikeGLX's fileSHA1)
-        if job.format == Format::SpikeGlx {
-            sc.spawn(|| {
+        let hasher = if job.format == Format::SpikeGlx {
+            Some(sc.spawn(|| {
                 use sha1::Digest;
                 let mut h = sha1::Sha1::new();
                 for buf in from_writer {
@@ -811,12 +812,12 @@ pub(crate) fn run(job: &Job, p: &Progress, cancel: &AtomicBool, labels_out: &mut
                     h.update(bytemuck::cast_slice::<i16, u8>(&buf));
                     timed(4, t);
                 }
-                let hex: String = h.finalize().iter().map(|b| format!("{b:02X}")).collect();
-                *hasher_result.lock().unwrap() = Some(hex);
-            });
+                h.finalize().iter().map(|b| format!("{b:02X}")).collect::<String>()
+            }))
         } else {
             drop(from_writer);
-        }
+            None
+        };
 
         // writer (this thread)
         let to_hasher = (job.format == Format::SpikeGlx).then_some(to_hasher);
@@ -845,6 +846,8 @@ pub(crate) fn run(job: &Job, p: &Progress, cancel: &AtomicBool, labels_out: &mut
         if cancel.load(Ordering::Relaxed) {
             stop.store(true, Ordering::Relaxed);
         }
+        // a panic in the hasher is re-raised here, as `scope` would do anyway
+        hasher.map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
     });
 
     let ms = |i: usize| busy[i].load(Ordering::Relaxed) / 1_000_000;
@@ -884,7 +887,7 @@ pub(crate) fn run(job: &Job, p: &Progress, cancel: &AtomicBool, labels_out: &mut
         plan: &plan,
         first,
         n_samples,
-        sha1: hasher_result.lock().unwrap().take(),
+        sha1,
         clipped: clipped.load(Ordering::Relaxed),
         dc: dc.as_deref(),
         eps: eps.as_deref(),
@@ -1397,7 +1400,7 @@ fn write_companions(info: &ExportInfo) -> Result<Vec<PathBuf>> {
 
     // NPXplorer settings for the export: preprocessing off (it is in the data now),
     // nothing removed, the atlas registration and events carried over
-    let band = crate::settings::Band::of_sample_rate(job.meta.sample_rate);
+    let band = crate::sidecar::Band::of_sample_rate(job.meta.sample_rate);
     let mut table = toml::Table::new();
     table.insert("removed_channels".into(), toml::Value::Array(Vec::new()));
     let mut preproc = toml::Table::new();
@@ -1418,7 +1421,7 @@ fn write_companions(info: &ExportInfo) -> Result<Vec<PathBuf>> {
         ev.insert("layout".into(), toml::Value::String(layout.to_string()));
         table.insert("events".into(), toml::Value::Table(ev));
     }
-    let sidecar = crate::settings::path(info.data_path);
+    let sidecar = crate::sidecar::path(info.data_path);
     std::fs::write(&sidecar, toml::to_string_pretty(&table)?)?;
     files.push(sidecar);
 
@@ -1608,7 +1611,7 @@ mod tests {
         let geom = |c: usize| {
             let shank = if c < 16 { 1 } else { 0 };
             let i = c % 16;
-            (shank, if i % 2 == 0 { 27 } else { 59 }, (i / 2) * 20)
+            (shank, if i.is_multiple_of(2) { 27 } else { 59 }, (i / 2) * 20)
         };
         let mut chan_map = format!("({N_NEURAL},0,1)");
         let mut geom_map = String::from("(NP2014,2,250,70)");
@@ -1745,7 +1748,7 @@ mod tests {
             assert_eq!(out[t * n_out_cols + n_out_cols - 1], raw[(3000 + t) * (N_NEURAL + 1) + N_NEURAL]);
         }
         // the export opens without preprocessing and with nothing removed
-        let side = crate::settings::load_table(&dst);
+        let side = crate::sidecar::load_table(&dst);
         assert_eq!(side["ap"]["preproc"]["highpass"].as_bool(), Some(false));
         assert_eq!(side["removed_channels"].as_array().map(|a| a.len()), Some(0));
         assert!(beside_data_path(&dst, ".kilosort4_probe.json").is_file());

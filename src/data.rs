@@ -37,34 +37,28 @@ pub const GAP_PITCH_FACTOR: f32 = 1.5;
 
 /// How channels are ordered top-to-bottom within a shank in the display.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 pub enum ChannelOrder {
     /// Raw hardware channel number, ascending from bottom to top.
     Id,
     /// Physical depth (y_um), ascending from bottom to top — the deepest channel
     /// on each shank is at the bottom.
+    #[default]
     Depth,
 }
 
-impl Default for ChannelOrder {
-    fn default() -> Self {
-        ChannelOrder::Depth
-    }
-}
 
 /// How shanks are ordered left-to-right in the display.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 pub enum ShankOrder {
     /// Raw shank index from the meta file, ascending.
+    #[default]
     Id,
     /// Physical x position (mean over the shank's electrodes), ascending — left to right.
     XCoord,
 }
 
-impl Default for ShankOrder {
-    fn default() -> Self {
-        ShankOrder::Id
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct Meta {
@@ -456,7 +450,7 @@ impl Meta {
         }
         let mut result = HashMap::new();
         for (shank, mut ys) in by_shank {
-            ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            ys.sort_by(|a, b| a.total_cmp(b));
             ys.dedup_by(|a, b| (*a - *b).abs() < 0.1);
             let min_diff = ys.windows(2)
                 .filter_map(|w| {
@@ -486,7 +480,7 @@ impl Meta {
                         .collect();
                     (s, xs.iter().sum::<f32>() / xs.len() as f32)
                 }).collect();
-                mean_x.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                mean_x.sort_by(|a, b| a.1.total_cmp(&b.1));
                 mean_x.into_iter().enumerate().map(|(rank, (s, _))| (s, rank as u32)).collect()
             }
         }
@@ -523,7 +517,7 @@ impl Meta {
         // same-depth channels end up adjacent and get merged correctly below,
         // independent of the final display order chosen
         entries.sort_by(|a, b| {
-            a.0.cmp(&b.0).then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            a.0.cmp(&b.0).then(a.1.total_cmp(&b.1))
         });
 
         // group by (shank, y_um)
@@ -550,15 +544,14 @@ impl Meta {
             let rank_b = shank_rank.get(&b.0).copied().unwrap_or(b.0);
             let key_a = match channel_order { ChannelOrder::Depth => a.1, ChannelOrder::Id => a.2[0] as f32 };
             let key_b = match channel_order { ChannelOrder::Depth => b.1, ChannelOrder::Id => b.2[0] as f32 };
-            rank_a.cmp(&rank_b).then(key_a.partial_cmp(&key_b).unwrap_or(std::cmp::Ordering::Equal))
+            rank_a.cmp(&rank_b).then(key_a.total_cmp(&key_b))
         });
 
         // build display rows with gap detection
         let mut rows: Vec<DisplayRow> = Vec::new();
-        let mut data_idx = 0usize;
         let mut prev: Option<(u32, f32)> = None; // (shank, y)
 
-        for (shank, y, channels) in &groups {
+        for (data_idx, (shank, y, channels)) in groups.iter().enumerate() {
             let pitch = *pitch_map.get(shank).unwrap_or(&20.0);
 
             if let Some((prev_shank, prev_y)) = prev {
@@ -582,7 +575,6 @@ impl Meta {
                 y_um: *y,
                 shank: *shank,
             });
-            data_idx += 1;
             prev = Some((*shank, *y));
         }
 
@@ -700,7 +692,7 @@ fn parse_shank_map(s: &str, spec: &ProbeSpec, n_ap: usize) -> Option<(Vec<Channe
                 let shank: u32 = parts[0].parse().unwrap_or(0);
                 let col: f32 = parts[1].parse().unwrap_or(0.0);
                 let row: u32 = parts[2].parse().unwrap_or(0);
-                let x0 = if row % 2 == 0 { spec.even_row_x0_um } else { spec.odd_row_x0_um };
+                let x0 = if row.is_multiple_of(2) { spec.even_row_x0_um } else { spec.odd_row_x0_um };
                 out[ch_idx] = ChannelGeom {
                     shank,
                     x_um: x0 + col * spec.pitch_h_um,
@@ -846,11 +838,11 @@ fn parse_open_ephys_geometry(xml: &str, node_id: u32, n_ap: usize) -> Result<(Ve
     // consecutive values are further apart than a single-shank column spacing
     const SHANK_GAP_THRESHOLD_UM: f32 = 100.0;
     let mut unique_x: Vec<f32> = xs.values().copied().collect();
-    unique_x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    unique_x.sort_by(|a, b| a.total_cmp(b));
     unique_x.dedup_by(|a, b| (*a - *b).abs() < 1.0);
     let mut cluster_starts: Vec<f32> = Vec::new();
     for &x in &unique_x {
-        if cluster_starts.last().map_or(true, |&last| x - last > SHANK_GAP_THRESHOLD_UM) {
+        if cluster_starts.last().is_none_or(|&last| x - last > SHANK_GAP_THRESHOLD_UM) {
             cluster_starts.push(x);
         }
     }
@@ -862,7 +854,7 @@ fn parse_open_ephys_geometry(xml: &str, node_id: u32, n_ap: usize) -> Result<(Ve
     // channels without a listed position are reference sites (NP 1.0: channel 191) —
     // only meaningful if the probe lists positions for most channels at all
     let mut no_position = BTreeSet::new();
-    for i in 0..n_ap {
+    for (i, geom) in channel_geom.iter_mut().enumerate() {
         let (x, y) = match (xs.get(&i), ys.get(&i)) {
             (Some(&x), Some(&y)) => (x, y),
             _ => {
@@ -872,13 +864,13 @@ fn parse_open_ephys_geometry(xml: &str, node_id: u32, n_ap: usize) -> Result<(Ve
                 (1..n_ap)
                     .find_map(|d| {
                         i.checked_sub(d).and_then(|lo| xs.get(&lo).zip(ys.get(&lo)))
-                            .or_else(|| (i + d < n_ap).then(|| ()).and_then(|_| xs.get(&(i + d)).zip(ys.get(&(i + d)))))
+                            .or_else(|| (i + d < n_ap).then_some(()).and_then(|_| xs.get(&(i + d)).zip(ys.get(&(i + d)))))
                     })
                     .map(|(&x, &y)| (x, y))
                     .unwrap_or((0.0, 0.0))
             }
         };
-        channel_geom[i] = ChannelGeom { x_um: x, y_um: y, shank: shank_for_x(x) };
+        *geom = ChannelGeom { x_um: x, y_um: y, shank: shank_for_x(x) };
     }
 
     if no_position.len() * 2 > n_ap {
@@ -933,10 +925,10 @@ impl ShiftKernels {
         let sinc = |u: f64| if u.abs() < 1e-9 { 1.0 } else { (std::f64::consts::PI * u).sin() / (std::f64::consts::PI * u) };
         let mut h = [0.0f32; SHIFT_TAPS];
         let mut sum = 0.0f64;
-        for k in 0..SHIFT_TAPS {
+        for (k, hk) in h.iter_mut().enumerate() {
             let u = k as f64 - SHIFT_LEAD as f64 - d as f64;
             let w = if u.abs() < a { sinc(u) * sinc(u / a) } else { 0.0 };
-            h[k] = w as f32;
+            *hk = w as f32;
             sum += w;
         }
         for v in &mut h {
@@ -968,20 +960,20 @@ pub trait ChunkSource: Send + Sync {
 /// samples small enough to stay in cache while every row reads from it.
 const BLOCK_T: usize = 1024;
 
-/// Raw mutable pointer wrapper for cross-thread access in rayon.
-/// SAFETY: each parallel item writes only its own, disjoint time range.
-struct SendPtr(*mut f32);
-unsafe impl Send for SendPtr {}
-unsafe impl Sync for SendPtr {}
-
-/// Convert interleaved i16 samples (`src[s * n_ch + ch]`) into per-row f32 traces:
-/// `out[r * n_samp + t]` is the mean over `rows[r]`'s channels of `scale[ch] * x[ch]`
-/// at source sample `src_offset + t`, with the per-channel fractional delay applied
-/// first when `kernels` is given. Samples beyond the source are zero.
-fn convert_rows(
-    src: &[i16],
+/// Interleaved i16 samples, `samples[s * n_ch + ch]`; reading starts at sample `offset`.
+#[derive(Clone, Copy)]
+struct InterleavedI16<'a> {
+    samples: &'a [i16],
     n_ch: usize,
-    src_offset: usize,
+    offset: usize,
+}
+
+/// Convert interleaved i16 samples into per-row f32 traces: `out[r * n_samp + t]` is
+/// the mean over `rows[r]`'s channels of `scale[ch] * x[ch]` at source sample
+/// `src.offset + t`, with the per-channel fractional delay applied first when `kernels`
+/// is given. Samples beyond the source are zero.
+fn convert_rows(
+    src: InterleavedI16,
     n_samp: usize,
     rows: &[&[usize]],
     scale: &[f32],
@@ -989,14 +981,13 @@ fn convert_rows(
     out: &mut [f32],
 ) {
     use rayon::prelude::*;
-    debug_assert_eq!(out.len(), rows.len() * n_samp);
+    let InterleavedI16 { samples: src, n_ch, offset: src_offset } = src;
+    assert_eq!(out.len(), rows.len() * n_samp, "output does not match the rows");
     if n_samp == 0 || rows.is_empty() || n_ch == 0 {
         return;
     }
     let src_len = src.len() / n_ch;
     let inv: Vec<f32> = rows.iter().map(|r| 1.0 / r.len().max(1) as f32).collect();
-    let out_ptr = SendPtr(out.as_mut_ptr());
-    let n_blocks = (n_samp + BLOCK_T - 1) / BLOCK_T;
 
     // kernels reversed, so the delay is a plain dot product with a contiguous window
     // of past samples: y[t] = Σ_j hr[j] · x[t + LEAD - (TAPS-1) + j]
@@ -1005,16 +996,14 @@ fn convert_rows(
         .unwrap_or_default();
     let chan_kernel = |ch: usize| kernels.and_then(|k| k.channel_kernel.get(ch).copied().flatten());
 
-    (0..n_blocks).into_par_iter().for_each(|b| {
-        let op = out_ptr.0;
-        let _ = &out_ptr;
+    let blocks = crate::rows::time_blocks_mut(out.chunks_exact_mut(n_samp), BLOCK_T);
+    blocks.into_par_iter().enumerate().for_each(|(b, mut dst_rows)| {
         let t0 = b * BLOCK_T;
-        let t1 = ((b + 1) * BLOCK_T).min(n_samp);
         let s0 = src_offset + t0; // first source sample of the block
-        let s1 = (src_offset + t1).min(src_len); // end of the in-range source samples
+        let s1 = (s0 + dst_rows[0].len()).min(src_len); // end of the in-range source samples
         // zero the block (covers samples beyond the source)
-        for r in 0..rows.len() {
-            unsafe { std::ptr::write_bytes(op.add(r * n_samp + t0), 0, t1 - t0) };
+        for dst in dst_rows.iter_mut() {
+            dst.fill(0.0);
         }
         if s0 >= s1 {
             return;
@@ -1023,14 +1012,13 @@ fn convert_rows(
         if kernels.is_none() {
             // no delay: read each source sample once, straight into the rows
             for s in s0..s1 {
-                let t = s - src_offset;
-                let base = s * n_ch;
-                for (r, chans) in rows.iter().enumerate() {
+                let frame = &src[s * n_ch..(s + 1) * n_ch];
+                for ((dst, chans), &inv_r) in dst_rows.iter_mut().zip(rows).zip(&inv) {
                     let mut acc = 0.0f32;
                     for &ch in chans.iter() {
-                        acc += src[base + ch] as f32 * scale[ch];
+                        acc += frame[ch] as f32 * scale[ch];
                     }
-                    unsafe { *op.add(r * n_samp + t) = acc * inv[r] };
+                    dst[s - s0] = acc * inv_r;
                 }
             }
             return;
@@ -1051,11 +1039,11 @@ fn convert_rows(
                     sc[ch * w + j] = src[base + ch] as f32;
                 }
             }
-            for (r, chans) in rows.iter().enumerate() {
-                let dst = unsafe { std::slice::from_raw_parts_mut(op.add(r * n_samp + t0), t1 - t0) };
+            for ((dst, chans), &inv_r) in dst_rows.iter_mut().zip(rows).zip(&inv) {
+                let dst: &mut [f32] = dst;
                 for &ch in chans.iter() {
                     let x = &sc[ch * w..(ch + 1) * w];
-                    let g = scale[ch] * inv[r];
+                    let g = scale[ch] * inv_r;
                     match chan_kernel(ch) {
                         None => {
                             for s in s0..s1 {
@@ -1070,19 +1058,22 @@ fn convert_rows(
                                 let v = if s >= back && s + lead < src_len {
                                     // interior: contiguous window, vectorizable
                                     let lo = s - back - h_lo;
-                                    let win = &x[lo..lo + SHIFT_TAPS];
+                                    let win = x[lo..].first_chunk::<SHIFT_TAPS>().expect("window lies inside the halo");
                                     let mut a = 0.0f32;
-                                    for j in 0..SHIFT_TAPS {
-                                        a += hr[j] * win[j];
+                                    for (&h, &v) in hr.iter().zip(win) {
+                                        a += h * v;
                                     }
                                     a
                                 } else {
-                                    // recording edges: repeat the first / last sample
+                                    // recording edges: repeat the first / last sample.
+                                    // Keep this signed clamp: computing the index with
+                                    // `saturating_sub` / `min` instead made the whole
+                                    // loop, interior included, 1.7x slower (measured).
                                     let mut a = 0.0f32;
-                                    for j in 0..SHIFT_TAPS {
+                                    for (j, &h) in hr.iter().enumerate() {
                                         let si = (s as isize - back as isize + j as isize)
                                             .clamp(0, src_len as isize - 1) as usize;
-                                        a += hr[j] * x[si - h_lo];
+                                        a += h * x[si - h_lo];
                                     }
                                     a
                                 };
@@ -1097,7 +1088,8 @@ fn convert_rows(
 }
 
 thread_local! {
-    static SCRATCH: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+    /// `convert_rows`' per-channel copy of a block plus halo (~1.7 MB), reused across calls
+    static SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl RawData {
@@ -1147,7 +1139,8 @@ impl RawData {
         match self {
             RawData::Uncompressed(mmap) => {
                 let src = mmap_as_i16(mmap);
-                convert_rows(src, n_ch, first_sample, n_samp, rows, &meta.uv_per_bit, kernels, &mut out);
+                let src = InterleavedI16 { samples: src, n_ch, offset: first_sample };
+                convert_rows(src, n_samp, rows, &meta.uv_per_bit, kernels, &mut out);
             }
             RawData::Compressed(reader) => {
                 // the range plus the filter halo, decompressed into one interleaved buffer
@@ -1157,7 +1150,8 @@ impl RawData {
                     return out;
                 };
                 let src_offset = first_sample.saturating_sub(gather_start);
-                convert_rows(&src, n_ch, src_offset, n_samp, rows, &meta.uv_per_bit, kernels, &mut out);
+                let src = InterleavedI16 { samples: &src, n_ch, offset: src_offset };
+                convert_rows(src, n_samp, rows, &meta.uv_per_bit, kernels, &mut out);
             }
         }
         out
@@ -1270,9 +1264,13 @@ pub fn open_data(bin_path: &Path, meta: &Meta) -> Result<RawData> {
     } else {
         let file = std::fs::File::open(bin_path)
             .with_context(|| format!("opening {}", bin_path.display()))?;
+        // SAFETY: the mapping is only read. It assumes that no other process truncates
+        // or rewrites the recording while it is open (a truncation would fault on
+        // access); there is no safe way to map a file, and reading a recording of
+        // tens of GB through buffers instead would be much slower.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         // verify alignment
-        if mmap.as_ptr() as usize % 2 != 0 {
+        if !(mmap.as_ptr() as usize).is_multiple_of(2) {
             bail!("mmap pointer is not 2-byte aligned");
         }
         Ok(RawData::Uncompressed(mmap))
@@ -1479,14 +1477,15 @@ pub(crate) mod tests {
         let rows: Vec<&[usize]> = vec![&[0, 1], &[2]];
         let scale = [1.0, 1.0, 2.0];
         let mut out = vec![0.0; 2 * 4];
-        convert_rows(&src, n_ch, 2, 4, &rows, &scale, None, &mut out);
+        let at = |offset| InterleavedI16 { samples: &src, n_ch, offset };
+        convert_rows(at(2), 4, &rows, &scale, None, &mut out);
         assert_eq!(out, vec![20.5, 30.5, 40.5, 50.5, 44.0, 64.0, 84.0, 104.0]);
         // delay channel 2 by one sample: row 1 becomes the previous sample's value
         let k = ShiftKernels::new(&[0.0, 0.0, 1.0]);
-        convert_rows(&src, n_ch, 2, 4, &rows, &scale, Some(&k), &mut out);
+        convert_rows(at(2), 4, &rows, &scale, Some(&k), &mut out);
         assert!((out[4] - 24.0).abs() < 1e-3 && (out[5] - 44.0).abs() < 1e-3);
         // past the end -> zeros
-        convert_rows(&src, n_ch, 6, 4, &rows, &scale, None, &mut out);
+        convert_rows(at(6), 4, &rows, &scale, None, &mut out);
         assert_eq!(&out[2..4], &[0.0, 0.0]);
     }
 }

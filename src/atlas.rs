@@ -265,6 +265,8 @@ impl AnnotationVolume {
 
     pub fn open(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: read-only; assumes the atlas file isn't truncated while it is open
+        // (there is no safe way to map a file)
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         Self::from_bytes(VolumeData::Mapped(mmap)).with_context(|| format!("reading {}", path.display()))
     }
@@ -323,7 +325,7 @@ impl Atlas {
             );
         }
         let tree_path = if nte { nte_tree } else { allen_tree.unwrap() };
-        let text = crate::psth::read_text_file(&tree_path)?;
+        let text = crate::config::read_text_file(&tree_path)?;
         let tree = StructureTree::parse(&text).with_context(|| format!("reading {}", tree_path.display()))?;
         progress.store(PROGRESS_TOTAL / 10, Ordering::Relaxed);
         if cancel.load(Ordering::Relaxed) {
@@ -459,8 +461,8 @@ fn convert_nrrd(nrrd: &Path, cache: &Path, ids_path: &Path, cancel: &AtomicBool,
             data.read_exact(&mut buf[..4 * m])
                 .with_context(|| format!("{}: data ends early", nrrd.display()))?;
             out_buf.clear();
-            for c in buf[..4 * m].chunks_exact(4) {
-                let id = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            for &c in buf[..4 * m].as_chunks::<4>().0 {
+                let id = u32::from_le_bytes(c);
                 // neighbouring voxels mostly share a label, so skip the hash lookup
                 if id != last_id {
                     last_idx = if id == 0 {
@@ -533,7 +535,6 @@ impl CcfTransform {
         Self { mouse_scale: bregma_lambda_mm / REFERENCE_BREGMA_LAMBDA_MM }
     }
 
-    #[allow(dead_code)] // inverse direction; used by tests
     pub fn ccf_to_bregma(&self, c: [f64; 3]) -> [f64; 3] {
         let s = [
             (c[0] - BREGMA_CCF[0]) * CCF_SCALE[0],
@@ -696,17 +697,6 @@ pub fn half_pitch_per_shank(meta: &Meta) -> HashMap<u32, f64> {
         .collect()
 }
 
-/// `<recording><suffix>` next to the data file; the AP and LF files of a SpikeGLX
-/// recording share it.
-pub fn recording_sidecar(bin_path: &Path, suffix: &str) -> PathBuf {
-    let stem = bin_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let base = stem
-        .strip_suffix(".ap")
-        .or_else(|| stem.strip_suffix(".lf"))
-        .unwrap_or(&stem)
-        .to_string();
-    bin_path.with_file_name(format!("{base}{suffix}"))
-}
 
 /// Path of the per-channel region table: `<data file stem>_regions.csv` next to it.
 pub fn regions_csv_path(bin_path: &Path) -> PathBuf {
@@ -1201,13 +1191,5 @@ id,atlas_id,name,acronym,st_level,ontology_id,hemisphere_id,weight,parent_struct
         assert_eq!(brain_depth_um(&ins, 405.0), 2400.0);
         let deeper = Insertion { depth_mm: 3.1, ..ins.clone() };
         assert!((brain_depth_um(&deeper, 505.0) - 2400.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn sidecar_name_shared_between_bands() {
-        let a = recording_sidecar(Path::new("/d/rec_g0_t0.imec0.ap.bin"), ".x.toml");
-        let b = recording_sidecar(Path::new("/d/rec_g0_t0.imec0.lf.bin"), ".x.toml");
-        assert_eq!(a, b);
-        assert_eq!(a, Path::new("/d/rec_g0_t0.imec0.x.toml"));
     }
 }

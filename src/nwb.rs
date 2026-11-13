@@ -234,7 +234,7 @@ impl ChunkSource for NwbReader {
         if bytes.len() != (hi - lo) * self.n_ch * 2 {
             bail!("{}: read {} bytes, expected {}", self.path.display(), bytes.len(), (hi - lo) * self.n_ch * 2);
         }
-        let data: Arc<Vec<i16>> = Arc::new(bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect());
+        let data: Arc<Vec<i16>> = Arc::new(bytes.as_chunks::<2>().0.iter().map(|&b| i16::from_le_bytes(b)).collect());
         self.cache.lock().unwrap().insert(idx, Arc::clone(&data));
         Ok(data)
     }
@@ -265,7 +265,7 @@ mod tests {
         for first in (0..meta.n_samples).step_by(50_001) {
             let n = 50_001.min(meta.n_samples - first);
             let got = raw.read_i16(first, n, &meta, &chans);
-            let same = got.iter().zip(want[first * n_ch * 2..].chunks_exact(2)).all(|(g, w)| *g == i16::from_le_bytes([w[0], w[1]]));
+            let same = got.iter().zip(want[first * n_ch * 2..].as_chunks::<2>().0).all(|(g, &w)| *g == i16::from_le_bytes(w));
             assert!(same, "samples from {first} differ");
         }
         println!("all samples equal, {:.2} s", t0.elapsed().as_secs_f64());

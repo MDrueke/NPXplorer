@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::app::RowsOnScreen;
 use crate::colormap::ColorMapChoice;
 use crate::atlas::{
     self, az_el_to_polar, polar_to_az_el, AngleConvention, Atlas, Insertion, RegionEdit,
@@ -911,14 +912,12 @@ impl AtlasUi {
         &mut self,
         ui: &Ui,
         meta: &Meta,
-        rect: egui::Rect,
+        shown: RowsOnScreen,
         line_right: f32,
-        display_rows: &[DisplayRow],
-        first_row: usize,
-        last_row: usize,
         channel_order: ChannelOrder,
         cmap: &ColorMapChoice,
     ) {
+        let RowsOnScreen { rows: display_rows, first: first_row, last: last_row, rect } = shown;
         if !self.overlay_visible() || channel_order == ChannelOrder::Id || last_row < first_row {
             return;
         }

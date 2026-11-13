@@ -8,12 +8,14 @@
 // channel_classify.rs, since this needs a full per-bin spectrum (not just a single
 // scalar HF feature) and benefits from rustfft's non-power-of-two support.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use rayon::prelude::*;
 use rustfft::num_complex::Complex;
 
+use crate::control::Control;
+use crate::rows::SampleWindow;
 use crate::data::{DisplayRow, Meta, RawData};
 use crate::preprocess::PreprocConfig;
 
@@ -22,47 +24,35 @@ use crate::preprocess::PreprocConfig;
 pub const SPECTRUM_CHUNK_DUR_S: f64 = 1.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 pub enum SpectrumTimeScope {
     CurrentView,
+    #[default]
     WholeRecordingChunks,
-}
-impl Default for SpectrumTimeScope {
-    fn default() -> Self {
-        Self::WholeRecordingChunks
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 pub enum SpectrumSource {
+    #[default]
     Raw,
     Preprocessed,
 }
-impl Default for SpectrumSource {
-    fn default() -> Self {
-        Self::Raw
-    }
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 pub enum SpectrumScaling {
     Linear,
+    #[default]
     Db,
-}
-impl Default for SpectrumScaling {
-    fn default() -> Self {
-        Self::Db
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Default)]
 pub enum SpectrumNormalization {
     PerChannel,
+    #[default]
     Global,
-}
-impl Default for SpectrumNormalization {
-    fn default() -> Self {
-        Self::Global
-    }
 }
 
 /// One PSD per data row (same order as the `DisplayRow::Data` rows of the
@@ -170,7 +160,7 @@ fn welch_psd_full(chan: &[f32], plan: &WelchPlan) -> Vec<f32> {
         for k in 0..plan.n_bins {
             let mag2 = buf[k].re * buf[k].re + buf[k].im * buf[k].im;
             let mut p = mag2 / (plan.fs as f32 * plan.win_sum_sq);
-            let is_nyquist = nperseg % 2 == 0 && k == plan.n_bins - 1;
+            let is_nyquist = nperseg.is_multiple_of(2) && k == plan.n_bins - 1;
             if k != 0 && !is_nyquist {
                 p *= 2.0;
             }
@@ -229,18 +219,16 @@ pub fn compute_psd_raw_current_view(
     Some(SpectrumResult { freqs, power })
 }
 
-/// Preprocessed buffer, current view window: `data` is the worker's `[n_data_rows][data_stride]`
-/// buffer; `None` if the requested view isn't (yet) fully covered by it.
+/// Power spectrum of the samples `view` = (first, n) of the preprocessed `src`, whose
+/// rows the data rows of `display_rows` index; `None` if `src` doesn't (yet) cover the
+/// whole view.
 pub fn compute_psd_preprocessed_current_view(
-    data: &[f32],
+    src: &SampleWindow,
     display_rows: &[DisplayRow],
-    data_stride: usize,
-    buf_first: usize,
-    buf_n_samp: usize,
-    view_first: usize,
-    view_n: usize,
+    (view_first, view_n): (usize, usize),
     fs: f64,
 ) -> Option<SpectrumResult> {
+    let (data, data_stride, buf_first, buf_n_samp) = (src.data, src.n, src.first, src.n);
     let buf_end = buf_first + buf_n_samp;
     if view_n == 0 || view_first < buf_first || view_first + view_n > buf_end {
         return None;
@@ -281,9 +269,9 @@ pub fn compute_psd_whole_recording(
     // restricts the span chunks are evenly spaced across to [start_s, end_s]
     // (clamped to the recording); None uses the whole recording
     time_range: Option<(f64, f64)>,
-    cancel: &AtomicBool,
-    progress: &AtomicUsize,
+    ctl: Control<'_>,
 ) -> Result<SpectrumResult, String> {
+    let (cancel, progress) = (ctl.cancel, ctl.done);
     const CANCELLED: &str = "cancelled";
     let fs = meta.sample_rate;
     let n_rows = n_data_rows(display_rows);

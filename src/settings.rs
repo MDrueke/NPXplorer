@@ -161,32 +161,6 @@ pub struct SpectrumSettings {
     pub show_overlay: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Band {
-    Ap,
-    Lf,
-}
-
-impl Band {
-    /// LF streams are sampled at 2.5 kHz, AP streams at 30 kHz (SpikeGLX and Open
-    /// Ephys alike).
-    pub fn of_sample_rate(fs: f64) -> Self {
-        if fs < 10_000.0 {
-            Band::Lf
-        } else {
-            Band::Ap
-        }
-    }
-
-    /// Name of the band's section in the file.
-    pub fn key(self) -> &'static str {
-        match self {
-            Band::Ap => "ap",
-            Band::Lf => "lf",
-        }
-    }
-}
-
 impl RecordingSettings {
     pub fn band_mut(&mut self, band: Band) -> &mut Option<BandSettings> {
         match band {
@@ -196,18 +170,7 @@ impl RecordingSettings {
     }
 }
 
-/// `<recording>.npxplorer.toml` next to the data file, shared by its AP and LF files.
-pub fn path(bin_path: &Path) -> PathBuf {
-    crate::atlas::recording_sidecar(bin_path, ".npxplorer.toml")
-}
-
-/// The file's contents as a TOML table (empty if there is no file or it can't be read).
-pub fn load_table(bin_path: &Path) -> toml::Table {
-    std::fs::read_to_string(path(bin_path))
-        .ok()
-        .and_then(|t| t.parse::<toml::Table>().ok())
-        .unwrap_or_default()
-}
+pub use crate::sidecar::{load_table, path, Band};
 
 /// `base` with every value present in `file` replaced by the file's: values missing
 /// from the file (or of the wrong type) keep the base value.
@@ -323,7 +286,7 @@ pub fn legacy_notches(bin_path: &Path) -> Option<Vec<crate::notch::Notch>> {
 }
 
 fn legacy_atlas_path(bin_path: &Path) -> PathBuf {
-    crate::atlas::recording_sidecar(bin_path, ".npx_atlas.toml")
+    crate::sidecar::recording_sidecar(bin_path, ".npx_atlas.toml")
 }
 
 fn legacy_notch_path(bin_path: &Path) -> PathBuf {

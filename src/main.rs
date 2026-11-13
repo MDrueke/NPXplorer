@@ -2,59 +2,28 @@
 /// Cargo.toml to change it everywhere (window title, title bar, taskbar).
 const APP_TITLE: &str = concat!("NPXplorer v", env!("CARGO_PKG_VERSION"));
 
-pub static DEBUG_LOGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Logging macro that only writes when --debug is active.
-/// Writes to debug.log next to the executable with timestamps.
-#[macro_export]
-macro_rules! file_log {
-    ($($arg:tt)*) => {
-        if $crate::DEBUG_LOGGING.load(std::sync::atomic::Ordering::Relaxed) {
-            let log_path = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("debug.log")))
-                .unwrap_or_else(|| std::path::PathBuf::from("debug.log"));
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                use std::io::Write;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0);
-                let _ = write!(f, "[{:.3}] ", now);
-                let _ = writeln!(f, $($arg)*);
-            }
-        }
-    };
-}
+// the core library's modules, under the names the app's modules use (`crate::data`, ...)
+use npxplorer::{
+    atlas, channel_classify, channel_remove, colormap, config, control, data, export, noise, notch, nwb, preprocess, probe, psth,
+    render, rows, sidecar, spectrum, spikes, stats, worker, zarr,
+};
+use npxplorer::file_log;
 
+#[cfg(test)]
+mod golden;
 mod app;
 mod app_icon;
-mod atlas;
 mod atlas_ui;
-mod blosc;
-mod channel_classify;
-mod channel_remove;
-mod colormap;
-mod data;
-mod geometry;
-mod mtscomp;
-mod noise;
-mod nwb;
-mod notch;
-mod preprocess;
-mod probe;
-mod psth;
-mod render;
+mod classify_ui;
+mod jobs;
+mod noise_ui;
+mod notch_ui;
 mod settings;
-mod spectrum;
-mod spikes;
+mod spectrum_ui;
+mod spikes_ui;
 mod events;
-mod export;
 mod export_ui;
-#[cfg(test)]
-mod realdata_tests;
-mod worker;
-mod zarr;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -128,7 +97,8 @@ struct Args {
 
 enum AppState {
     Empty,
-    Loaded(app::NPXplorerApp),
+    /// boxed: the app is large and `Empty` would otherwise be as large
+    Loaded(Box<app::NPXplorerApp>),
 }
 
 struct MainApp {
@@ -202,7 +172,7 @@ impl MainApp {
         let mut error_msg = None;
         let state = if let Some(path) = bin_path {
             match app::NPXplorerApp::new(ctx, path) {
-                Ok(a) => AppState::Loaded(a),
+                Ok(a) => AppState::Loaded(Box::new(a)),
                 Err(e) => {
                     error_msg = Some(format!("{e}"));
                     AppState::Empty
@@ -396,7 +366,7 @@ impl eframe::App for MainApp {
                     self.recent_files = app::Preferences::load()
                         .map(|p| p.recent_files.iter().map(PathBuf::from).collect())
                         .unwrap_or_default();
-                    self.state = AppState::Loaded(a);
+                    self.state = AppState::Loaded(Box::new(a));
                     self.error_msg = None;
                 }
                 Err(e) => {
@@ -422,7 +392,7 @@ fn main() -> anyhow::Result<()> {
     channel_remove::ensure_default_layout();
 
     if args.debug {
-        DEBUG_LOGGING.store(true, std::sync::atomic::Ordering::Relaxed);
+        npxplorer::log::DEBUG_LOGGING.store(true, std::sync::atomic::Ordering::Relaxed);
         file_log!("=== NPXplorer debug logging started ===");
     }
 

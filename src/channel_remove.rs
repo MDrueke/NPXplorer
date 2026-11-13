@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::psth::read_text_file;
+use crate::config::read_text_file;
 
 /// Split a data line into fields, same convention as the PSTH event-file reader.
 fn split_fields(line: &str) -> Vec<&str> {
@@ -213,7 +213,7 @@ pub fn resolve_layout(list_path: &Path, default_layout_path: &Path) -> Result<Ch
 }
 
 pub fn default_layout_path() -> PathBuf {
-    crate::psth::config_dir().join("channel_remove_layout.csv")
+    crate::config::config_dir().join("channel_remove_layout.csv")
 }
 
 const DEFAULT_LAYOUT: &str = "\

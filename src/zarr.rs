@@ -80,7 +80,7 @@ impl ZarrArray {
         };
         let shape = dims("shape")?;
         let chunks = dims("chunks")?;
-        if shape.len() != chunks.len() || chunks.iter().any(|&c| c == 0) {
+        if shape.len() != chunks.len() || chunks.contains(&0) {
             bail!("{}: shape {shape:?} and chunks {chunks:?} do not match", meta_path.display());
         }
         let dtype = j.get("dtype").and_then(Value::as_str).context("structured Zarr dtypes are not supported")?.to_string();
@@ -259,8 +259,10 @@ impl ZarrArray {
                     .read_all()?
                     .chunks_exact(item.max(4))
                     .map(|b| {
-                        b.chunks_exact(4)
-                            .map(|c| if big { u32::from_be_bytes([c[0], c[1], c[2], c[3]]) } else { u32::from_le_bytes([c[0], c[1], c[2], c[3]]) })
+                        b.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|&c| if big { u32::from_be_bytes(c) } else { u32::from_le_bytes(c) })
                             .take_while(|&c| c != 0)
                             .filter_map(char::from_u32)
                             .collect()
@@ -302,16 +304,16 @@ fn undo_delta(bytes: &mut [u8], item: usize) -> Result<()> {
         }
         2 => {
             let mut acc = 0i16;
-            for b in bytes.chunks_exact_mut(2) {
-                acc = acc.wrapping_add(i16::from_le_bytes([b[0], b[1]]));
-                b.copy_from_slice(&acc.to_le_bytes());
+            for b in bytes.as_chunks_mut::<2>().0 {
+                acc = acc.wrapping_add(i16::from_le_bytes(*b));
+                *b = acc.to_le_bytes();
             }
         }
         4 => {
             let mut acc = 0i32;
-            for b in bytes.chunks_exact_mut(4) {
-                acc = acc.wrapping_add(i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-                b.copy_from_slice(&acc.to_le_bytes());
+            for b in bytes.as_chunks_mut::<4>().0 {
+                acc = acc.wrapping_add(i32::from_le_bytes(*b));
+                *b = acc.to_le_bytes();
             }
         }
         n => bail!("Delta filter on {n}-byte elements is not supported"),
@@ -597,7 +599,7 @@ pub fn load_meta(root: &Path) -> Result<Meta> {
         let dims = loc.len() / n_ch;
         let group = per_channel("group");
         // groups are shanks only if they are numbered from 0
-        let shank = |i: usize| group.as_ref().map(|g| g[i]).filter(|&v| v >= 0.0 && v < 64.0).map_or(0, |v| v as u32);
+        let shank = |i: usize| group.as_ref().map(|g| g[i]).filter(|&v| (0.0..64.0).contains(&v)).map_or(0, |v| v as u32);
         (0..n_ch).map(|i| ChannelGeom { x_um: loc[i * dims] as f32, y_um: loc[i * dims + 1] as f32, shank: shank(i) }).collect()
     } else {
         warnings.push("no probe in the Zarr folder: electrode positions assumed (one column, 20 µm apart)".to_string());
@@ -667,7 +669,7 @@ mod tests {
             prev = v;
         }
         undo_delta(&mut enc, 2).unwrap();
-        let back: Vec<i16> = enc.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+        let back: Vec<i16> = enc.as_chunks::<2>().0.iter().map(|&b| i16::from_le_bytes(b)).collect();
         assert_eq!(back, vals);
     }
 
@@ -701,8 +703,8 @@ mod tests {
                 for first in (0..meta.n_samples).step_by(7001) {
                     let n = 7001.min(meta.n_samples - first);
                     let got = raw.read_i16(first, n, &meta, &chans);
-                    for (g, w) in got.iter().zip(want[first * n_ch * 2..].chunks_exact(2)) {
-                        let d = (*g as i32 - i16::from_le_bytes([w[0], w[1]]) as i32).abs();
+                    for (g, &w) in got.iter().zip(want[first * n_ch * 2..].as_chunks::<2>().0) {
+                        let d = (*g as i32 - i16::from_le_bytes(w) as i32).abs();
                         max_diff = max_diff.max(d);
                         n_diff += (d != 0) as usize;
                     }

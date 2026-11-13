@@ -389,7 +389,8 @@ impl ExportUi {
     /// arrives with the next one.
     pub fn start(&mut self, job: crate::export::Job, ctx: &egui::Context) {
         let dst = job.dst.clone();
-        let handle = crate::export::spawn(job, ctx.clone());
+        let repaint = ctx.clone();
+        let handle = crate::export::spawn(job, move || repaint.request_repaint());
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(FreezeShot)));
         self.open = false;
         self.running = Some(Running {

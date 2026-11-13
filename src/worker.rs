@@ -54,19 +54,22 @@ pub struct BlockCache {
     /// destripe AGC floors of the first block computed — reused by every later block,
     /// so neighbouring blocks get the same floor and no seam appears
     agc_eps: Option<Arc<Vec<f32>>>,
+    /// filter coefficients for `cfg`
+    filters: Arc<Filters>,
     blocks: HashMap<usize, Arc<Block>>,
     bytes: usize,
 }
 
 impl BlockCache {
-    fn new(cfg: &PreprocConfig, meta: &Meta, filt: &Filters) -> Self {
+    fn new(cfg: &PreprocConfig, meta: &Meta) -> Self {
+        let filters = Arc::new(Filters::new(cfg));
         let display_rows = Arc::new(meta.build_display_rows(cfg.avg_depths, &cfg.removed_channels, cfg.channel_order, cfg.shank_order));
         let n_rows = display_rows.iter().filter(|r| matches!(r, DisplayRow::Data { .. })).count();
         let fs = meta.sample_rate;
         let settle_s = crate::notch::settle_s(cfg).max(crate::preprocess::bandpass_settle_s(cfg));
         let mut overlap = MIN_OVERLAP_SAMP.max((settle_s * fs).ceil() as usize);
         if cfg.spatial_filter == SpatialFilter::Destripe {
-            overlap = overlap.max(filt.kfilt_lagc);
+            overlap = overlap.max(filters.kfilt_lagc);
         }
         let block_samp = ((MIN_BLOCK_S * fs) as usize).max(BLOCK_PER_OVERLAP * overlap);
         let max_uv_per_bit = meta.uv_per_bit.iter().fold(0.0f32, |a, &b| a.max(b)) as f64;
@@ -81,6 +84,7 @@ impl BlockCache {
             overlap,
             step_uv,
             agc_eps: None,
+            filters,
             blocks: HashMap::new(),
             bytes: 0,
         }
@@ -151,6 +155,12 @@ pub struct WorkerState {
     shutdown: bool,
 }
 
+impl Default for WorkerState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkerState {
     pub fn new() -> Self {
         WorkerState { cache: None, plan: None, active: None, shutdown: false }
@@ -219,7 +229,8 @@ pub fn cache_display_rows(shared: &SharedWorkerState) -> Option<Arc<Vec<DisplayR
 
 /// Contiguous f32 copy of the cached data around the view, in display units (µV, or
 /// mV/mm² for CSD) — what the heatmap, waveform view and overlays read.
-/// Layout: data[row * n_samp + t].
+/// Layout: data[row * n_samp + t]. Cloning it is cheap: the data is shared.
+#[derive(Clone)]
 pub struct ViewWindow {
     pub first_sample: usize,
     pub n_samp: usize,
@@ -227,7 +238,11 @@ pub struct ViewWindow {
     pub cfg: PreprocConfig,
     pub display_rows: Arc<Vec<DisplayRow>>,
     cache_id: u64,
+    /// unique per window built: identifies its data in caches derived from it
+    pub generation: u64,
 }
+
+static NEXT_WINDOW_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Keep `window` covering the view ± `pad` samples, as far as the cached blocks allow
 /// (with gaps: the run of cached blocks that covers most of the view). Rebuilt when the
@@ -264,7 +279,7 @@ pub fn update_view_window(
                 b += 1;
             }
             let shared_blocks = |r: &std::ops::Range<usize>| r.end.min(view.end).saturating_sub(r.start.max(view.start));
-            if best.as_ref().map_or(true, |r| shared_blocks(&(start..b)) > shared_blocks(r)) {
+            if best.as_ref().is_none_or(|r| shared_blocks(&(start..b)) > shared_blocks(r)) {
                 best = Some(start..b);
             }
         }
@@ -307,7 +322,15 @@ pub fn update_view_window(
         }
     });
 
-    *window = Some(ViewWindow { first_sample: lo, n_samp, data: Arc::new(data), cfg, display_rows, cache_id });
+    *window = Some(ViewWindow {
+        first_sample: lo,
+        n_samp,
+        data: Arc::new(data),
+        cfg,
+        display_rows,
+        cache_id,
+        generation: NEXT_WINDOW_GENERATION.fetch_add(1, Ordering::Relaxed),
+    });
 }
 
 /// `pct`-th percentile (0–100) of |values| in samples [lo, hi) of `w` (clipped to it),
@@ -423,15 +446,17 @@ struct Job {
     overlap: usize,
     step_uv: f32,
     agc_eps: Option<Arc<Vec<f32>>>,
+    filters: Arc<Filters>,
 }
 
+/// Start the preprocessing thread. `block_ready` is called whenever a block for the
+/// current settings lands in the cache (to redraw the view).
 pub fn spawn_worker(
     raw: Arc<RawData>,
     meta: Arc<Meta>,
-    filt: Arc<Mutex<Filters>>,
     shared: SharedWorkerState,
     cancel: SharedCancel,
-    ctx: egui::Context,
+    block_ready: impl Fn() + Send + 'static,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(compute_thread_count()).build().unwrap();
@@ -446,9 +471,8 @@ pub fn spawn_worker(
                         return;
                     }
                     if let Some(plan) = st.plan.clone() {
-                        if st.cache.as_ref().map_or(true, |c| c.cfg != plan.cfg) {
-                            let filt_g = filt.lock().unwrap().clone();
-                            st.cache = Some(BlockCache::new(&plan.cfg, &meta, &filt_g));
+                        if st.cache.as_ref().is_none_or(|c| c.cfg != plan.cfg) {
+                            st.cache = Some(BlockCache::new(&plan.cfg, &meta));
                         }
                         sys.refresh_memory();
                         let c = st.cache.as_mut().unwrap();
@@ -464,6 +488,7 @@ pub fn spawn_worker(
                                 overlap: c.overlap,
                                 step_uv: c.step_uv,
                                 agc_eps: c.agc_eps.clone(),
+                                filters: Arc::clone(&c.filters),
                             };
                             st.active = Some((b, background));
                             // reset under the lock, so a cancel posted for this block isn't lost
@@ -475,7 +500,7 @@ pub fn spawn_worker(
                 }
             };
 
-            let result = pool.install(|| compute_block(&job, &raw, &meta, &filt, &cancel));
+            let result = pool.install(|| compute_block(&job, &raw, &meta, &cancel));
 
             let mut st = lock.lock().unwrap();
             st.active = None;
@@ -485,7 +510,7 @@ pub fn spawn_worker(
                         c.agc_eps = Some(Arc::new(eps));
                     }
                     c.insert(job.b, block);
-                    ctx.request_repaint();
+                    block_ready();
                 }
             }
         }
@@ -494,7 +519,7 @@ pub fn spawn_worker(
 
 /// Read and preprocess one block plus its overlap, keep the block, store it as i16.
 /// Returns the block and the destripe AGC floors used; None if cancelled.
-fn compute_block(job: &Job, raw: &RawData, meta: &Meta, filt: &Mutex<Filters>, cancel: &AtomicBool) -> Option<(Block, Vec<f32>)> {
+fn compute_block(job: &Job, raw: &RawData, meta: &Meta, cancel: &AtomicBool) -> Option<(Block, Vec<f32>)> {
     let read_first = job.first.saturating_sub(job.overlap);
     let read_end = (job.first + job.len + job.overlap).min(meta.n_samples);
     let read_n = read_end - read_first;
@@ -503,8 +528,7 @@ fn compute_block(job: &Job, raw: &RawData, meta: &Meta, filt: &Mutex<Filters>, c
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
-    let filt_g = filt.lock().unwrap().clone();
-    let eps = preprocess(&mut data, read_n, &job.cfg, &filt_g, cancel, &job.display_rows, job.agc_eps.as_deref().map(|v| &v[..]));
+    let eps = preprocess(&mut data, read_n, &job.cfg, &job.filters, cancel, &job.display_rows, job.agc_eps.as_deref().map(|v| &v[..]));
     if cancel.load(Ordering::Relaxed) {
         return None;
     }

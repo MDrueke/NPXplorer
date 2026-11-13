@@ -154,10 +154,7 @@ impl MtscompReader {
         }
 
         // bytes -> i16 (the Vec<u8> may not be 2-byte aligned, so copy via LE decode)
-        let raw_i16: Vec<i16> = decomp_buf
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]))
-            .collect();
+        let raw_i16: Vec<i16> = decomp_buf.as_chunks::<2>().0.iter().map(|&b| i16::from_le_bytes(b)).collect();
 
         // 1. Un-transpose if necessary (F-order -> C-order)
         let mut out = if self.meta.chunk_order == "F" {
